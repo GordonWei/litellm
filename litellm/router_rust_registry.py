@@ -48,6 +48,7 @@ from litellm.litellm_core_utils.ptu_pricing import (
 )
 from litellm.litellm_core_utils.ptu_shares import ptu_capacity_warning
 from litellm.litellm_core_utils.routing_common_utils import (
+    provider_for_generic_call,
     resolve_model_group_alias,
     team_may_use_deployment,
     warn_on_ignored_model_capability_flags,
@@ -62,6 +63,7 @@ from litellm.router_strategy.auto_router.auto_router_model_naming import classif
 from litellm.router_utils.endpoint_eligibility import warn_on_unenforced_endpoint_flag
 from litellm.types.router import (
     VALID_LITELLM_ENVIRONMENTS,
+    CredentialLiteLLMParams,
     Deployment,
     DeploymentTypedDict,
     LiteLLM_Params,
@@ -1080,6 +1082,177 @@ class HostRegistry:
 
     def _get_deployment_by_litellm_model(self, model: str) -> list[UntypedEntry]:  # mutable-ok: a fresh list
         return [m for m in self._core_model_list if _params_of(m).get("model") == model]
+
+    # -- credentials ------------------------------------------------------------------------------
+
+    @staticmethod
+    def _core_is_deployment_blocked(deployment: Deployment) -> bool:
+        model_info: Final[object] = getattr(deployment, "model_info", None)
+        return model_info is not None and getattr(model_info, "blocked", None) is True
+
+    def _core_get_deployment_credentials(self, model_id: str) -> UntypedEntry | None:
+        deployment: Final = self._core_get_deployment(model_id=model_id)
+        if deployment is None or self._core_is_deployment_blocked(deployment):
+            return None
+        return CredentialLiteLLMParams.model_validate(
+            deployment.litellm_params.model_dump(exclude_none=True)
+        ).model_dump(exclude_none=True)
+
+    def _get_model_group_deployment_usable_by_team(
+        self, model_group_name: str, team_id: str | None
+    ) -> Deployment | None:
+        with self._deployment_index_lock:
+            indices: Final = self._core_model_name_to_deployment_indices.get(model_group_name) or ()
+            first_usable: Final = next(
+                (
+                    self._core_model_list[idx]
+                    for idx in indices
+                    if self._core_deployment_usable_by_team(self._core_model_list[idx], team_id)
+                ),
+                None,
+            )
+        return None if first_usable is None else Deployment(**first_usable)  # pyright: ignore[reportArgumentType]  # a stored entry
+
+    def _get_team_public_name_deployment(self, model_id: str, team_id: str | None) -> Deployment | None:
+        if team_id is None:
+            return None
+        with self._deployment_index_lock:
+            team_indices: Final = self._core_team_model_to_deployment_indices.get((team_id, model_id))
+            team_model: Final = self._core_model_list[team_indices[0]] if team_indices else None
+        return None if team_model is None else Deployment(**team_model)  # pyright: ignore[reportArgumentType]  # a stored entry
+
+    def _get_wildcard_deployment_usable_by_team(self, model_id: str, team_id: str | None) -> Deployment | None:
+        team_router: Final = self._core_team_pattern_routers.get(team_id) if team_id is not None else None
+        team_models: Final = team_router.route(model_id) if team_router else None
+        global_models: Final = tuple(
+            model
+            for model in (self._core_pattern_router.route(model_id) or ())
+            if self._core_deployment_usable_by_team(model, team_id)
+        )
+        candidates: Final = team_models or global_models
+        if not candidates:
+            return None
+        return Deployment(**candidates[0])  # a pattern router holds stored entry dicts
+
+    def _core_get_credential_deployment(self, model_id: str, team_id: str | None = None) -> Deployment | None:
+        deployment: Final = (
+            self._core_get_deployment(model_id=model_id)
+            or self._get_model_group_deployment_usable_by_team(model_group_name=model_id, team_id=team_id)
+            or self._get_team_public_name_deployment(model_id=model_id, team_id=team_id)
+            or self._get_wildcard_deployment_usable_by_team(model_id=model_id, team_id=team_id)
+        )
+        if deployment is None or self._core_is_deployment_blocked(deployment):
+            return None
+        return deployment
+
+    def _core_get_deployment_credentials_with_provider(
+        self, model_id: str, team_id: str | None = None
+    ) -> UntypedEntry | None:
+        deployment: Final = self._core_get_credential_deployment(model_id=model_id, team_id=team_id)
+        if deployment is None:
+            return None
+        base: Final = CredentialLiteLLMParams.model_validate(
+            deployment.litellm_params.model_dump(exclude_none=True)
+        ).model_dump(exclude_none=True)
+        credential_name: Final = deployment.litellm_params.litellm_credential_name
+        resolved: Final[UntypedEntry] = dict(base)
+        if credential_name is not None:
+            credential_values: Final = CredentialAccessor.get_credential_values(credential_name)
+            if not credential_values:
+                verbose_router_logger.warning("Credential '%s' not found in credential_list", credential_name)
+            resolved.update(credential_values)
+            _ = resolved.pop("litellm_credential_name", None)
+        model: Final = deployment.litellm_params.model
+        resolved["model"] = model
+        resolved["custom_llm_provider"] = (
+            deployment.litellm_params.custom_llm_provider or (model.split("/")[0] if "/" in model else None) or "openai"
+        )
+        return resolved
+
+    # -- routable names ---------------------------------------------------------------------------
+
+    def _routable_deployments(self, model_name: str, team_id: str | None) -> tuple[UntypedEntry, ...]:
+        named: Final = self._core_get_all_deployments(
+            model_name=self._core_routable_model_group(model_name), team_id=team_id
+        )
+        usable: Final = tuple(d for d in named if self._core_deployment_usable_by_team(d, team_id))
+        return tuple(d for d in (usable or named) if _model_info_of(d).get("blocked") is not True)
+
+    def _core_get_routable_upstream_model(self, model_name: str, team_id: str | None = None) -> str | None:
+        deployment: Final = next(iter(self._routable_deployments(model_name, team_id)), None)
+        if deployment is None:
+            return None
+        model: Final = _params_of(deployment).get("model")
+        return None if model is None else str(model)
+
+    def _core_map_team_model(
+        self, team_model_name: str | None, team_id: str, custom_llm_provider: str | None = None
+    ) -> str | None:
+        """A team's public name to its group, or a deployment for a model-less call (``map_team_model``)."""
+        models: Final = self._core_get_model_list(model_name=team_model_name, team_id=team_id)
+        if not models:
+            return None
+        if team_model_name is None and custom_llm_provider is not None:
+            return self._team_model_for_provider(models, team_id, custom_llm_provider)
+        for model in models:
+            info = _model_info_of(model)
+            if info.get("team_id") == team_id:
+                if team_model_name is None:
+                    public = info.get("team_public_model_name") or model.get("model_name")
+                    return None if public is None else str(public)
+                return team_model_name
+        return None
+
+    @staticmethod
+    def _team_model_for_provider(models: Sequence[UntypedEntry], team_id: str, custom_llm_provider: str) -> str | None:
+        def public_name(deployment: UntypedEntry) -> str | None:
+            info: Final = _model_info_of(deployment)
+            if info.get("team_id") != team_id:
+                return None
+            name: Final = info.get("team_public_model_name")
+            return name if isinstance(name, str) and name else str(deployment["model_name"])
+
+        def provider(deployment: UntypedEntry) -> object:
+            return provider_for_generic_call(_params_of(deployment))  # pyright: ignore[reportArgumentType]  # the deployment's params
+
+        matching: Final = next(
+            (m for m in models if public_name(m) is not None and provider(m) == custom_llm_provider), None
+        )
+        if matching is None:
+            return None
+        name: Final = public_name(matching)
+        if name is None:
+            return None
+        if all(provider(m) == custom_llm_provider for m in models if public_name(m) == name):
+            return name
+        matched_id: Final = _model_info_of(matching).get("id")
+        return matched_id if isinstance(matched_id, str) else None
+
+    # -- access groups ----------------------------------------------------------------------------
+
+    def _core_get_model_access_groups(
+        self, model_name: str | None = None, model_access_group: str | None = None, team_id: str | None = None
+    ) -> Mapping[str, Sequence[str]]:
+        use_cache: Final = model_name is None and model_access_group is None and team_id is None
+        if use_cache and self._access_groups_cache is not None:
+            return self._access_groups_cache
+        groups: Final[dict[str, list[str]]] = {}  # mutable-ok: built here, as the core's defaultdict
+        for entry in self._core_get_model_list(model_name=model_name, team_id=team_id) or []:
+            info = entry.get("model_info")
+            if not info:
+                continue
+            for group in _model_info_of(entry).get("access_groups", []) or []:  # pyright: ignore[reportGeneralTypeIssues]  # a configured list
+                if model_access_group is None or group == model_access_group:
+                    groups.setdefault(str(group), []).append(str(entry["model_name"]))
+        if use_cache:
+            self._access_groups_cache = groups
+        return groups
+
+    def _core_is_model_access_group_for_wildcard_route(self, model_access_group: str) -> bool:
+        groups: Final = self._core_get_model_access_groups(model_access_group=model_access_group)
+        return any(
+            self._core_pattern_router.route(request=model) is not None for model in groups.get(model_access_group, [])
+        )
 
 
 # -- the registry() view -------------------------------------------------------------------------
