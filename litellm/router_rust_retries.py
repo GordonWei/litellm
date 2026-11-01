@@ -37,6 +37,32 @@ def refuse_unserved_retry_policies(policies: object) -> None:
         raise RustCoreUnsupported("a request model_group_retry_policy that is not a policy per group is not served yet")
 
 
+_STREAM_POLICY_ENDPOINTS: Final = frozenset({"aanthropic_messages", "anthropic_messages"})
+
+
+def refuse_unserved_request_retry_policies(endpoint: str, request: Mapping[str, object]) -> None:
+    """A request ``model_group_retry_policy`` with an entry that is not a policy is served only on a
+    streamed Anthropic messages call, which resolves such an entry to no policy at all
+    (``_anthropic_messages_resolved_retry_policy``)."""
+    policies: Final = request.get("model_group_retry_policy")
+    if endpoint in _STREAM_POLICY_ENDPOINTS and request.get("stream") is True and isinstance(policies, Mapping):
+        return
+    refuse_unserved_retry_policies(policies)
+
+
+def group_policy_document(policies: object) -> object:
+    """A request ``model_group_retry_policy`` as router-core reads it: an entry that is not a
+    policy is an empty policy, which grants nothing (see above)."""
+    if not isinstance(policies, Mapping):
+        return policies
+    entries: Final[Mapping[object, object]] = policies  # pyright: ignore[reportUnknownVariableType]  # read as objects
+    empty: Final[Mapping[str, object]] = {}
+    served: Final[dict[object, object]] = {  # mutable-ok: built here
+        group: entry if isinstance(entry, RetryPolicy | Mapping) else empty for group, entry in entries.items()
+    }
+    return served
+
+
 def _count(deployments: object) -> int:
     return len(deployments) if isinstance(deployments, list) else 0  # pyright: ignore[reportUnknownArgumentType]  # only the length is read
 
@@ -77,4 +103,10 @@ class RustRetries:
         return self._handle.retry_policy_retries(dict(attempt_failure(exception)), model_group)
 
 
-__all__ = ["RustRetries", "refuse_unserved_retry_policies", "resolved_retry_policy"]
+__all__ = [
+    "RustRetries",
+    "group_policy_document",
+    "refuse_unserved_request_retry_policies",
+    "refuse_unserved_retry_policies",
+    "resolved_retry_policy",
+]

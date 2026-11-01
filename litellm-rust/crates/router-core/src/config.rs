@@ -202,6 +202,16 @@ pub struct RouterConfig {
     /// `Router(plugins=[...])` is set: the host runs the routing-plugin pipeline.
     pub routing_plugins: bool,
     pub enable_health_check_routing: bool,
+    /// How old (seconds) a background health check result may be and still count
+    /// (`health_check_staleness_threshold`, else the default interval times its multiplier).
+    pub health_check_staleness_threshold: Option<f64>,
+    /// `background_health_check_model_groups`: when set, only these groups are health-filtered.
+    pub background_health_check_model_groups: Option<Vec<String>>,
+    /// `enable_weighted_failover`: a failed deployment's group is re-picked without it before
+    /// any cross-group fallback (simple-shuffle only).
+    pub enable_weighted_failover: bool,
+    /// `fallback_on_unsupported_params`; `None` is Python's default, `True`.
+    pub fallback_on_unsupported_params: Option<bool>,
     /// Deployment ids that are a provider's default and never cool down
     /// (`provider_default_deployment_ids`).
     pub provider_default_deployment_ids: Vec<String>,

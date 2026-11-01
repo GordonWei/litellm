@@ -78,6 +78,12 @@ class RustHealthCallbacks:
     async def _drive_cache_steps(self, call: "RouterCall") -> Mapping[str, object]:
         raise NotImplementedError
 
+    def _core_get_allowed_fails_from_policy(self, exception: Exception) -> int | None:
+        """The router ``allowed_fails_policy``'s allowance for this exception, decided by router-core."""
+        from litellm.router_rust_core import attempt_failure
+
+        return self._handle.allowed_fails_for(dict(attempt_failure(exception)))
+
     def deployment_callback_on_failure(
         self,
         kwargs: Mapping[str, object],

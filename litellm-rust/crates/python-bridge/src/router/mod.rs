@@ -422,6 +422,11 @@ impl RouterCoreHandle {
         retries::policy_retries(&self.router, failure, model_group)
     }
 
+    /// `_core_get_allowed_fails_from_policy` for a failure shaped like an attempt outcome.
+    fn allowed_fails_for(&self, failure: &Bound<'_, PyDict>) -> PyResult<Option<u32>> {
+        retries::allowed_fails(&self.router, failure)
+    }
+
     /// `should_retry_this_error` as a predicate, for a failure shaped like an attempt outcome.
     fn should_retry(
         &self,
@@ -618,6 +623,7 @@ pub(crate) fn attempt_outcome(outcome: &Bound<'_, PyDict>) -> PyResult<Result<u6
     failure.num_retries = item(outcome, "num_retries")?;
     failure.detail = item::<String>(outcome, "detail")?.map(Into::into);
     failure.recorded = item::<bool>(outcome, "recorded")?.unwrap_or(false);
+    failure.names_provider = item::<bool>(outcome, "llm_provider")?.unwrap_or(false);
     failure.classes = item::<Vec<String>>(outcome, "classes")?
         .unwrap_or_default()
         .into_iter()

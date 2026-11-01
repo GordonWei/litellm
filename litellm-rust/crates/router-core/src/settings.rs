@@ -29,9 +29,16 @@ pub struct Settings {
     pub enable_pre_call_checks: bool,
     pub routing_plugins: bool,
     pub enable_health_check_routing: bool,
+    pub health_check_staleness: Duration,
+    pub background_health_check_model_groups: Option<Arc<[String]>>,
+    pub enable_weighted_failover: bool,
+    pub fallback_on_unsupported_params: bool,
     pub provider_default_deployment_ids: Arc<[String]>,
     pub dynamic: Arc<RouterDynamicConfig>,
 }
+
+/// `DEFAULT_HEALTH_CHECK_INTERVAL * DEFAULT_HEALTH_CHECK_STALENESS_MULTIPLIER`.
+pub const DEFAULT_HEALTH_CHECK_STALENESS: Duration = Duration::from_secs(300 * 2);
 
 fn seconds(value: f64) -> Duration {
     Duration::try_from_secs_f64(value).unwrap_or_default()
@@ -56,6 +63,15 @@ impl Settings {
             enable_pre_call_checks: config.enable_pre_call_checks,
             routing_plugins: config.routing_plugins,
             enable_health_check_routing: config.enable_health_check_routing,
+            health_check_staleness: config
+                .health_check_staleness_threshold
+                .map_or(DEFAULT_HEALTH_CHECK_STALENESS, seconds),
+            background_health_check_model_groups: config
+                .background_health_check_model_groups
+                .clone()
+                .map(Into::into),
+            enable_weighted_failover: config.enable_weighted_failover,
+            fallback_on_unsupported_params: config.fallback_on_unsupported_params.unwrap_or(true),
             provider_default_deployment_ids: config.provider_default_deployment_ids.clone().into(),
             dynamic,
         }

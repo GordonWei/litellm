@@ -31,6 +31,10 @@ const STATIC_KEYS: &[&str] = &[
     "enable_pre_call_checks",
     "routing_plugins",
     "enable_health_check_routing",
+    "health_check_staleness_threshold",
+    "background_health_check_model_groups",
+    "enable_weighted_failover",
+    "fallback_on_unsupported_params",
     "provider_default_deployment_ids",
 ];
 
@@ -178,6 +182,7 @@ struct RequestSpec {
     max_fallbacks: Option<u32>,
     mock_failure: Option<MockFailure>,
     cooldown_time: Option<f64>,
+    health_check_probe: Option<bool>,
     body: Option<Value>,
 }
 
@@ -226,6 +231,7 @@ pub(crate) fn request(value: Value, model: Option<&str>) -> Result<RouterRequest
         max_fallbacks: spec.max_fallbacks,
         mock_failure: spec.mock_failure,
         cooldown_time: spec.cooldown_time,
+        health_check_probe: spec.health_check_probe.unwrap_or(false),
         payload: None,
     })
 }

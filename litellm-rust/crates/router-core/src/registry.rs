@@ -46,6 +46,9 @@ pub struct ModelInfo {
     pub blocked: bool,
     pub cooldown_time: Option<f64>,
     pub allowed_fails: Option<u32>,
+    /// `model_info.allowed_fails_policy` when it is a dict, read as Python reads it: field name
+    /// to allowed fails, values as given.
+    pub allowed_fails_policy: Option<Map<String, Value>>,
     pub raw: Map<String, Value>,
 }
 
@@ -72,6 +75,10 @@ impl ModelInfo {
                 .get("allowed_fails")
                 .and_then(Value::as_u64)
                 .and_then(|fails| u32::try_from(fails).ok()),
+            allowed_fails_policy: raw
+                .get("allowed_fails_policy")
+                .and_then(Value::as_object)
+                .cloned(),
             raw,
         }
     }

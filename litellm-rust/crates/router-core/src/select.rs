@@ -12,6 +12,7 @@ use crate::{
     Core, Snapshot,
     config::{Op, RoutingStrategy},
     error::Error,
+    health_routing::WhenAllUnhealthy,
     host::{RouterRequest, RoutingContext, SelectStage},
     registry::{Deployment, ResolveKind, ResolveScope},
     strategy::{StrategyScope, routing_context},
@@ -74,6 +75,8 @@ pub struct Candidates {
 pub(crate) struct SelectInputs {
     pub target_order: Option<i64>,
     pub skipped_ids: Vec<String>,
+    /// A weighted failover hop's `_excluded_deployment_ids`: never picked.
+    pub excluded_ids: Arc<[String]>,
     /// Stop before the plugins, order and skip filters: the group less cooldowns and blocked
     /// deployments, which `_async_get_healthy_deployments` counts when deciding whether to retry.
     pub count_only: bool,
@@ -262,23 +265,41 @@ impl Core {
 
         // A deployment named by its id is served even while it cools down
         // (`get_deployment_by_model_id` returns before the cooldown filter).
+        let settings = &snapshot.settings;
         let cooling = if resolution.kind == ResolveKind::Id {
             Vec::new()
         } else {
             let ids: Vec<String> = all.iter().map(|d| d.id.clone()).collect();
             self.health.active_cooldowns(&ids).await?
         };
-        let mut healthy: Vec<Arc<Deployment>> = all
+        // Health-check filtering runs before the cooldown filter, except for a deployment named
+        // by its id and the healthy count a retry decision reads.
+        let checked = if resolution.kind == ResolveKind::Id || inputs.count_only {
+            all.clone()
+        } else {
+            let when_all_unhealthy = if request.health_check_probe {
+                WhenAllUnhealthy::Nothing
+            } else {
+                WhenAllUnhealthy::KeepAll
+            };
+            self.health
+                .health_check_filter(settings, all.clone(), when_all_unhealthy)
+                .await
+        };
+        let mut healthy: Vec<Arc<Deployment>> = checked
             .iter()
             .filter(|d| !cooling.iter().any(|(id, _)| *id == d.id))
             .cloned()
             .collect();
-        let settings = &snapshot.settings;
+        // The safety net when health-check routing drives cooldowns (an allowed_fails_policy):
+        // never on a listed pass-through pick or the healthy count.
         if healthy.is_empty()
+            && !listed
+            && !inputs.count_only
             && settings.enable_health_check_routing
             && settings.allowed_fails_policy.is_some()
         {
-            healthy = all.clone();
+            healthy = checked;
         }
         if resolution.kind == ResolveKind::Id
             && let Some(deployment) = all.first()
@@ -436,7 +457,9 @@ impl Core {
             healthy.retain(|d| d.order() == Some(order));
         }
 
-        healthy.retain(|d| !request.excluded_ids.contains(&d.id));
+        healthy.retain(|d| {
+            !request.excluded_ids.contains(&d.id) && !inputs.excluded_ids.contains(&d.id)
+        });
 
         if !inputs.skipped_ids.is_empty() || !request.retry_skipped_ids.is_empty() {
             let kept: Vec<Arc<Deployment>> = healthy
