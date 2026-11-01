@@ -196,7 +196,12 @@ PLANS: Final[Mapping[str, Plan]] = MappingProxyType(
         ),
         "arerank": Plan("arerank", "arerank", "rerank"),
         "aadapter_completion": Plan(
-            "aadapter_completion", "aadapter_completion", "adapter", prepare_field=None, fail_key="group"
+            "aadapter_completion",
+            "aadapter_completion",
+            "adapter",
+            prepare_field=None,
+            splits_stream_timeout=True,
+            fail_key="group",
         ),
         "acreate_batch": Plan(
             "acreate_batch",
