@@ -222,10 +222,22 @@ impl Core {
             });
         }
         let team_id = request.team_id.as_deref();
-        let mut all: Vec<Arc<Deployment>> = deployments
+        let usable: Vec<Arc<Deployment>> = deployments
             .into_iter()
             .filter(|d| d.usable_by_team(team_id))
             .collect();
+        // `_filter_reserved_deployments`: PTU shares keep holders to their share and everyone
+        // else to the deployments split into none.
+        let (mut all, withheld) = crate::ptu::filter_shared(usable, team_id);
+        if withheld && all.is_empty() {
+            return Err(Error::PtuReserved {
+                model: match resolution.kind {
+                    ResolveKind::Id => first_model.unwrap_or_else(|| name.to_owned()),
+                    ResolveKind::Wildcard | ResolveKind::SpecificDeployment => name.to_owned(),
+                    _ => resolution.group.clone(),
+                },
+            });
+        }
         let listed =
             request.pass_through == Some(PassThrough::Listed) && resolution.kind != ResolveKind::Id;
         if listed {

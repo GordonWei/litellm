@@ -82,10 +82,19 @@ from litellm.router_rust_selection import (
     picked_id,
     routing_pre_call_checks,
 )
+from litellm.router_rust_settings import (
+    MISSING,
+    SettingsUpdate,
+    apply_construction_effects,
+    argument_attribute,
+    default_litellm_params,
+    initial_plain,
+    read_settings_update,
+    request_timeout,
+    settings_view,
+)
 from litellm.router_rust_shaping import Shaping
 from litellm.router_rust_streaming import (
-    CONTINUATION_FLAG,
-    NO_FLAG,
     StreamAttempt,
     continuation_flag,
     continuation_routing,
@@ -103,6 +112,9 @@ from litellm.types.utils import LlmProviders
 
 if TYPE_CHECKING:
     from litellm.caching.dual_cache import DualCache
+    from litellm.caching.redis_cache import RedisCache
+    from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
     from litellm.router_utils.cooldown_cache import CooldownCache
     from litellm.rust_bridge._native import (  # pyright: ignore[reportPrivateUsage]  # the stub's step shapes
         RouterCall,
@@ -693,53 +705,25 @@ class RustHealth(RouterHealth):
         done: Final = self._core._drive_sync_steps(call)  # pyright: ignore[reportPrivateUsage]  # see above
         return bool(done.get("cooled"))
 
+    def team_ptu_ceiling(self, team_id: str, model_group: str) -> "PTUTeamCeiling | None":
+        return self._core._hosted._core_team_ptu_ceiling(team_id, model_group)  # pyright: ignore[reportPrivateUsage]  # the host registry's ported ceiling
+
     async def usage(  # pyright: ignore[reportIncompatibleMethodOverride]  # the same two kinds
         self, model_group: str, *, kind: Literal["current", "remaining"] = "current"
     ) -> tuple[int | None, int | None] | Mapping[str, int]:
-        keys: Final = self._core._handle.usage_keys(model_group)  # pyright: ignore[reportPrivateUsage]  # see above
-        if keys is None:
-            if kind == "current":
-                return None, None
-            return {}
-        with service_target(ROUTER_USAGE_TARGET):
-            values: Final = await self.store.async_batch_get_cache(  # pyright: ignore[reportUnknownMemberType]  # DualCache's reads are untyped
-                keys=[tpm for _, tpm, _ in keys] + [rpm for _, _, rpm in keys]
-            )
+        """The group's usage this minute, read from the routing cache over the host registry's
+        live model list, as ``get_model_group_usage`` / ``get_remaining_model_group_usage`` read it."""
+        hosted: Final = self._core._hosted  # pyright: ignore[reportPrivateUsage]  # see above
         if kind == "current":
-            tpm_values: Final = (values or [])[: len(keys)]
-            rpm_values: Final = (values or [])[len(keys) :]
-            return _summed(tpm_values), _summed(rpm_values)
-        if kind != "remaining":
-            raise ValueError(f"unknown usage kind {kind!r}")
-        current: Final = await self.usage(model_group)
-        current_tpm, current_rpm = current if isinstance(current, tuple) else (None, None)
-        limits: Final = [
-            as_str_mapping((as_str_mapping(self._core._handle.deployment(id)) or {}).get("litellm_params")) or {}  # pyright: ignore[reportPrivateUsage]  # see above
-            for id, _, _ in keys
-        ]
-        tpm_limit: Final = _limit(limits, "tpm")
-        rpm_limit: Final = _limit(limits, "rpm")
-        remaining: Final[dict[str, int]] = {}  # mutable-ok: the header map, built here
-        if tpm_limit is not None:
-            remaining["x-ratelimit-remaining-tokens"] = tpm_limit - (current_tpm or 0)
-            remaining["x-ratelimit-limit-tokens"] = tpm_limit
-        if rpm_limit is not None:
-            remaining["x-ratelimit-remaining-requests"] = rpm_limit - (current_rpm or 0)
-            remaining["x-ratelimit-limit-requests"] = rpm_limit
-        return remaining
+            return await hosted._core_get_model_group_usage(model_group)  # pyright: ignore[reportPrivateUsage]  # the ported usage read
+        if kind == "remaining":
+            return await hosted._core_get_remaining_model_group_usage(model_group)  # pyright: ignore[reportPrivateUsage]  # see above
+        raise ValueError(f"unknown usage kind {kind!r}")
 
 
-_HEALTH_SERVED: Final = frozenset({"store", "cooldowns", "failures_this_minute", "record_failure", "usage"})
-
-
-def _summed(values: Sequence[object]) -> int | None:
-    numbers: Final = [int(value) for value in values if isinstance(value, int | float)]
-    return sum(numbers) if numbers else None
-
-
-def _limit(params: Sequence[Mapping[str, object]], key: str) -> int | None:
-    values: Final = [int(value) for p in params if isinstance((value := p.get(key)), int | float)]
-    return sum(values) if values else None
+_HEALTH_SERVED: Final = frozenset(
+    {"store", "cooldowns", "failures_this_minute", "record_failure", "usage", "team_ptu_ceiling"}
+)
 
 
 # --- the core -----------------------------------------------------------------------------------
@@ -758,7 +742,15 @@ class RustCore(_SettingsSource, RustRegistryMembers):
 
         self._config: Final = config
         self._host: Final = host
+        apply_construction_effects(config, host)
         self._resolved: Resolved = resolved
+        # Settings the Python core keeps as plain attributes, and settings deleted with `del`.
+        self._plain: Final = initial_plain(config)
+        self._deleted: frozenset[str] = frozenset()
+        self._request_timeout: Final = request_timeout(config)
+        legacy: Final[dict[str, object]] = {"deployment_stats": {}}  # mutable-ok: the core's own legacy attributes
+        self._legacy: Final = legacy
+        self._health_view: RustHealth | None = None
         self._cache: Final = host.routing_cache(config)
         self._cooldowns: CooldownCache = CooldownCache(cache=self._cache, default_cooldown_time=resolved.cooldown_time)
         self._version: int = 1
@@ -821,7 +813,42 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         endpoint: Final = endpoints.member(name) if isinstance(endpoints, RustEndpoints) else None
         if endpoint is not None:
             return endpoint
+        attribute: Final = self._settings_attribute(name) if "_resolved" in self.__dict__ else MISSING
+        if attribute is not MISSING:
+            return attribute
         raise RustCoreUnsupported(f"'{name}' is not served by the Rust router core", name=name, obj=self)
+
+    def _settings_attribute(self, name: str) -> object:
+        """A router attribute that reads a setting, the constructor's arguments or a constant."""
+        r: Final = self._resolved
+        resolved: Final[Mapping[str, object]] = {
+            "num_retries": r.num_retries,
+            "max_fallbacks": r.max_fallbacks,
+            "timeout": r.timeout,
+            "retry_after": r.retry_after,
+            "explicit_allowed_fails": r.explicit_allowed_fails,
+            "routing_strategy_args": r.routing_strategy_args,
+            "request_timeout": self._request_timeout,
+            "default_priority": self._endpoints._default_priority,  # pyright: ignore[reportPrivateUsage]  # parsed by the endpoint plans
+        }
+        if name in resolved:
+            return resolved[name]
+        if name in self._plain:
+            return self._plain[name]
+        if name in self._legacy:
+            return self._legacy[name]
+        if name == "healthy_deployments":
+            return self._hosted._core_model_list  # pyright: ignore[reportPrivateUsage]  # the live list, as the core keeps it
+        if name == "get_model_group_io_token_usage":
+            return self._hosted.get_model_group_io_token_usage
+        if name == "scheduler":
+            return self._endpoints._get_scheduler()  # pyright: ignore[reportPrivateUsage]  # the endpoint plans' scheduler
+        if name == "chat":
+            from litellm.main import Chat
+
+            self._legacy["chat"] = Chat(params=default_litellm_params(self._config), router_obj=self)  # pyright: ignore[reportArgumentType]  # Chat calls the router's endpoints, which this core serves
+            return self._legacy["chat"]
+        return argument_attribute(self._config, name)
 
     @property
     def _shaping(self) -> Shaping:
@@ -872,13 +899,17 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         return self._settings
 
     def _settings_snapshot(self) -> RustSettings:
+        from litellm.types.router import RouterGeneralSettings
+
         r: Final = self._resolved
-        return RustSettings(
+        snapshot: Final = RustSettings(
             routing_strategy=r.routing_strategy,
             fallbacks=r.fallbacks,
             context_window_fallbacks=r.context_window_fallbacks,
             content_policy_fallbacks=r.content_policy_fallbacks,
-            default_litellm_params=dict(r.default_litellm_params),
+            default_litellm_params=dict(r.default_litellm_params)
+            if "default_litellm_params" in r.assigned
+            else default_litellm_params(self._config),
             cooldown_time=r.cooldown_time,
             allowed_fails=r.allowed_fails,
             allowed_fails_policy=r.allowed_fails_policy,  # pyright: ignore[reportArgumentType]  # the policy as passed
@@ -894,18 +925,18 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             search_tools=self._endpoints.search_tools,  # pyright: ignore[reportArgumentType]  # the configured entries, as passed
             guardrail_list=self._endpoints.guardrail_list,  # pyright: ignore[reportArgumentType]  # same
             provider_default_deployment_ids=self._hosted._core_provider_default_deployment_ids,  # pyright: ignore[reportPrivateUsage]  # the host registry's live list
+            health_check_ignore_transient_errors=False,
+            router_general_settings=self._config.get("router_general_settings") or RouterGeneralSettings(),  # pyright: ignore[reportArgumentType]  # the argument as passed
             _router=self,  # pyright: ignore[reportArgumentType]  # the snapshot reads as_dict from this core
-            _unset=frozenset(
-                {
-                    "default_deployment",
-                    "default_max_parallel_requests",
-                    "health_check_ignore_transient_errors",
-                    "background_health_check_model_groups",
-                    "router_general_settings",
-                    "provider_budget_config",
-                    "kubernetes_pod_discovery",
-                }
-            ),
+            _unset=frozenset({"kubernetes_pod_discovery"}),
+        )
+        if not self._deleted:
+            return snapshot
+        # A deleted setting reads as unset.
+        return dataclasses.replace(
+            snapshot,
+            **dict.fromkeys(self._deleted, None),  # pyright: ignore[reportArgumentType]  # settings fields only
+            _unset=snapshot._unset | self._deleted,  # pyright: ignore[reportPrivateUsage]  # the snapshot's own unset set
         )
 
     def settings_dict(self) -> Mapping[str, object]:
@@ -913,7 +944,7 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         latency: Final = self._selectors.latency_args() if r.routing_strategy == "latency-based-routing" else None
         # `get_settings` reports the latency selector's full routing args.
         args: Final = latency if latency is not None else dict(r.routing_strategy_args)
-        return {
+        values: Final = {
             "routing_strategy_args": args,
             "routing_strategy": r.routing_strategy,
             "allowed_fails": r.allowed_fails,
@@ -925,14 +956,26 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             "context_window_fallbacks": r.context_window_fallbacks,
             "model_group_alias": dict(r.model_group_alias),
             "enable_mid_stream_fallback_continuation": r.enable_mid_stream_fallback_continuation,
+            "enable_tag_filtering": r.enable_tag_filtering,
+            "tag_routing_prefix": r.tag_routing_prefix,
             "routing_groups": group_settings(r.routing_groups),
         }
+        return settings_view(values, self._plain, self._deleted)
 
     def health(self) -> RustHealth:
-        return RustHealth(self)
+        """The health view, built once."""
+        if self._health_view is None:
+            self._health_view = RustHealth(self)
+        return self._health_view
 
-    def observe(self, **_: object) -> RoutingObservers:  # kwargs-ok: the RouterCore observe options
-        raise RustCoreUnsupported("observe() is not served by the Rust router core yet", name="observe", obj=self)
+    def observe(self, logging_obj: object = None, *, request_scoped: bool = False) -> RoutingObservers:
+        """The routing observers. This core registers no outcome callbacks and builds no alerting
+        (``alerting_config`` is declined), so there is no Slack alerting logger."""
+        if request_scoped:
+            raise RustCoreUnsupported("observe(request_scoped=True) is not served by the Rust router core yet")
+        if logging_obj is not None:
+            raise RustCoreUnsupported("observe(logging_obj) is not served by the Rust router core yet")
+        return RoutingObservers(slack_alerting_logger=None)
 
     def register_plugin(self, plugin: "CustomRoutingStrategyBase") -> None:
         # Plugins will run through the host's select step; until then a plugin is refused, never
@@ -949,29 +992,63 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         self._handle.retire()
 
     def apply(self, changes: ChangeSet) -> ApplyResult:
-        if changes.redis_cache is not None or changes.refresh_model_info:
-            raise RustCoreUnsupported("apply(redis_cache / refresh_model_info) is not served by the Rust router core")
-        # `update_settings` reads the flag itself; it is not a settings field a changeset assigns.
-        flag: Final = changes.settings.get(CONTINUATION_FLAG, NO_FLAG)
-        if flag is not NO_FLAG:
-            self._set_continuation(continuation_flag(flag))
-        values: Final = {**changes.assign, **{k: v for k, v in changes.settings.items() if k != CONTINUATION_FLAG}}
-        if "routing_groups" in changes.settings:
+        """``apply_changes``: assigned settings, then ``update_settings``, upserts, deletes and the
+        Redis cache, in that order. A refused changeset changes nothing."""
+        from litellm.router_api import ASSIGNABLE_ALIASES, PLAIN_SETTING_ATTRIBUTES, SETTING_FIELDS
+
+        if changes.refresh_model_info:
+            raise TypeError("ChangeSet(refresh_model_info=True) needs aapply()")
+        unknown: Final = sorted(set(changes.assign) - {*SETTING_FIELDS, *PLAIN_SETTING_ATTRIBUTES, *ASSIGNABLE_ALIASES})
+        if unknown:
+            raise ValueError(f"not assignable router settings: {unknown}")
+        update: Final = read_settings_update(changes.settings)
+        if update.continuation is not MISSING:
+            self._set_continuation(continuation_flag(update.continuation))
+        self._apply_settings(changes.assign, update)
+        # Upserts first, then deletes (`apply_changes`), through the host registry, which hands
+        # each change to the Rust core.
+        upserted: Final = [self._hosted._core_upsert_deployment(deployment=d) for d in changes.upsert]  # pyright: ignore[reportPrivateUsage]  # see __init__
+        deleted: Final = [self._hosted._core_delete_deployment(id=i) for i in changes.delete]  # pyright: ignore[reportPrivateUsage]  # see __init__
+        if changes.redis_cache is not None:
+            # `_core_update_redis_cache`: the routing state's cache gains the Redis cache.
+            self._cache.attach_redis_cache(changes.redis_cache)
+        return ApplyResult(
+            version=self._hosted._registry_version,  # pyright: ignore[reportPrivateUsage]  # see __init__
+            upserted=upserted,
+            deleted=deleted,  # pyright: ignore[reportArgumentType]  # the removed model_list entries, as the core returns them
+        )
+
+    async def aapply(self, changes: ChangeSet) -> ApplyResult:
+        """``apply``, then the model info refresh, which needs I/O."""
+        result: Final = self.apply(dataclasses.replace(changes, refresh_model_info=False, refresh_client=None))
+        if changes.refresh_model_info:
+            await self._hosted.arefresh_model_info(changes.refresh_client)
+        return result
+
+    def _apply_settings(self, assign: Mapping[str, object], update: SettingsUpdate) -> None:
+        values: Final = {**assign, **update.values}
+        given: Final = dict(update.values)  # the settings passed through `update_settings`
+        if update.routing_groups is not MISSING:
+            given["routing_groups"] = update.routing_groups
             values["routing_groups"] = parse_groups(
-                changes.settings["routing_groups"],
+                update.routing_groups,
                 frozenset(str(d.get("model_name")) for d in self._handle.deployments()),
                 frozenset(self._resolved.model_group_alias),
             )
+        self._plain.update(update.plain)
+        if self._deleted & set(values):
+            self._deleted = self._deleted - set(values)
+            self._settings = None
         if values:
             previous: Final = self._resolved
-            resolved: Final = previous.changed(values, frozenset(changes.settings))
+            resolved: Final = previous.changed(values, frozenset(given))
             static_changed: Final = bool(_STATIC_SETTINGS & set(values))
             self._resolved = resolved
             if set(values) & set(SETTING_FIELDS):
                 self._settings = None  # the snapshot holds settings fields, not the plain attributes
             if "model_group_alias" in values:
                 self._hosted._core_model_group_alias = dict(resolved.model_group_alias)  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]  # see __init__
-            self._apply_strategy(previous, resolved, changes.settings)
+            self._apply_strategy(previous, resolved, given)
             if "routing_groups" in values:
                 self._settings = None
                 self._hosted.set_routing_groups(resolved.routing_groups)
@@ -984,15 +1061,6 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             else:
                 names: Final = [str(d.get("model_name")) for d in self._handle.deployments()]
                 self._handle.apply({"settings": resolved.dynamic_document(self._version, names)})
-        # Upserts first, then deletes (`apply_changes`), through the host registry, which hands
-        # each change to the Rust core.
-        upserted: Final = [self._hosted._core_upsert_deployment(deployment=d) for d in changes.upsert]  # pyright: ignore[reportPrivateUsage]  # see __init__
-        deleted: Final = [self._hosted._core_delete_deployment(id=i) for i in changes.delete]  # pyright: ignore[reportPrivateUsage]  # see __init__
-        return ApplyResult(
-            version=self._hosted._registry_version,  # pyright: ignore[reportPrivateUsage]  # see __init__
-            upserted=upserted,
-            deleted=deleted,  # pyright: ignore[reportArgumentType]  # the removed model_list entries, as the core returns them
-        )
 
     def _apply_strategy(self, previous: Resolved, resolved: Resolved, values: Mapping[str, object]) -> None:
         """``_core_update_settings``: a changed strategy re-inits the selectors with the args passed
@@ -1020,6 +1088,49 @@ class RustCore(_SettingsSource, RustRegistryMembers):
 
         _note("delete_deployment", "apply(ChangeSet(delete=[id]))")
         return self.apply(ChangeSet(delete=[id])).deleted[0]
+
+    def update_settings(self, **kwargs: object) -> None:  # kwargs-ok: the deprecated signature, unchanged
+        from litellm.router_deprecated import _note  # pyright: ignore[reportPrivateUsage]  # see upsert_deployment
+
+        _note("update_settings", "apply(ChangeSet(settings={...}))")
+        _ = self.apply(ChangeSet(settings=kwargs))
+
+    def update_redis_cache(self, cache: "RedisCache") -> None:
+        from litellm.router_deprecated import _note  # pyright: ignore[reportPrivateUsage]  # see upsert_deployment
+
+        _note("update_redis_cache", "apply(ChangeSet(redis_cache=cache))")
+        _ = self.apply(ChangeSet(redis_cache=cache))
+
+    async def arefresh_model_info(self, *, client: "AsyncHTTPHandler | None" = None) -> None:
+        from litellm.router_deprecated import _note  # pyright: ignore[reportPrivateUsage]  # see upsert_deployment
+
+        _note("arefresh_model_info", "aapply(ChangeSet(refresh_model_info=True))")
+        _ = await self.aapply(ChangeSet(refresh_model_info=True, refresh_client=client))
+
+    def flush_cache(self) -> None:
+        """Drop the host's response cache and the routing state."""
+        self._host.set_global_cache(None)
+        self._cache.flush_cache()
+
+    def reset(self) -> None:
+        """Empty the host's success and failure callback lists (every entry, not only this core's),
+        drop the retry policy and flush the caches."""
+        for name in ("success_callback", "_async_success_callback", "failure_callback", "_async_failure_callback"):
+            self._host.set_callback_list(name, [])
+        self._plain["retry_policy"] = None
+        self.flush_cache()
+
+    def __delattr__(self, name: str) -> None:
+        # `del router.<setting>` unsets it: the settings view reports it unset from then on.
+        from litellm.router_api import SETTING_FIELDS
+
+        if name not in SETTING_FIELDS:
+            object.__delattr__(self, name)
+            return
+        if name in self._deleted:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        self._deleted = self._deleted | {name}
+        self._settings = None
 
     def __setattr__(self, name: str, value: object) -> None:
         # A setting write is a changeset (`router.num_retries = 2` is `apply(ChangeSet(assign=...))`),
@@ -1598,6 +1709,13 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             return litellm_exceptions.BadRequestError(
                 message=f"You passed in model={named_model}. {RouterErrors.only_strategy_marker_deployments.value}",
                 model=named_model,
+                llm_provider="",
+            )
+        if kind == "ptu_reserved":
+            reserved: Final = str(step.get("error_model") or model)
+            return litellm_exceptions.BadRequestError(
+                message=f"Deployment {reserved} is reserved for the teams holding a PTU share of it",
+                model=reserved,
                 llm_provider="",
             )
         if kind == "not_pass_through":

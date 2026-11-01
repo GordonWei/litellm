@@ -227,7 +227,8 @@ impl Core {
             | Error::Paused { .. }
             | Error::NotPassThrough { .. }
             | Error::NoPassThroughDeployments { .. }
-            | Error::OnlyMarkers { .. } => {
+            | Error::OnlyMarkers { .. }
+            | Error::PtuReserved { .. } => {
                 return None;
             }
         };
