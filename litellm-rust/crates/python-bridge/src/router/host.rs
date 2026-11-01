@@ -20,8 +20,8 @@ use std::{
 
 use async_trait::async_trait;
 use litellm_router_core::{
-    Attempt, AttemptError, Deployment, Error, Host, Output, Payload, RouterCache, RouterEvent,
-    RouterRequest, RouterResponse, RoutingContext, SelectStage,
+    Attempt, AttemptError, Deployment, Error, Host, Output, Payload, PreRoute, RouterCache,
+    RouterEvent, RouterRequest, RouterResponse, RoutingContext, SelectStage,
 };
 use serde_json::Value;
 
@@ -36,6 +36,8 @@ pub(crate) enum StepKind {
     AllowFallback,
     #[strum(serialize = "select")]
     Select,
+    #[strum(serialize = "pre_route")]
+    PreRoute,
     #[strum(serialize = "cache")]
     Cache,
     #[strum(serialize = "done")]
@@ -141,6 +143,13 @@ pub(crate) enum Ask {
         pool: Vec<String>,
         candidates: Vec<String>,
     },
+    /// Pre-routing before a pick resolves `model`: answered with the model group to resolve
+    /// instead, or `None`.
+    PreRoute {
+        model: String,
+        fallback_depth: u32,
+        retry: u32,
+    },
     /// One [`RouterCache`] op against the host's cache. `key` is set for every op but
     /// `batch_get`, which sets `keys`; `value` is set for `set` (the JSON to store) and
     /// `increment` (the amount); `ttl` is in seconds.
@@ -160,6 +169,7 @@ impl Ask {
             Self::Sleep { .. } => StepKind::Sleep,
             Self::AllowFallback { .. } => StepKind::AllowFallback,
             Self::Select { .. } => StepKind::Select,
+            Self::PreRoute { .. } => StepKind::PreRoute,
             Self::Cache { .. } => StepKind::Cache,
         }
     }
@@ -174,6 +184,8 @@ pub(crate) enum Answer {
     AllowFallback(bool),
     /// The candidate ids that remain, pick first.
     Select(Vec<String>),
+    /// The model group to resolve instead, or `None`.
+    PreRoute(Option<String>),
     Cache(CacheOutcome),
 }
 
@@ -184,6 +196,7 @@ impl Answer {
             Self::Slept => StepKind::Sleep,
             Self::AllowFallback(_) => StepKind::AllowFallback,
             Self::Select(_) => StepKind::Select,
+            Self::PreRoute(_) => StepKind::PreRoute,
             Self::Cache(_) => StepKind::Cache,
         }
     }
@@ -492,6 +505,18 @@ impl Host for StepHost {
             .iter()
             .filter_map(|id| candidates.iter().find(|d| d.id == *id).cloned())
             .collect())
+    }
+
+    async fn pre_route(&self, pre: &PreRoute<'_>) -> Result<Option<String>, Error> {
+        let question = Ask::PreRoute {
+            model: pre.name.to_owned(),
+            fallback_depth: pre.fallback_depth,
+            retry: pre.retry,
+        };
+        let Answer::PreRoute(routed) = ask(question).await else {
+            unreachable!("{CHECKED}");
+        };
+        Ok(routed)
     }
 
     async fn allow_fallback(&self, _request: &RouterRequest, target: &str) -> bool {

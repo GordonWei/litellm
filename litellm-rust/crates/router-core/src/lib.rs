@@ -78,6 +78,7 @@ pub mod config;
 pub mod error;
 pub mod health;
 pub mod host;
+pub mod prerouting;
 pub mod registry;
 pub mod routing_groups;
 pub mod select;
@@ -99,6 +100,7 @@ pub use crate::{
     error::{AttemptError, ConfigError, Error, FailureKind, Payload, Unsupported},
     health::{Clock, Health, Outcome, SystemClock},
     host::{Attempt, Host, Output, RouterEvent, RouterRequest, RoutingContext, SelectStage},
+    prerouting::PreRoute,
     registry::{ChangeSet, Deployment, DeploymentSpec, Registry, RegistryVersion},
     select::{Randomness, SeededRandomness, ThreadRandomness},
     settings::Settings,
@@ -253,15 +255,19 @@ impl Router {
     pub async fn select(&self, op: &Op, request: &RouterRequest) -> Result<Arc<Deployment>, Error> {
         self.live()?;
         let snapshot = self.core.snapshot.load_full();
-        let candidates = self
+        let name = self
             .core
-            .candidates(
-                &snapshot,
+            .pre_routed(PreRoute {
                 op,
                 request,
-                &request.model,
-                &SelectInputs::default(),
-            )
+                name: &request.model,
+                fallback_depth: 0,
+                retry: 0,
+            })
+            .await?;
+        let candidates = self
+            .core
+            .candidates(&snapshot, op, request, &name, &SelectInputs::default())
             .await?;
         self.core.pick(&snapshot, op, request, &candidates).await
     }

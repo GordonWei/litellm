@@ -69,6 +69,7 @@ from litellm.router_rust_endpoints import (
     stamp_error,
 )
 from litellm.router_rust_members import RustRegistryMembers
+from litellm.router_rust_prerouting import PreRouter, PreRoutingStrategies
 from litellm.router_rust_registry import HostRegistry, RustRegistry, hosted_registry_view
 from litellm.router_rust_selection import (
     SELECTOR_ATTRIBUTES,
@@ -94,7 +95,6 @@ from litellm.router_rust_streaming import (
     register_continuation_prefill_check,
     shape_attempt_kwargs,
 )
-from litellm.router_strategy.auto_router.auto_router_model_naming import classify_strategy_router_model
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.router_callbacks.track_deployment_metrics import find_deployment_metadata
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
@@ -192,6 +192,8 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "default_priority",
         "polling_interval",
         "ignore_invalid_deployments",
+        # Read host-side by the pre-routing strategies (litellm/router_rust_prerouting.py).
+        "auto_router_capability_limit",
     }
 )
 # Arguments that may be passed at their default without asking for anything.
@@ -588,17 +590,8 @@ def unsupported_arguments(config: RouterConfig) -> frozenset[str]:
         and (isinstance(params.get("weight"), bool) or not isinstance(params.get("weight"), int | float))
         for deployment in _as_list(config.get("model_list"))
     )
-    # Tag routing among pre-routing strategy markers needs pre-routing, which is not served yet.
-    tagged_markers: Final = bool(config.get("enable_tag_filtering")) and any(
-        isinstance(
-            model := (as_str_mapping((as_str_mapping(deployment) or {}).get("litellm_params")) or {}).get("model"), str
-        )
-        and classify_strategy_router_model(model) is not None
-        for deployment in _as_list(config.get("model_list"))
-    )
     return (
         unserved
-        | ({"enable_tag_filtering"} if tagged_markers else frozenset[str]())
         # lar1 routes through a custom strategy (`apply_lar1_routing_strategy`), not served yet.
         | ({"routing_strategy"} if strategy == "lar1" else frozenset[str]())
         | ({"model_list"} if odd_weight else frozenset[str]())
@@ -745,6 +738,7 @@ def _limit(params: Sequence[Mapping[str, object]], key: str) -> int | None:
 # --- the core -----------------------------------------------------------------------------------
 
 
+_NO_INPUT: Final = object()
 _EndpointImpl: TypeAlias = Callable[..., Awaitable[object]]
 # A strategy select step's strategy, selector, keyed name and candidate deployments.
 _StrategyInputs: TypeAlias = tuple[str, object, str, list[dict[str, object]]]
@@ -777,6 +771,12 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             on_change=self._sync_registry,
         )
         self._hosted._core_cache = self._cache  # pyright: ignore[reportPrivateUsage]  # usage reads come from the cache the Rust core writes
+        ctx: Final = RoutingContext(self)  # pyright: ignore[reportArgumentType]  # the strategies read registry(), settings(), health() and select()
+        strategies: Final = PreRoutingStrategies(
+            self._hosted, host, ctx, config.get("auto_router_capability_limit"), self._cache
+        )
+        self._hosted.strategies = strategies
+        self._prerouter: Final = PreRouter(strategies, self._hosted, host, ctx, self._cache)
         self._hosted.build(_as_list(config.get("model_list")) if config.get("model_list") is not None else None)
         self._hosted.set_routing_groups(resolved.routing_groups)
         self._handle: RouterCoreHandle = self._new_handle(list(self._hosted._core_model_list))  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
@@ -946,6 +946,8 @@ class RustCore(_SettingsSource, RustRegistryMembers):
     def retire(self) -> None:
         self._retired = True
         self._selectors.retire()
+        if self._hosted.strategies is not None:
+            self._hosted.strategies.retire()
         self._handle.retire()
 
     def apply(self, changes: ChangeSet) -> ApplyResult:
@@ -1279,6 +1281,8 @@ class RustCore(_SettingsSource, RustRegistryMembers):
                     outcome = await self._answer_cache(step)
                 case "select":
                     outcome = await driver.select(step)
+                case "pre_route":
+                    outcome = await self._pre_route(step, prepared)
                 case "done" | "failed":
                     return driver, step
                 case other:
@@ -1413,6 +1417,35 @@ class RustCore(_SettingsSource, RustRegistryMembers):
                     raise RuntimeError(f"router-core ({step.get('error_kind')}): {step.get('error')}")
                 case other:
                     raise RuntimeError(f"router-core asked for {other!r} while recording an outcome")
+
+    # -- pre-route steps -------------------------------------------------------------------------
+
+    async def _pre_route(
+        self,
+        step: Mapping[str, object],
+        request: Mapping[str, object],
+        messages: object = _NO_INPUT,
+        input: object = _NO_INPUT,
+    ) -> str | None:
+        """The host's pre-routing of one pick (router_rust_prerouting): the model group to resolve
+        instead of the step's ``model``, or ``None``."""
+        if not isinstance(request, dict):
+            return None
+        depth: Final = step.get("fallback_depth")
+        r: Final = self._resolved
+        owner: Final[object] = self.__dict__.get("_core_owner")
+        public: Final[object] = owner() if callable(owner) else None
+        return await self._prerouter.pre_route(
+            str(step.get("model")),
+            request,  # pyright: ignore[reportUnknownArgumentType]  # the request kwargs the hook stamps
+            messages=request.get("messages") if messages is _NO_INPUT else messages,
+            input=request.get("input") if input is _NO_INPUT else input,
+            fallback_depth=depth if isinstance(depth, int) else 0,
+            router_strategy=normalize_strategy(r.routing_strategy),
+            enable_tag_filtering=r.enable_tag_filtering,
+            match_any=r.tag_filtering_match_any,
+            public_router=public if public is not None else self,
+        )
 
     # -- select steps ----------------------------------------------------------------------------
 
@@ -1746,6 +1779,8 @@ class _Selection:
                     outcome = await core._answer_cache(step)  # pyright: ignore[reportPrivateUsage]  # see above
                 case "select":
                     outcome = await core._answer_select(step, self._request, self._messages, self._input)  # pyright: ignore[reportPrivateUsage]  # see above
+                case "pre_route":
+                    outcome = await core._pre_route(step, self._request, self._messages, self._input)  # pyright: ignore[reportPrivateUsage]  # see above
                 case "done":
                     return self._done(step)
                 case "failed":

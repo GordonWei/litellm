@@ -204,15 +204,13 @@ impl Core {
             .deployments
             .first()
             .map(|d| d.params.model.clone());
-        let all_resolved = resolution.deployments.clone();
-        let mut deployments: Vec<Arc<Deployment>> = all_resolved
+        let deployments: Vec<Arc<Deployment>> = resolution
+            .deployments
             .iter()
             .filter(|d| !is_strategy_marker(d))
             .cloned()
             .collect();
-        if request.pre_routes && resolution.kind != ResolveKind::Id {
-            deployments = all_resolved;
-        } else if resolved_any && deployments.is_empty() {
+        if resolved_any && deployments.is_empty() {
             return Err(Error::OnlyMarkers {
                 // A marker named by its id is reported by its litellm model.
                 model: match resolution.kind {

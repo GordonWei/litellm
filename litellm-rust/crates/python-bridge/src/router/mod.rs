@@ -383,6 +383,12 @@ fn answer(ask: &Ask, outcome: Option<Bound<'_, PyAny>>) -> PyResult<Answer> {
             outcome.ok_or_else(missing)?.extract()?,
         )),
         Ask::Select { .. } => Ok(Answer::Select(outcome.ok_or_else(missing)?.extract()?)),
+        Ask::PreRoute { .. } => Ok(Answer::PreRoute(
+            outcome
+                .filter(|outcome| !outcome.is_none())
+                .map(|outcome| outcome.extract())
+                .transpose()?,
+        )),
         Ask::Attempt { .. } => {
             let outcome = outcome.ok_or_else(missing)?;
             attempt_outcome(outcome.cast::<PyDict>()?).map(Answer::Attempt)
@@ -574,6 +580,15 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             dict.set_item("scope", scope)?;
             dict.set_item("group", group)?;
             dict.set_item("candidates", PyList::new(py, candidates)?)
+        }
+        Ask::PreRoute {
+            model,
+            fallback_depth,
+            retry,
+        } => {
+            dict.set_item("model", model)?;
+            dict.set_item("fallback_depth", fallback_depth)?;
+            dict.set_item("retry", retry)
         }
         Ask::Cache {
             op,

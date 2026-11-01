@@ -14,6 +14,7 @@ use crate::{
     error::{AttemptError, ConfigError, Error, FailureKind, Unsupported},
     health::{GroupShape, should_retry_status},
     host::{Attempt, Output, RouterEvent, RouterRequest},
+    prerouting::PreRoute,
     registry::ResolveKind,
     select::{Candidates, SelectInputs},
 };
@@ -463,8 +464,17 @@ impl Core {
         retry: u32,
         at: Hop,
     ) -> Result<RouterResponse, Failed> {
+        let name = self
+            .pre_routed(PreRoute {
+                op,
+                request,
+                name: &target.group,
+                fallback_depth: at.depth,
+                retry,
+            })
+            .await?;
         let candidates = self
-            .candidates(snapshot, op, request, &target.group, inputs)
+            .candidates(snapshot, op, request, &name, inputs)
             .await?;
         if candidates.healthy.is_empty() {
             return Err(Error::NoHealthyDeployments {

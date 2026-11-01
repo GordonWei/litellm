@@ -77,6 +77,7 @@ from litellm.types.router import (
     ModelGroupInfo,
     RouterModelGroupAliasItem,
     RoutingGroup,
+    TaggedPreRoutingStrategy,
     holds_secret_pointer,
     validate_litellm_params_strictly,
 )
@@ -90,6 +91,7 @@ from litellm.utils import (
 
 if TYPE_CHECKING:
     from litellm.router_python_host import PythonHost
+    from litellm.router_rust_prerouting import PreRoutingStrategies
 
 _MODEL_INFO_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 _LITELLM_PARAMS_ADAPTER: Final = TypeAdapter(Mapping[str, object])
@@ -415,6 +417,13 @@ class HostRegistry(HostModelInfo):
         self._core_routing_groups: dict[str, RoutingGroup] = {}  # mutable-ok: the routing_groups attribute
         self._routing_group_rows: tuple[UntypedEntry, ...] | None = None
         self._provider_unresolved_deployments: tuple[Callable[[], Deployment | None], ...] = ()
+        # The pre-routing strategy registries (``registry().plugins``) and the hooks that keep them;
+        # RustCore installs its ``PreRoutingStrategies`` (litellm/router_rust_prerouting.py).
+        self._core_auto_routers: dict[str, list[TaggedPreRoutingStrategy[object]]] = {}  # mutable-ok: the live registry
+        self._core_complexity_routers: dict[str, list[TaggedPreRoutingStrategy[object]]] = {}  # mutable-ok: same
+        self._core_adaptive_routers: dict[str, list[TaggedPreRoutingStrategy[object]]] = {}  # mutable-ok: same
+        self._core_quality_routers: dict[str, list[TaggedPreRoutingStrategy[object]]] = {}  # mutable-ok: same
+        self.strategies: PreRoutingStrategies | None = None
         # The routing cache usage reads come from; RustCore sets it to the one its Rust core writes.
         self._core_cache: DualCache = DualCache()
         self._discovered_model_info_cache: InMemoryCache = InMemoryCache(
@@ -473,6 +482,8 @@ class HostRegistry(HostModelInfo):
             self._core_team_model_to_deployment_indices = {}
         self._core_team_pattern_routers = {}
         self._core_team_public_model_names = frozenset()
+        if self.strategies is not None:
+            self.strategies.reset()
         self._provider_unresolved_deployments = ()
         self._invalidate_model_group_info_cache()
         self._invalidate_access_groups_cache()
@@ -518,6 +529,8 @@ class HostRegistry(HostModelInfo):
                     duplicate_ids=duplicate_ids,
                 )
         self._core_model_names = {str(_LITELLM_PARAMS_ADAPTER.validate_python(m).get("model_name")) for m in model_list}
+        if self.strategies is not None:
+            self.strategies.finalize()
         self._on_change()
 
     def _create_deployment(
@@ -675,6 +688,8 @@ class HostRegistry(HostModelInfo):
                     source_params[param_key] = os.environ.get(source_params[param_key].replace("os.environ/", ""), "")
         if custom_llm_provider is not None:
             self._initialize_deployment_for_pass_through(deployment, custom_llm_provider)
+        if self.strategies is not None:
+            self.strategies.register(deployment)
         return deployment
 
     def _initialize_deployment_for_pass_through(self, deployment: Deployment, custom_llm_provider: str) -> None:
@@ -797,8 +812,12 @@ class HostRegistry(HostModelInfo):
                         self._invalidate_model_group_info_cache()
                         self._invalidate_access_groups_cache()
                         self._update_deployment_indices_after_removal(model_id=model_id, removal_idx=removal_idx)
+                if self.strategies is not None:
+                    self.strategies.release(on_router)
                 self._on_change()
             self.add_deployment(deployment=deployment)
+            if self.strategies is not None:
+                self.strategies.upserted(deployment, on_router)
         except Exception as e:
             if not self.ignore_invalid_deployments:
                 raise
@@ -817,7 +836,10 @@ class HostRegistry(HostModelInfo):
         if previous is None or self._core_has_model_id(model_id):
             return
         try:
-            self.add_deployment(deployment=previous)
+            if self.strategies is None:
+                self.add_deployment(deployment=previous)
+            else:
+                self.strategies.without_capability_limit(lambda: self.add_deployment(deployment=previous))
             verbose_router_logger.info(
                 "Restored deployment %s (id=%s); it keeps serving its previous configuration.",
                 previous.model_name,
@@ -842,6 +864,8 @@ class HostRegistry(HostModelInfo):
                 self._invalidate_model_group_info_cache()
                 self._invalidate_access_groups_cache()
                 self._update_deployment_indices_after_removal(model_id=id, removal_idx=deployment_idx)
+            if self.strategies is not None:
+                self.strategies.release_entry(item)
         except Exception:  # noqa: BLE001  # the core answers None for any failed delete
             return None
         self._on_change()
@@ -921,6 +945,43 @@ class HostRegistry(HostModelInfo):
         )
         owner: Final = _MODEL_INFO_ADAPTER.validate_python(info).get("team_id") if isinstance(info, Mapping) else None
         return team_may_use_deployment(owner, team_id)
+
+    def _core_deployments_for_request(
+        self, model: str, request_kwargs: Mapping[str, object]
+    ) -> Sequence[Mapping[str, object]]:
+        """The deployments ``model`` names for this caller: alias, then team-first, then global, then
+        admin-across-teams (``_core_deployments_for_request``)."""
+        from litellm.litellm_core_utils.routing_common_utils import get_request_team_id, is_proxy_admin_request
+
+        registered: Final = self._core_get_model_from_alias(model=model) or model
+        team_id: Final = get_request_team_id(request_kwargs)
+        deployments: Final = self._core_get_all_deployments(model_name=registered, team_id=team_id)
+        if deployments or team_id is not None or not is_proxy_admin_request(request_kwargs):
+            return deployments
+        return self._team_deployments_across_teams(registered)
+
+    def _team_deployments_across_teams(self, model: str) -> list[UntypedEntry]:  # mutable-ok: a fresh list
+        """Every team's deployments under public name ``model``, for a proxy admin calling without a team."""
+        with self._deployment_index_lock:
+            team_deployments: Final = [  # comprehension-ok: as the Python router collects them
+                self._core_model_list[index]
+                for (_, public_model_name), indices in self._core_team_model_to_deployment_indices.items()
+                if public_model_name == model
+                for index in indices
+            ]
+        team_ids: Final = {
+            team_id for team_id in (_model_info_of(d).get("team_id") for d in team_deployments) if team_id is not None
+        }
+        if len(team_ids) > 1:
+            raise litellm_exceptions.BadRequestError(
+                message=(
+                    f"Model name '{model}' matches deployments from multiple teams. "
+                    "Specify the deployment ID directly to disambiguate."
+                ),
+                model=model,
+                llm_provider="",
+            )
+        return team_deployments
 
     def _core_get_all_deployments(
         self, model_name: str, model_alias: str | None = None, team_id: str | None = None
