@@ -56,6 +56,10 @@ pub struct RouterRequest {
     pub has_image: bool,
     /// An async pick: the host's pre-routing step runs before each pick resolves its name.
     pub pre_routes: bool,
+    /// The requested name is no model group (a search tool name): nothing is selected, every
+    /// attempt is handed to the host as is, and no outcome is recorded for a deployment
+    /// (`_asearch_with_fallbacks`, whose helper picks among the router's search tools).
+    pub unrouted: bool,
     /// What the host needs to run the call itself, such as the Python kwargs.
     pub payload: Option<Payload>,
 }

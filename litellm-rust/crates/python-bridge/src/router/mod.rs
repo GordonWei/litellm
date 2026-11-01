@@ -18,7 +18,8 @@ use litellm_router_core::{
     AttemptError, Deployment, DeploymentSpec, Error, FailureKind, Op, Outcome, PreRouted, Router,
     RouterEvent,
     health::{UsageMetric, current_minute, usage_key},
-    registry::{DeploymentFilter, ResolveScope},
+    registry::{DeploymentFilter, ResolveKind, ResolveScope},
+    strategy::routing_context,
 };
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
@@ -287,6 +288,33 @@ impl RouterCoreHandle {
             PyList::new(py, resolution.deployments.iter().map(|d| d.id.clone()))?,
         )?;
         Ok(Some(dict))
+    }
+
+    /// `_get_routing_context` for a pick of `model`: `(strategy, scope, group)`, spelled as a
+    /// strategy select step spells them. A name that resolves to nothing reads its routing group
+    /// membership as is.
+    #[pyo3(signature = (model, routing_strategy=None))]
+    fn routing_context(
+        &self,
+        model: &str,
+        routing_strategy: Option<&str>,
+    ) -> (String, &'static str, Option<String>) {
+        let registry = self.router.registry();
+        let settings = self.router.settings();
+        let (kind, group) = registry
+            .resolve(model, ResolveScope::default())
+            .map_or((ResolveKind::Group, model.to_owned()), |resolution| {
+                (resolution.kind, resolution.group)
+            });
+        let (strategy, scope) = routing_context(
+            &registry,
+            &settings.routing_strategy,
+            routing_strategy,
+            &kind,
+            &group,
+        );
+        let (scope, group) = scope.wire();
+        (strategy.to_string(), scope, group.map(str::to_owned))
     }
 
     fn retire(&self) {

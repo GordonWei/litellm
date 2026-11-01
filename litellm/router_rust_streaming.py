@@ -97,6 +97,8 @@ class StreamAttempt:
     deployment_id: str | None
     attempted_retries: int
     committed_budget: int | None = None
+    # The deployment's max_parallel_requests slot the attempt holds; an open chat stream takes it.
+    slot: contextlib.ExitStack | None = None
 
     @property
     def model_group(self) -> str:
@@ -670,10 +672,15 @@ def _chat_has_output(model_response: CustomStreamWrapper) -> bool:
 
 
 def wrap_chat_stream(  # noqa: C901  # one function per Python wrapper it ports
-    attempt: StreamAttempt, model_response: CustomStreamWrapper, first_chunk: _FirstChunk[AsyncIterator[object]]
+    attempt: StreamAttempt,
+    model_response: CustomStreamWrapper,
+    first_chunk: _FirstChunk[AsyncIterator[object]],
+    held_slot: contextlib.ExitStack | None = None,
 ) -> FallbackAwareStreamWrapper:
     """``_acompletion_streaming_iterator``: a mid-stream error before content falls back through the core;
-    after content, the provider's error is raised."""
+    after content, the provider's error is raised. ``held_slot`` (the deployment's max_parallel_requests
+    slot) is released when the stream is exhausted, closed, or falls back."""
+    slot: Final = held_slot if held_slot is not None else contextlib.ExitStack()
 
     async def close_model_response() -> None:
         if not hasattr(model_response, "aclose"):
@@ -701,6 +708,7 @@ def wrap_chat_stream(  # noqa: C901  # one function per Python wrapper it ports
             )
             with anyio.CancelScope(shield=True):
                 await close_model_response()
+                slot.close()
             committed: Final = bool(
                 not e.is_pre_first_chunk
                 and (e.generated_content or _stream_chunks_have_generated_content(model_response.chunks))
@@ -750,6 +758,7 @@ def wrap_chat_stream(  # noqa: C901  # one function per Python wrapper it ports
         finally:
             with anyio.CancelScope(shield=True):
                 await close_model_response()
+                slot.close()
                 if fallback_response is not None and hasattr(fallback_response, "aclose"):
                     try:
                         await fallback_response.aclose()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above
@@ -1525,7 +1534,9 @@ async def open_attempt_stream(attempt: StreamAttempt, response: object) -> objec
     if attempt.op == "acompletion" and isinstance(response, CustomStreamWrapper):
         if response.completion_stream is None and response.make_call is not None:  # pyright: ignore[reportUnknownMemberType]  # untyped attributes
             await response.fetch_stream()
-        return wrap_chat_stream(attempt, response, await _aread_first_chunk(response))
+        first_chunk: Final = await _aread_first_chunk(response)
+        held_slot: Final = attempt.slot.pop_all() if attempt.slot is not None else contextlib.ExitStack()
+        return wrap_chat_stream(attempt, response, first_chunk, held_slot)
     if not attempt.kwargs.get("stream"):
         return response
     if attempt.op == "aresponses" and isinstance(response, BaseResponsesAPIStreamingIterator):

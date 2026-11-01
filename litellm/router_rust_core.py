@@ -17,6 +17,7 @@ itself only through its host, and the host never calls back into a Python router
 ``router_python_core.py`` cannot change what this core does.
 """
 
+import contextlib
 import dataclasses
 import inspect
 import json
@@ -68,6 +69,7 @@ from litellm.router_rust_endpoints import (
     pinned_video_deployment,
     plan_for,
     stamp_error,
+    unrouted_fields,
 )
 from litellm.router_rust_members import RustRegistryMembers
 from litellm.router_rust_plugins import SYNC_PATH_MESSAGE, candidate_models, run_plugins
@@ -98,6 +100,7 @@ from litellm.router_rust_settings import (
     settings_view,
 )
 from litellm.router_rust_shaping import Shaping
+from litellm.router_rust_slots import enter_deployment_slot
 from litellm.router_rust_streaming import (
     StreamAttempt,
     continuation_flag,
@@ -1334,7 +1337,12 @@ class RustCore(_SettingsSource, RustRegistryMembers):
     # -- driving a call --------------------------------------------------------------------------
 
     def _start(
-        self, plan: Plan, request: Mapping[str, object], overrides: Mapping[str, object] | None = None
+        self,
+        plan: Plan,
+        request: Mapping[str, object],
+        overrides: Mapping[str, object] | None = None,
+        *,
+        prepared_already: bool = False,
     ) -> "tuple[RouterCall, Mapping[str, object]]":
         if self._retired:
             raise RuntimeError("this router core was retired")
@@ -1349,10 +1357,11 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         field: Final = plan.prepare_field or "metadata"
         if request.get(field) is not None and not isinstance(request.get(field), Mapping):
             raise TypeError(f"{field} must be a mapping")
-        prepared: Final = self._endpoints.prepare(plan, request, model)
+        prepared: Final = dict(request) if prepared_already else self._endpoints.prepare(plan, request, model)
         fields: Final = {
             **self._routing_fields(prepared),
             **pinned_video_deployment(plan, request),
+            **unrouted_fields(plan),
             # The sync path never runs pre-routing; a custom strategy picks on both.
             **({} if plan.sync and self._custom_strategy is None else {"pre_routes": True}),
             **(overrides or {}),
@@ -1394,8 +1403,9 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         overrides: Mapping[str, object] | None = None,
         *,
         passthrough: "Callable[[Mapping[str, object]], Awaitable[object]] | None" = None,
+        prepared_already: bool = False,
     ) -> object:
-        call, prepared = self._start(plan, request, overrides)
+        call, prepared = self._start(plan, request, overrides, prepared_already=prepared_already)
         driver, step = await self._run(plan, call, prepared)
         if step["kind"] == "failed":
             if passthrough is not None and driver.attempted == 0:
@@ -2115,6 +2125,9 @@ def _narrowing_fields(request: dict[str, object], kind: str) -> Mapping[str, obj
     }
 
 
+_NO_ROUTING_PRE_CALL_CHECKS: Final = frozenset({"search", "rerank", "moderation"})
+
+
 class _Driver:
     """Answers the attempt and fallback steps of one call, and shapes its result.
 
@@ -2182,7 +2195,9 @@ class _Driver:
     def last_error(self) -> BaseException | None:
         return self._last_error
 
-    def _stream_attempt(self, step: Mapping[str, object], kwargs: Mapping[str, object]) -> StreamAttempt:
+    def _stream_attempt(
+        self, step: Mapping[str, object], kwargs: Mapping[str, object], slot: "contextlib.ExitStack | None" = None
+    ) -> StreamAttempt:
         def number(key: str) -> int:
             value: Final = step.get(key)
             return value if isinstance(value, int) else 0
@@ -2200,6 +2215,7 @@ class _Driver:
             level=number("fallback_level"),
             deployment_id=deployment_id if isinstance(deployment_id, str) else None,
             attempted_retries=number("retry"),
+            slot=slot,
         )
 
     def _failed(
@@ -2228,19 +2244,24 @@ class _Driver:
         try:
             deployment, call = self._call(step)  # rebind-ok: rebound as the Python router rebinds it
             host: Final = self._core._host  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
-            await routing_pre_call_checks(host, as_str_mapping(step.get("deployment")) or {})
-            pending: Final[object] = (
-                self._core._endpoints.create_file_everywhere(  # pyright: ignore[reportPrivateUsage]  # see above
-                    call.kwargs, call.model_name, self._request.get("specific_deployment")
+            # The deployment's max_parallel_requests slot; an open chat stream takes it along.
+            with enter_deployment_slot(self._core, self._plan, deployment, call.kwargs) as slot:
+                # A search tool is no deployment: nothing to check; Python's `_arerank` and
+                # `amoderation` run no routing pre-call checks either.
+                if self._plan.kind not in _NO_ROUTING_PRE_CALL_CHECKS:
+                    await routing_pre_call_checks(host, as_str_mapping(step.get("deployment")) or {})
+                pending: Final[object] = (
+                    self._core._endpoints.create_file_everywhere(  # pyright: ignore[reportPrivateUsage]  # see above
+                        call.kwargs, call.model_name, self._request.get("specific_deployment")
+                    )
+                    if self._plan.kind == "create_file"
+                    else host.invoke(call.host_op)(**call.kwargs)
                 )
-                if self._plan.kind == "create_file"
-                else host.invoke(call.host_op)(**call.kwargs)
-            )
-            # The generic helper awaits whatever the handler returns, as the Python router does.
-            awaited: Final = self._plan.kind == "generic" or inspect.isawaitable(pending)
-            answered: Final[object] = await pending if awaited else pending  # pyright: ignore[reportGeneralTypeIssues, reportUnknownVariableType]  # see above
-            self._core._endpoints.check_response(self._plan, answered, call)  # pyright: ignore[reportPrivateUsage, reportUnknownArgumentType]  # see above
-            response: Final = await open_attempt_stream(self._stream_attempt(step, call.kwargs), answered)  # pyright: ignore[reportUnknownArgumentType]  # see above
+                # The generic helper awaits whatever the handler returns, as the Python router does.
+                awaited: Final = self._plan.kind == "generic" or inspect.isawaitable(pending)
+                answered: Final[object] = await pending if awaited else pending  # pyright: ignore[reportGeneralTypeIssues, reportUnknownVariableType]  # see above
+                self._core._endpoints.check_response(self._plan, answered, call)  # pyright: ignore[reportPrivateUsage, reportUnknownArgumentType]  # see above
+                response: Final = await open_attempt_stream(self._stream_attempt(step, call.kwargs, slot), answered)  # pyright: ignore[reportUnknownArgumentType]  # see above
         except Exception as error:  # noqa: BLE001  # every attempt failure is classified and handed to the Rust call loop
             return self._failed(step, deployment, call, error)
         return self._succeeded(call, response)

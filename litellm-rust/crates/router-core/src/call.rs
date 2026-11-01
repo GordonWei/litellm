@@ -471,6 +471,11 @@ impl Core {
         retry: u32,
         at: Hop,
     ) -> Result<RouterResponse, Failed> {
+        if request.unrouted {
+            return self
+                .unrouted_attempt(snapshot, op, request, target, retry, at)
+                .await;
+        }
         crate::routing_plugins::refuse_sync_pick(
             snapshot.settings.routing_plugins,
             &snapshot.settings.routing_strategy,
@@ -567,6 +572,45 @@ impl Core {
                     deployment_id: Some(deployment.id.clone()),
                 })
             }
+        }
+    }
+
+    /// An attempt on a name that is no model group: the host serves it under that name, with no
+    /// deployment picked and no outcome recorded.
+    async fn unrouted_attempt(
+        &self,
+        snapshot: &Snapshot,
+        op: &Op,
+        request: &Arc<RouterRequest>,
+        target: &Target,
+        retry: u32,
+        at: Hop,
+    ) -> Result<RouterResponse, Failed> {
+        let deployment =
+            Arc::new(crate::registry::Deployment::unrouted(&target.group).map_err(Error::from)?);
+        let attempt = Attempt {
+            op: op.clone(),
+            request: request.clone(),
+            deployment,
+            name: target.group.clone(),
+            model_group: target.group.clone(),
+            target_order: target.order,
+            candidate_ids: Vec::new(),
+            retry,
+            fallback_depth: at.depth,
+            fallback_level: at.level,
+            timeout: snapshot.settings.timeout,
+        };
+        match self.host.invoke(&attempt).await {
+            Ok(output) => Ok(RouterResponse {
+                output,
+                deployment_id: String::new(),
+                model_group: target.group.clone(),
+                attempted_retries: retry,
+                max_retries: None,
+                attempted_fallbacks: at.depth,
+            }),
+            Err(failure) => Err(Error::Attempt(failure).into()),
         }
     }
 

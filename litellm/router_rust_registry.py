@@ -110,6 +110,8 @@ _PTUMemo: TypeAlias = tuple[
 ROUTER_CLIENTS_TARGET: Final = "router_clients"
 _MODEL_INFO_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 _LITELLM_PARAMS_ADAPTER: Final = TypeAdapter(Mapping[str, object])
+
+
 _CACHE_PRICING_FIELDS: Final = (
     "cache_creation_input_token_cost",
     "cache_creation_input_token_cost_above_1hr",

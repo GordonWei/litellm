@@ -111,6 +111,19 @@ impl Deployment {
         })
     }
 
+    /// The stand-in an unrouted attempt carries: the requested name as its group and model, no id.
+    pub fn unrouted(name: &str) -> Result<Self, ConfigError> {
+        let mut params = Map::new();
+        params.insert("model".to_owned(), Value::String(name.to_owned()));
+        let mut info = Map::new();
+        info.insert("id".to_owned(), Value::String(String::new()));
+        Self::from_spec(DeploymentSpec {
+            model_name: name.to_owned(),
+            litellm_params: params,
+            model_info: info,
+        })
+    }
+
     /// The provider: `custom_llm_provider`, else the `model` prefix before `/`.
     pub fn provider(&self) -> &str {
         self.params

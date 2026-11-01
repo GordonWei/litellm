@@ -164,6 +164,7 @@ struct RequestSpec {
     retry_skipped_ids: Option<Vec<String>>,
     pre_routes: Option<bool>,
     has_image: Option<bool>,
+    unrouted: Option<bool>,
     body: Option<Value>,
 }
 
@@ -195,6 +196,7 @@ pub(crate) fn request(value: Value, model: Option<&str>) -> Result<RouterRequest
         retry_skipped_ids: spec.retry_skipped_ids.unwrap_or_default(),
         pre_routes: spec.pre_routes.unwrap_or(false),
         has_image: spec.has_image.unwrap_or(false),
+        unrouted: spec.unrouted.unwrap_or(false),
         payload: None,
     })
 }
