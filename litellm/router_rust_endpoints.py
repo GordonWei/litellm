@@ -57,6 +57,7 @@ Kind = Literal[  # rebind-ok: rebound as the Python router rebinds it
     "vector_store_create",
     "moderation",
     "create_file",
+    "search",
 ]
 Stamp = Literal["deployment", "retry_skip", "none"]  # rebind-ok: rebound as the Python router rebinds it
 CountKey = Literal["deployment", "group", "empty"]  # rebind-ok: rebound as the Python router rebinds it
@@ -172,6 +173,18 @@ PLANS: Final[Mapping[str, Plan]] = MappingProxyType(
             splits_stream_timeout=True,
             fail_key="group",
             named=("prompt",),
+        ),
+        # `_asearch_with_fallbacks`: the search tool name routes as the model, with no deployment
+        # picked; its helper picks among the router's search tools.
+        "asearch": Plan(
+            "asearch",
+            "search.asearch",
+            "search",
+            prepare_field="litellm_metadata",
+            stamp="none",
+            total_key=None,
+            success_key=None,
+            fail_key=None,
         ),
         "aembedding": Plan("aembedding", "aembedding", "embedding", named=("input",)),
         "embedding": Plan("embedding", "embedding", "embedding", sync=True, named=("input",)),
@@ -345,6 +358,8 @@ _SYNC_GENERIC: Final[Mapping[str, str]] = MappingProxyType(
         "generate_content": "google_genai.generate_content",
         "generate_content_stream": "google_genai.generate_content_stream",
         "ocr": "ocr.ocr",
+        # The sync wrapper routes a search tool name as a model group, unlike `asearch`.
+        "search": "search.search",
         "decisions": "decisions.decisions",
         "systemone": "systemone.systemone",
         "extraction": "extraction.extraction",
@@ -554,7 +569,13 @@ def attempt_call(
             update_kwargs_with_deployment(shaping, deployment, kwargs, cache=cache, splits_stream_timeout=True)
             kwargs.pop("silent_model", None)
             final = without_router_only_kwargs(  # rebind-ok: rebound as the Python router rebinds it
-                {**params, **named, "caching": caching, **kwargs}
+                {
+                    **params,
+                    **named,
+                    "caching": caching,
+                    "client": model_client(core, plan, deployment, kwargs),
+                    **kwargs,
+                }
             )
             return AttemptCall(plan.host_op, final, kwargs, str(params.get("model")), group)
         case "text" | "embedding" | "image" | "transcription" | "rerank" | "adapter":
@@ -567,6 +588,7 @@ def attempt_call(
                 **data,
                 **named,
                 "caching": caching,
+                "client": model_client(core, plan, deployment, kwargs),
                 **kwargs,
             }
             return AttemptCall(plan.host_op, without_router_only_kwargs(final), kwargs, model_name, group)
@@ -577,6 +599,7 @@ def attempt_call(
                 **data,
                 **named,
                 "voice": data.get("voice") if voice is None else voice,
+                "client": model_client(core, plan, deployment, kwargs),
                 **kwargs,
             }
             return AttemptCall(plan.host_op, final, kwargs, model_name, group)
@@ -589,6 +612,7 @@ def attempt_call(
                 **data,
                 "custom_llm_provider": _provider(core, data),
                 "caching": caching,
+                "client": model_client(core, plan, deployment, kwargs),
                 **kwargs,
             }
             return AttemptCall(plan.host_op, final, kwargs, str(data.get("model")), group)
@@ -619,6 +643,8 @@ def attempt_call(
             kwargs["model"] = model_name
             kwargs.update(data)
             return AttemptCall(plan.host_op, kwargs, kwargs, model_name, group)
+        case "search":
+            return _search_attempt(core, plan, kwargs, group)
         case "create_file":
             # `_acreate_file` creates the file on every healthy deployment of the hop's name, not
             # only the picked one: the driver hands the request to `create_file_everywhere`.
@@ -675,6 +701,51 @@ def _generic_attempt(
     return AttemptCall(plan.host_op, final, kwargs, model_name, group)
 
 
+_SEARCH_PROTECTED_PARAMS: Final = frozenset({"search_provider", "api_key", "api_base"})
+
+
+def _search_attempt(
+    core: "RustCore",
+    plan: Plan,
+    kwargs: dict[str, object],  # mutable-ok: the attempt's own kwargs
+    group: str,
+) -> AttemptCall:
+    """`SearchAPIRouter.async_search_with_fallbacks_helper`: one of the search tools named
+    ``group`` at random, called with its provider, credentials and params under the request's."""
+    import random
+
+    tools: Final = [
+        tool
+        for tool in core._endpoints.search_tools  # pyright: ignore[reportPrivateUsage]  # the core's live search tools
+        if as_dict(tool).get("search_tool_name") == group
+    ]
+    if not tools:
+        raise ValueError(f"Search tool '{group}' not found in router.search_tools")
+    selected: Final = random.choice(tools)  # load balancing, as the Python router picks
+    params: Final = as_dict(as_dict(selected).get("litellm_params"))
+    search_provider: Final = params.get("search_provider")
+    if not search_provider:
+        raise ValueError(f"search_provider not found in litellm_params for search tool '{group}'")
+    search_params: Final = {
+        key: value
+        for source in (params, kwargs)
+        for key, value in source.items()
+        if key not in _SEARCH_PROTECTED_PARAMS and value is not None
+    }  # comprehension-ok: the tool's params, then the request's
+    final: Final = {
+        "search_provider": search_provider,
+        "api_key": params.get("api_key"),
+        "api_base": params.get("api_base"),
+        **search_params,
+    }
+    return AttemptCall(plan.host_op, final, kwargs, group, group)
+
+
+def unrouted_fields(plan: Plan) -> Mapping[str, object]:
+    """A search tool name is no model group: the Rust core hands every attempt to the host as is."""
+    return {"unrouted": True} if plan.kind == "search" else {}
+
+
 def _session_with_model(session: object, model_name: str) -> Mapping[str, object]:
     if not isinstance(session, Mapping):
         return {}
@@ -688,6 +759,35 @@ def _generic_provider(data: Mapping[str, object]) -> str | None:
     from litellm.litellm_core_utils.routing_common_utils import provider_for_generic_call
 
     return provider_for_generic_call(data)  # pyright: ignore[reportArgumentType]  # deployment params
+
+
+def model_client(
+    core: "RustCore", plan: Plan, deployment: Mapping[str, object], kwargs: Mapping[str, object]
+) -> object:
+    """The SDK client cached for the deployment (`_get_async_openai_model_client`; `_get_client`
+    with the sync keys for sync completion and embedding), dropped when the request carries
+    another api key."""
+    from litellm.litellm_core_utils.core_helpers import get_parent_otel_span_from_kwargs
+
+    if as_dict(deployment.get("litellm_params")).get("kubernetes_pod_discovery") is True:
+        return None
+    model_id: Final = as_dict(deployment.get("model_info")).get("id")
+    sync_keys: Final = plan.sync and plan.kind in ("chat", "embedding")
+    stream: Final = "stream_" if kwargs.get("stream") is True else ""
+    key: Final = f"{model_id}_{stream}client" if sync_keys else f"{model_id}_{stream}async_client"
+    span: Final = get_parent_otel_span_from_kwargs(dict(kwargs))
+    client: Final = _cached_client(core, key, span, local_only=not sync_keys)
+    dynamic_api_key: Final = kwargs.get("api_key")
+    if dynamic_api_key is not None and client is not None and dynamic_api_key != getattr(client, "api_key", None):
+        return None
+    return client
+
+
+def _cached_client(core: "RustCore", key: str, span: object, *, local_only: bool) -> object:
+    cache: Final = core._cache  # pyright: ignore[reportPrivateUsage]  # the core's routing cache
+    if local_only:
+        return cache.get_cache(key=key, local_only=True, parent_otel_span=span)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportArgumentType]  # the cache holds untyped values
+    return cache.get_cache(key=key, parent_otel_span=span)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportArgumentType]  # see above
 
 
 def _provider(core: "RustCore", data: Mapping[str, object]) -> object:
@@ -929,6 +1029,7 @@ class RustEndpoints:
         parsed: Final = parse_default_priority(config.get("default_priority"))
         self._default_priority: Final = None if isinstance(parsed, InvalidPriority) else parsed
         self._polling_interval: Final = config.get("polling_interval")
+        self._caching_groups: Final = config.get("caching_groups")
         self._scheduler: object = None
 
     @property
@@ -972,12 +1073,29 @@ class RustEndpoints:
 
     def shaping(self, resolved: "Resolved") -> Shaping:
         return Shaping(
-            default_litellm_params=resolved.default_litellm_params,
+            default_litellm_params=self.default_litellm_params(resolved),
             timeout=resolved.timeout,
             explicit_timeout=self._explicit_timeout,
             request_timeout=self._request_timeout,
             stream_timeout=self._stream_timeout,
             cache_responses=self._cache_responses,
+        )
+
+    def default_litellm_params(self, resolved: "Resolved") -> Mapping[str, object]:
+        """The defaults the Python constructor completes before any call: the router ``timeout``
+        argument, no client retries, and the caching groups in the default metadata."""
+        configured: Final = resolved.default_litellm_params
+        metadata: Final = configured.get("metadata")
+        return MappingProxyType(
+            {
+                "timeout": self._explicit_timeout,
+                "max_retries": 0,
+                **configured,
+                "metadata": {
+                    **(as_dict(metadata) if isinstance(metadata, Mapping) else {}),  # pyright: ignore[reportUnknownArgumentType]  # the configured metadata
+                    "caching_groups": self._caching_groups,
+                },
+            }
         )
 
     def prepare(
@@ -1031,6 +1149,7 @@ class RustEndpoints:
             "schedule_acompletion": self.schedule_acompletion,
             "priority_header_update": self.priority_header_update,
             "aguardrail": self.aguardrail,
+            "asearch": self.asearch,
         }.get(name)
         if direct is not None:
             return direct
@@ -1776,7 +1895,13 @@ class RustEndpoints:
                 metadata_bucket(kwargs_copy, "litellm_metadata")["gcs_bucket_name"] = data["gcs_bucket_name"]  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
             response: Final = await self._direct(
                 "acreate_file",
-                {**data, "custom_llm_provider": provider, "caching": self._cache_responses, **kwargs_copy},  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
+                {
+                    **data,
+                    "custom_llm_provider": provider,
+                    "caching": self._cache_responses,
+                    "client": model_client(self._core, PLANS["acreate_file"], deployment, kwargs_copy),  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
+                    **kwargs_copy,
+                },  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
             )
             self.counters.success_calls[model_name] += 1
             return response
@@ -1790,6 +1915,23 @@ class RustEndpoints:
         if hidden is not None:
             hidden["model_file_id_mapping"] = mapping
         return returned
+
+    # -- search tools -------------------------------------------------------------------------
+
+    async def asearch(
+        self,
+        custom_llm_provider: str | None = None,
+        client: object = None,
+        **kwargs: object,  # kwargs-ok: the request
+    ) -> object:
+        """`_asearch_with_fallbacks`: the search tool name (``search_tool_name``, else ``model``)
+        routes as the model; the factory wrapper drops ``custom_llm_provider`` and ``client``."""
+        request: Final = dict(kwargs)
+        search_tool_name: Final = request.get("search_tool_name", request.get("model"))
+        if not search_tool_name:
+            raise ValueError("search_tool_name or model parameter is required for search")
+        request["model"] = search_tool_name
+        return await self._core._drive(PLANS["asearch"], request)  # pyright: ignore[reportPrivateUsage]  # the endpoints drive their own core
 
     # -- guardrails ---------------------------------------------------------------------------
 
@@ -1922,4 +2064,5 @@ __all__ = [
     "plan_for",
     "prepare_request",
     "stamp_error",
+    "unrouted_fields",
 ]

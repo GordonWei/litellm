@@ -93,6 +93,37 @@ if TYPE_CHECKING:
 
 _MODEL_INFO_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 _LITELLM_PARAMS_ADAPTER: Final = TypeAdapter(Mapping[str, object])
+
+
+def _search_tool_support(deployment: Mapping[str, object]) -> bool | None:
+    """A configured ``model_info.supports_search_tool`` bool, else True when the deployment's chat
+    config builds an Anthropic Messages request, else None (``_search_tool_support``)."""
+    from litellm.responses.litellm_completion_transformation.tool_search import chat_config_builds_anthropic_request
+    from litellm.types.utils import LlmProviders
+    from litellm.utils import ProviderConfigManager
+
+    configured: Final = _MODEL_INFO_ADAPTER.validate_python(deployment.get("model_info") or {}).get(
+        "supports_search_tool"
+    )
+    if isinstance(configured, bool):
+        return configured
+    params: Final = _LITELLM_PARAMS_ADAPTER.validate_python(deployment.get("litellm_params") or {})
+    model: Final = params.get("model")
+    provider: Final = params.get("custom_llm_provider")
+    if not isinstance(model, str):
+        return None
+    try:
+        resolved_model, resolved_provider = resolve_model_and_provider_for_metadata(
+            model=model, custom_llm_provider=provider if isinstance(provider, str) else None
+        )
+        chat_config: Final = ProviderConfigManager.get_provider_chat_config(
+            model=resolved_model, provider=LlmProviders(resolved_provider)
+        )
+    except (litellm_exceptions.BadRequestError, ValueError):
+        return None
+    return True if chat_config_builds_anthropic_request(chat_config) else None
+
+
 _CACHE_PRICING_FIELDS: Final = (
     "cache_creation_input_token_cost",
     "cache_creation_input_token_cost_above_1hr",
@@ -1264,6 +1295,10 @@ class HostRegistry(HostModelInfo):
         )
         usable: Final = tuple(d for d in named if self._core_deployment_usable_by_team(d, team_id))
         return tuple(d for d in (usable or named) if _model_info_of(d).get("blocked") is not True)
+
+    def _core_get_search_tool_support(self, model_name: str, team_id: str | None = None) -> tuple[bool | None, ...]:
+        """Per routable deployment, whether it answers Codex's client ``tool_search``."""
+        return tuple(_search_tool_support(deployment) for deployment in self._routable_deployments(model_name, team_id))
 
     def _core_get_routable_upstream_model(self, model_name: str, team_id: str | None = None) -> str | None:
         deployment: Final = next(iter(self._routable_deployments(model_name, team_id)), None)

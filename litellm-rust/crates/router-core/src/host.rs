@@ -52,6 +52,10 @@ pub struct RouterRequest {
     /// The async pick, whose pre-routing hook (not ported yet) runs before strategy markers are
     /// dropped: markers of a group name stay candidates until pre-routing is served.
     pub pre_routes: bool,
+    /// The requested name is no model group (a search tool name): nothing is selected, every
+    /// attempt is handed to the host as is, and no outcome is recorded for a deployment
+    /// (`_asearch_with_fallbacks`, whose helper picks among the router's search tools).
+    pub unrouted: bool,
     /// What the host needs to run the call itself, such as the Python kwargs.
     pub payload: Option<Payload>,
 }

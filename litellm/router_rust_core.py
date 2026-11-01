@@ -67,6 +67,7 @@ from litellm.router_rust_endpoints import (
     pinned_video_deployment,
     plan_for,
     stamp_error,
+    unrouted_fields,
 )
 from litellm.router_rust_members import RustRegistryMembers
 from litellm.router_rust_registry import HostRegistry, RustRegistry, hosted_registry_view
@@ -1217,6 +1218,7 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         fields: Final = {
             **self._routing_fields(prepared),
             **pinned_video_deployment(plan, request),
+            **unrouted_fields(plan),
             # The sync path never runs pre-routing.
             **({} if plan.sync else {"pre_routes": True}),
             **(overrides or {}),
@@ -1915,7 +1917,8 @@ class _Driver:
         try:
             deployment, call = self._call(step)  # rebind-ok: rebound as the Python router rebinds it
             host: Final = self._core._host  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
-            await routing_pre_call_checks(host, as_str_mapping(step.get("deployment")) or {})
+            if self._plan.kind != "search":  # a search tool is no deployment: nothing to check
+                await routing_pre_call_checks(host, as_str_mapping(step.get("deployment")) or {})
             pending: Final[object] = (
                 self._core._endpoints.create_file_everywhere(  # pyright: ignore[reportPrivateUsage]  # see above
                     call.kwargs, call.model_name, self._request.get("specific_deployment")
