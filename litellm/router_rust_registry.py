@@ -67,6 +67,7 @@ from litellm.llms.openai_like.model_info import MODEL_INFO_REFRESH_SECONDS
 from litellm.responses.bridge_check import keep_registered_mode
 from litellm.router_api import RouterRegistry, deployment_id
 from litellm.router_rust_model_info import HostModelInfo
+from litellm.router_rust_shaping import ROUTER_CLIENTS_TARGET
 from litellm.router_strategy.auto_router.auto_router_model_naming import classify_strategy_router_model
 from litellm.router_utils.endpoint_eligibility import warn_on_unenforced_endpoint_flag
 from litellm.types.router import (
@@ -106,8 +107,6 @@ _PTUMemo: TypeAlias = tuple[
     frozenset[str],
     dict[tuple[str, str], "PTUTeamCeiling | None"],
 ]
-# The SDK-client reads: clients are process-local, so this only names a Redis span on a miss.
-ROUTER_CLIENTS_TARGET: Final = "router_clients"
 _MODEL_INFO_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 _LITELLM_PARAMS_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 
@@ -1481,45 +1480,6 @@ class HostRegistry(HostModelInfo):
                 lambda name: self._core_wildcard_route_deployments(name, team_id),
             )
         return ceilings[key]
-
-    def _core_deployments_for_request(self, model: str, request_kwargs: Mapping[str, object]) -> Sequence[UntypedEntry]:
-        """The deployments ``model`` names for this caller: the alias target, then team-first, then
-        global, then across teams for a proxy admin without a team (``deployments_for_request``)."""
-        from litellm.litellm_core_utils.routing_common_utils import get_request_team_id, is_proxy_admin_request
-
-        registered_name: Final = self._core_get_model_from_alias(model=model) or model
-        team_id: Final = get_request_team_id(request_kwargs)
-        deployments: Final = self._core_get_all_deployments(model_name=registered_name, team_id=team_id)
-        if deployments or team_id is not None or not is_proxy_admin_request(request_kwargs):
-            return deployments
-        return self._team_deployments_across_teams(registered_name)
-
-    def _team_deployments_across_teams(
-        self, model: str
-    ) -> list[UntypedEntry]:  # mutable-ok: a fresh list, as the core returns it
-        """Every team's deployments under public name ``model``; refused when several teams share it."""
-        with self._deployment_index_lock:
-            team_deployments: Final = [
-                self._core_model_list[index]
-                for (_, public_model_name), indices in self._core_team_model_to_deployment_indices.items()
-                if public_model_name == model
-                for index in indices
-            ]  # comprehension-ok: every index of every team entry under the name, as the core reads them
-        team_ids: Final = {
-            team_id
-            for deployment in team_deployments
-            if (team_id := _model_info_of(deployment).get("team_id")) is not None
-        }
-        if len(team_ids) > 1:
-            raise litellm_exceptions.BadRequestError(
-                message=(
-                    f"Model name '{model}' matches deployments from multiple teams. "
-                    "Specify the deployment ID directly to disambiguate."
-                ),
-                model=model,
-                llm_provider="",
-            )
-        return team_deployments
 
     def _get_client(
         self, deployment: Mapping[str, object], kwargs: Mapping[str, object], client_type: str | None = None

@@ -54,6 +54,9 @@ if TYPE_CHECKING:
     from litellm.caching.dual_cache import DualCache
     from litellm.router_python_host import PythonHost
 
+# The SDK-client and max_parallel_requests reads of the routing cache: process-local, so the family
+# only names a Redis span when a read misses through to Redis.
+ROUTER_CLIENTS_TARGET: Final = "router_clients"
 _MAPPING: Final = TypeAdapter(Mapping[str, object])
 _FORWARDED_CREDENTIAL_ISOLATION_PROVIDERS: Final = frozenset({"chatgpt", "anthropic"})
 _ALIAS_MARKER_FORWARDED_PARAMS_KWARG: Final = "_alias_marker_forwarded_params"

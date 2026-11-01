@@ -13,7 +13,8 @@ import contextlib
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Final
 
-from litellm.router_rust_shaping import as_dict
+from litellm._internal_context import with_service_target
+from litellm.router_rust_shaping import ROUTER_CLIENTS_TARGET, as_dict
 
 if TYPE_CHECKING:
     from litellm.router_rust_core import RustCore
@@ -38,6 +39,7 @@ _SLOTTED_KINDS: Final = frozenset(
 )
 
 
+@with_service_target(ROUTER_CLIENTS_TARGET)
 def _max_parallel_requests_limit(
     core: "RustCore", deployment: Mapping[str, object], kwargs: Mapping[str, object]
 ) -> object:

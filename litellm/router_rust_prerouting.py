@@ -190,7 +190,7 @@ class PreRoutingStrategies:
         """In the order ``_select_pre_routing_strategy`` searches them."""
         return (self.auto, self.complexity, self.adaptive, self.quality)
 
-    def any(self) -> bool:
+    def any_registered(self) -> bool:
         return any(self.all())
 
     # -- registry hooks (HostRegistry calls these) -----------------------------------------------
@@ -985,7 +985,7 @@ class PreRouter:
         match_any: bool,
     ) -> str:
         """``_resolve_claude_code_session_router``."""
-        if is_native_compaction_call() or not self._strategies.any():
+        if is_native_compaction_call() or not self._strategies.any_registered():
             return registered
         cache_key: Final = _session_router_cache_key(request_kwargs)
         if cache_key is None:

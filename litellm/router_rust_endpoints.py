@@ -21,11 +21,13 @@ from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
 from pydantic import TypeAdapter, ValidationError
 
+from litellm._internal_context import service_target
 from litellm._logging import verbose_router_logger
 from litellm.litellm_core_utils.batch_utils import get_router_metadata_variable_name
 from litellm.litellm_core_utils.routing_common_utils import without_router_only_kwargs
 from litellm.responses.retrieve_stream_query import without_retrieve_stream_defaults
 from litellm.router_rust_shaping import (
+    ROUTER_CLIENTS_TARGET,
     STREAM_TIMEOUT_AWARE_GENERIC_HANDLERS,
     Shaping,
     as_dict,
@@ -788,9 +790,10 @@ def model_client(
 
 def _cached_client(core: "RustCore", key: str, span: object, *, local_only: bool) -> object:
     cache: Final = core._cache  # pyright: ignore[reportPrivateUsage]  # the core's routing cache
-    if local_only:
-        return cache.get_cache(key=key, local_only=True, parent_otel_span=span)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportArgumentType]  # the cache holds untyped values
-    return cache.get_cache(key=key, parent_otel_span=span)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportArgumentType]  # see above
+    with service_target(ROUTER_CLIENTS_TARGET):
+        if local_only:
+            return cache.get_cache(key=key, local_only=True, parent_otel_span=span)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportArgumentType]  # the cache holds untyped values
+        return cache.get_cache(key=key, parent_otel_span=span)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportArgumentType]  # see above
 
 
 def _provider(core: "RustCore", data: Mapping[str, object]) -> object:
