@@ -46,6 +46,14 @@ enum ErrorKind {
     Cache,
     #[strum(serialize = "retired")]
     Retired,
+    #[strum(serialize = "paused")]
+    Paused,
+    #[strum(serialize = "not_pass_through")]
+    NotPassThrough,
+    #[strum(serialize = "no_pass_through_deployments")]
+    NoPassThroughDeployments,
+    #[strum(serialize = "only_markers")]
+    OnlyMarkers,
 }
 
 impl From<&Error> for ErrorKind {
@@ -57,6 +65,10 @@ impl From<&Error> for ErrorKind {
             Error::Attempt(_) => Self::Attempt,
             Error::Cache(_) => Self::Cache,
             Error::Retired => Self::Retired,
+            Error::Paused { .. } => Self::Paused,
+            Error::NotPassThrough { .. } => Self::NotPassThrough,
+            Error::NoPassThroughDeployments { .. } => Self::NoPassThroughDeployments,
+            Error::OnlyMarkers { .. } => Self::OnlyMarkers,
         }
     }
 }
@@ -133,6 +145,7 @@ impl RouterCoreHandle {
             Ok(Finish::Selected {
                 deployment_id: deployment.id.clone(),
                 model_group: deployment.model_name.clone(),
+                deployment: host::deployment_record(&deployment),
             })
         }))
     }
@@ -146,6 +159,10 @@ impl RouterCoreHandle {
             let deployments = router.healthy(&Op::Completion, &request).await?;
             Ok(Finish::Healthy {
                 deployment_ids: deployments.iter().map(|d| d.id.clone()).collect(),
+                deployments: deployments
+                    .iter()
+                    .map(|d| host::deployment_record(d))
+                    .collect(),
             })
         }))
     }
@@ -494,6 +511,9 @@ fn step_dict(py: Python<'_>, step: Step) -> PyResult<Bound<'_, PyDict>> {
             let attempt = error.attempt();
             dict.set_item("error", Report::new(&error).to_string())?;
             dict.set_item("error_kind", <&'static str>::from(ErrorKind::from(&error)))?;
+            if let Error::OnlyMarkers { model } = &error {
+                dict.set_item("error_model", model)?;
+            }
             dict.set_item("attempt_failed", attempt.is_some())?;
             dict.set_item("status", attempt.and_then(|failure| failure.status))?;
             dict.set_item(
@@ -535,15 +555,24 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
         Ask::Select {
             stage,
             model_group,
+            name,
+            scope,
+            group,
+            pool,
             candidates,
         } => {
             let (stage, strategy) = match stage {
                 Stage::Plugins => ("plugins", None),
                 Stage::Strategy(strategy) => ("strategy", Some(strategy)),
+                Stage::Tags => ("tags", None),
             };
+            dict.set_item("pool", PyList::new(py, pool)?)?;
             dict.set_item("stage", stage)?;
             dict.set_item("strategy", strategy)?;
             dict.set_item("model_group", model_group)?;
+            dict.set_item("model", name)?;
+            dict.set_item("scope", scope)?;
+            dict.set_item("group", group)?;
             dict.set_item("candidates", PyList::new(py, candidates)?)
         }
         Ask::Cache {
@@ -575,12 +604,24 @@ fn done_items(dict: &Bound<'_, PyDict>, finish: Finish) -> PyResult<()> {
         Finish::Selected {
             deployment_id,
             model_group,
+            deployment,
         } => {
             dict.set_item("deployment_id", deployment_id)?;
-            dict.set_item("model_group", model_group)
+            dict.set_item("model_group", model_group)?;
+            dict.set_item("deployment", to_py(dict.py(), &deployment)?)
         }
         Finish::Reported { cooled } => dict.set_item("cooled", cooled),
-        Finish::Healthy { deployment_ids } => dict.set_item("deployment_ids", deployment_ids),
+        Finish::Healthy {
+            deployment_ids,
+            deployments,
+        } => {
+            dict.set_item("deployment_ids", deployment_ids)?;
+            let records = deployments
+                .iter()
+                .map(|d| to_py(dict.py(), d))
+                .collect::<PyResult<Vec<_>>>()?;
+            dict.set_item("deployments", PyList::new(dict.py(), records)?)
+        }
     }
 }
 

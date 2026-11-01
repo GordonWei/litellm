@@ -79,8 +79,10 @@ pub mod error;
 pub mod health;
 pub mod host;
 pub mod registry;
+pub mod routing_groups;
 pub mod select;
 pub mod settings;
+pub mod strategy;
 
 use std::sync::{
     Arc,

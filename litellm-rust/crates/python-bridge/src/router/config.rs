@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use litellm_router_core::select::PassThrough;
 use litellm_router_core::{
     ChangeSet, ConfigError, DeploymentSpec, RouterConfig, RouterDynamicConfig, RouterRequest,
 };
@@ -164,6 +165,14 @@ struct RequestSpec {
     disable_fallbacks: Option<bool>,
     router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
     pinned_deployment_id: Option<String>,
+    routing_strategy: Option<String>,
+    filter_tags: Option<bool>,
+    /// `listed` or `healthy`: which pass-through pick the request makes.
+    pass_through: Option<String>,
+    target_order: Option<i64>,
+    excluded_ids: Option<Vec<String>>,
+    retry_skipped_ids: Option<Vec<String>>,
+    pre_routes: Option<bool>,
     body: Option<Value>,
 }
 
@@ -183,6 +192,17 @@ pub(crate) fn request(value: Value, model: Option<&str>) -> Result<RouterRequest
         disable_fallbacks: spec.disable_fallbacks.unwrap_or(false),
         router_weights: spec.router_weights,
         pinned_deployment_id: spec.pinned_deployment_id,
+        routing_strategy: spec.routing_strategy,
+        filter_tags: spec.filter_tags.unwrap_or(false),
+        pass_through: match spec.pass_through.as_deref() {
+            None => None,
+            Some("healthy") => Some(PassThrough::Healthy),
+            Some(_) => Some(PassThrough::Listed),
+        },
+        target_order: spec.target_order,
+        excluded_ids: spec.excluded_ids.unwrap_or_default(),
+        retry_skipped_ids: spec.retry_skipped_ids.unwrap_or_default(),
+        pre_routes: spec.pre_routes.unwrap_or(false),
         payload: None,
     })
 }

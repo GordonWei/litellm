@@ -44,6 +44,18 @@ pub enum Error {
     Cache(#[from] litellm_cache::Error),
     #[error("the router was retired")]
     Retired,
+    /// A blocked deployment named by its id (`model` is its litellm model).
+    #[error("deployment model `{model}` is paused")]
+    Paused { model: String },
+    /// A pass-through pick named a deployment id without `use_in_pass_through`.
+    #[error("deployment `{id}` does not support pass-through")]
+    NotPassThrough { id: String },
+    /// A pass-through pick of a group with healthy deployments, none of them pass-through.
+    #[error("model `{model}` has no pass-through deployment")]
+    NoPassThroughDeployments { model: String },
+    /// Every deployment `model` resolved to is a pre-routing strategy marker (`auto_router/...`).
+    #[error("every deployment of `{model}` is a strategy router marker")]
+    OnlyMarkers { model: String },
 }
 
 impl Error {
@@ -55,7 +67,11 @@ impl Error {
             | Self::UnknownModel { .. }
             | Self::NoHealthyDeployments { .. }
             | Self::Cache(_)
-            | Self::Retired => None,
+            | Self::Retired
+            | Self::Paused { .. }
+            | Self::NotPassThrough { .. }
+            | Self::NoPassThroughDeployments { .. }
+            | Self::OnlyMarkers { .. } => None,
         }
     }
 }

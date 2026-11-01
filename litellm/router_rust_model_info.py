@@ -15,6 +15,7 @@ from typing import Any, Final, Union, cast  # noqa: TID251  # the core's own sig
 from pydantic import BaseModel, TypeAdapter
 from typing_extensions import overload
 
+from litellm._internal_context import service_target
 from litellm._logging import verbose_router_logger
 from litellm.litellm_core_utils.add_retry_fallback_headers import (
     apply_quality_router_decision_headers,
@@ -38,6 +39,7 @@ from litellm.llms.bedrock.common_utils import get_bedrock_base_model
 from litellm.router_python_host import python_host
 from litellm.router_utils.pre_call_checks.io_token_rate_limit_check import build_io_token_rate_limit_headers
 from litellm.router_utils.router_callbacks.track_deployment_metrics import find_deployment_metadata
+from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
 from litellm.types.router import (
     CONFIGURABLE_CLIENTSIDE_AUTH_PARAMS,
     Deployment,
@@ -883,7 +885,8 @@ class HostModelInfo:
             )
         combined_tpm_rpm_keys: Final = tpm_keys + rpm_keys
 
-        combined_tpm_rpm_values: Final = await self._core_cache.async_batch_get_cache(keys=combined_tpm_rpm_keys)
+        with service_target(ROUTER_USAGE_TARGET):
+            combined_tpm_rpm_values: Final = await self._core_cache.async_batch_get_cache(keys=combined_tpm_rpm_keys)
         if combined_tpm_rpm_values is None:
             return None, None
 
@@ -942,7 +945,8 @@ class HostModelInfo:
                 )
             )
 
-        combined_values: Final = await self._core_cache.async_batch_get_cache(keys=itpm_keys + otpm_keys)
+        with service_target(ROUTER_USAGE_TARGET):
+            combined_values: Final = await self._core_cache.async_batch_get_cache(keys=itpm_keys + otpm_keys)
         if combined_values is None:
             return None, None
 

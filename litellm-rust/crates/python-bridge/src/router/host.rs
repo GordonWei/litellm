@@ -51,6 +51,8 @@ pub(crate) enum Stage {
     Plugins,
     /// A strategy router-core does not implement: return the candidates with the pick first.
     Strategy(String),
+    /// Tag routing: return the deployments that remain.
+    Tags,
 }
 
 /// The `op` of a `cache` step: one per [`RouterCache`] method.
@@ -130,6 +132,13 @@ pub(crate) enum Ask {
     Select {
         stage: Stage,
         model_group: String,
+        /// The name the request resolved from, which strategies key their state by.
+        name: String,
+        /// Whose selector a strategy reads: `default`, `group` (with `group`) or `override`.
+        scope: &'static str,
+        group: Option<String>,
+        /// The deployments the name resolved to, before health filters (the tag stage reads them).
+        pool: Vec<String>,
         candidates: Vec<String>,
     },
     /// One [`RouterCache`] op against the host's cache. `key` is set for every op but
@@ -217,9 +226,14 @@ pub(crate) enum Finish {
     Selected {
         deployment_id: String,
         model_group: String,
+        /// The deployment as served: a priority group's member carries its priority as `order`.
+        deployment: Value,
     },
-    /// `healthy`: the deployments a pick would choose among.
-    Healthy { deployment_ids: Vec<String> },
+    /// `healthy`: the deployments a pick would choose among, as served.
+    Healthy {
+        deployment_ids: Vec<String>,
+        deployments: Vec<Value>,
+    },
     /// `report_failure`: whether the deployment was cooled down.
     Reported { cooled: bool },
 }
@@ -457,12 +471,18 @@ impl Host for StepHost {
         ctx: &RoutingContext<'_>,
         candidates: Vec<Arc<Deployment>>,
     ) -> Result<Vec<Arc<Deployment>>, Error> {
+        let (scope, group) = ctx.scope.wire();
         let question = Ask::Select {
             stage: match stage {
                 SelectStage::Plugins => Stage::Plugins,
                 SelectStage::Strategy(strategy) => Stage::Strategy(strategy.to_string()),
+                SelectStage::Tags => Stage::Tags,
             },
+            pool: ctx.pool.iter().map(|d| d.id.clone()).collect(),
             model_group: ctx.model_group.to_owned(),
+            name: ctx.name.to_owned(),
+            scope,
+            group: group.map(str::to_owned),
             candidates: candidates.iter().map(|d| d.id.clone()).collect(),
         };
         let Answer::Select(ids) = ask(question).await else {
@@ -989,11 +1009,13 @@ mod tests {
                 .map(|deployment| Finish::Selected {
                     deployment_id: deployment.id.clone(),
                     model_group: deployment.model_name.clone(),
+                    deployment: deployment_record(&deployment),
                 })
         });
         let Step::Done(Finish::Selected {
             deployment_id,
             model_group,
+            ..
         }) = store.resume(&mut driver, None)
         else {
             panic!("a selection should finish with the pick");

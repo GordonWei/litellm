@@ -60,6 +60,7 @@ from litellm.litellm_core_utils.routing_common_utils import (
     with_admin_api_key_secret_reference,
     without_model_capability_flags,
 )
+from litellm.litellm_core_utils.routing_groups import apply_routing_group_priority
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
 from litellm.llms.openai_like.model_info import MODEL_INFO_REFRESH_SECONDS
 from litellm.responses.bridge_check import keep_registered_mode
@@ -75,6 +76,7 @@ from litellm.types.router import (
     LiteLLM_Params,
     ModelGroupInfo,
     RouterModelGroupAliasItem,
+    RoutingGroup,
     holds_secret_pointer,
     validate_litellm_params_strictly,
 )
@@ -370,6 +372,12 @@ def _renamed(entry: UntypedEntry, model_name: str) -> UntypedEntry:
     return {**entry, "model_name": model_name}
 
 
+def _as_routing_group_row(deployment: Mapping[str, object]) -> UntypedEntry:
+    """A member deployment under its group's name, without the member's ``access_groups``."""
+    model_info: Final = {k: v for k, v in _model_info_of(deployment).items() if k != "access_groups"}
+    return {**deployment, "model_info": model_info}
+
+
 def _without_indices(indices: Sequence[int], removal_idx: int) -> list[int]:  # mutable-ok: an index list
     return [idx - 1 if idx > removal_idx else idx for idx in indices if idx != removal_idx]
 
@@ -403,6 +411,9 @@ class HostRegistry(HostModelInfo):
         self._core_model_names: set[str] = set()  # mutable-ok: the live group set
         self._core_deployment_latency_map: dict[str, float] = {}  # mutable-ok: the live latency map
         self._access_groups_cache: Mapping[str, Sequence[str]] | None = None
+        # The routing groups by name; RustCore sets them from its resolved settings.
+        self._core_routing_groups: dict[str, RoutingGroup] = {}  # mutable-ok: the routing_groups attribute
+        self._routing_group_rows: tuple[UntypedEntry, ...] | None = None
         self._provider_unresolved_deployments: tuple[Callable[[], Deployment | None], ...] = ()
         # The routing cache usage reads come from; RustCore sets it to the one its Rust core writes.
         self._core_cache: DualCache = DualCache()
@@ -439,6 +450,13 @@ class HostRegistry(HostModelInfo):
     def _invalidate_model_group_info_cache(self) -> None:
         self._cached_get_model_group_info.cache_clear()  # pyright: ignore[reportFunctionMemberAccess]  # an lru_cache
         self._core_cached_deployment_model_info.cache_clear()  # pyright: ignore[reportFunctionMemberAccess]  # an lru_cache
+        self._routing_group_rows = None
+
+    def set_routing_groups(self, groups: Sequence[RoutingGroup]) -> None:
+        """``_init_routing_groups``' registry side: the groups by name, and the caches they feed."""
+        self._core_routing_groups = {group.group_name: group for group in groups}
+        self._invalidate_model_group_info_cache()
+        self._invalidate_access_groups_cache()
 
     def _invalidate_access_groups_cache(self) -> None:
         self._access_groups_cache = None
@@ -935,9 +953,29 @@ class HostRegistry(HostModelInfo):
             ]
         return []
 
-    def get_routing_group(self, model_name: str) -> None:
-        """No routing groups: the Rust core declines ``routing_groups``."""
-        _ = model_name
+    def get_routing_group(self, model_name: str) -> RoutingGroup | None:
+        """The routing group callable as ``model_name``: a deployment model_name or an alias of the
+        same name shadows it."""
+        if not self._core_routing_groups:
+            return None
+        group: Final = self._core_routing_groups.get(model_name)
+        if (
+            group is None
+            or model_name in self._core_model_name_to_deployment_indices
+            or model_name in (self._core_model_group_alias or {})
+        ):
+            return None
+        return group
+
+    def _core_routing_group_has_alternatives(self, model_group: str | None) -> bool:
+        """A callable routing group whose member union spans more than one deployment."""
+        if model_group is None:
+            return False
+        resolved: Final = self._core_get_model_from_alias(model=model_group) or model_group
+        group: Final = self.get_routing_group(resolved)
+        if group is None:
+            return False
+        return sum(len(self._core_model_name_to_deployment_indices.get(member) or ()) for member in group.models) > 1
 
     def _core_get_model_list_from_model_alias(
         self, model_name: str | None = None
@@ -960,12 +998,40 @@ class HostRegistry(HostModelInfo):
                 target = item["model"]
             else:
                 continue
-            returned.extend(self._core_get_all_deployments(model_name=target, model_alias=model_alias))
+            alias_group = self.get_routing_group(target)
+            if alias_group is not None:
+                returned.extend(
+                    {**row, "model_name": model_alias} for row in self._materialize_routing_group_rows((alias_group,))
+                )
+            else:
+                returned.extend(self._core_get_all_deployments(model_name=target, model_alias=model_alias))
         return returned
 
     def _core_get_model_list_from_routing_groups(self, model_name: str | None = None) -> Sequence[UntypedEntry]:
-        _ = model_name
-        return ()
+        """Callable routing groups as model-list rows: each member deployment under the group's name."""
+        if model_name is not None:
+            group: Final = self.get_routing_group(model_name)
+            return self._materialize_routing_group_rows((group,)) if group is not None else ()
+        cached: Final = self._routing_group_rows
+        if cached is not None:
+            return cached
+        rows: Final = self._materialize_routing_group_rows(
+            tuple(
+                callable_group
+                for name in self._core_routing_groups
+                if (callable_group := self.get_routing_group(name)) is not None
+            )
+        )
+        self._routing_group_rows = rows
+        return rows
+
+    def _materialize_routing_group_rows(self, groups: tuple[RoutingGroup, ...]) -> tuple[UntypedEntry, ...]:
+        return tuple(  # comprehension-ok: each member deployment of each group, in order
+            _as_routing_group_row(apply_routing_group_priority(group, member, deployment))  # pyright: ignore[reportArgumentType]  # a stored entry
+            for group in groups
+            for member in group.models
+            for deployment in self._core_get_all_deployments(model_name=member, model_alias=group.group_name)
+        )
 
     def _get_wildcard_deployments(
         self, model_name: str, team_id: str | None = None

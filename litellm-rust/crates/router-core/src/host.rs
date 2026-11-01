@@ -15,6 +15,7 @@ use crate::{
     health::Health,
     registry::{Deployment, Registry},
     settings::Settings,
+    strategy::StrategyScope,
 };
 
 /// One call into the router.
@@ -35,6 +36,22 @@ pub struct RouterRequest {
     /// The deployment a call on an existing resource (a video id) names: picked whenever the
     /// filters keep it (`_narrow_to_video_deployment`).
     pub pinned_deployment_id: Option<String>,
+    /// A per-request `routing_strategy` override, as Python normalizes it.
+    pub routing_strategy: Option<String>,
+    /// Whether tag routing may apply to this request (router, request or model setting), so the
+    /// host's tag stage runs.
+    pub filter_tags: bool,
+    /// A pass-through pick: only `use_in_pass_through` deployments may serve it.
+    pub pass_through: Option<crate::select::PassThrough>,
+    /// `_target_order`: the order level to pick from instead of the lowest.
+    pub target_order: Option<i64>,
+    /// `_excluded_deployment_ids`: never picked, even when that leaves nothing.
+    pub excluded_ids: Vec<String>,
+    /// `_retry_skipped_deployment_ids`: skipped unless that leaves nothing.
+    pub retry_skipped_ids: Vec<String>,
+    /// The async pick, whose pre-routing hook (not ported yet) runs before strategy markers are
+    /// dropped: markers of a group name stay candidates until pre-routing is served.
+    pub pre_routes: bool,
     /// What the host needs to run the call itself, such as the Python kwargs.
     pub payload: Option<Payload>,
 }
@@ -77,6 +94,13 @@ pub struct RoutingContext<'a> {
     pub request: &'a RouterRequest,
     pub op: &'a Op,
     pub model_group: &'a str,
+    /// The name the request resolved from (Python's `model`), which strategies key state by.
+    pub name: &'a str,
+    /// Whose selector a strategy stage reads.
+    pub scope: StrategyScope,
+    /// The deployments the name resolved to for this caller, before health filters
+    /// (`request_deployments`), for the tag stage.
+    pub pool: &'a [Arc<Deployment>],
 }
 
 /// Which selection step the host is asked to run.
@@ -86,6 +110,8 @@ pub enum SelectStage {
     Plugins,
     /// A strategy not yet ported: return the candidates with the pick first.
     Strategy(RoutingStrategy),
+    /// Tag routing (`get_deployments_for_tag`), not yet ported: return the deployments that remain.
+    Tags,
 }
 
 /// Routing events, delivered through [`Host::observe`].

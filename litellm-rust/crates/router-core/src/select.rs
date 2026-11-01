@@ -14,6 +14,7 @@ use crate::{
     error::Error,
     host::{RouterRequest, RoutingContext, SelectStage},
     registry::{Deployment, ResolveKind, ResolveScope},
+    strategy::{StrategyScope, routing_context},
 };
 
 /// Randomness for the shuffle and retry jitter, injectable so tests are deterministic.
@@ -44,9 +45,23 @@ impl Randomness for SeededRandomness {
     }
 }
 
+/// Which pass-through pick a request makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassThrough {
+    /// `get_available_deployment_for_pass_through` (and `select(kind="pass_through")`): the
+    /// pass-through deployments are chosen first, then cooldown and blocked filters, and only a
+    /// priority group filters by order.
+    Listed,
+    /// `async_get_available_deployment_for_pass_through`: the full healthy chain, then the
+    /// pass-through filter.
+    Healthy,
+}
+
 /// A group's deployments before and after filtering.
 #[derive(Clone, Debug)]
 pub struct Candidates {
+    /// The name that was resolved (Python's `model`).
+    pub name: String,
     pub model_group: String,
     pub kind: ResolveKind,
     /// Every deployment the caller may use (after the team filter).
@@ -116,6 +131,23 @@ pub fn simple_shuffle(
     Some(deployments[index].clone())
 }
 
+/// A pre-routing strategy marker (`classify_strategy_router_model`): its model is `auto_router/...`.
+pub fn is_strategy_marker(deployment: &Deployment) -> bool {
+    deployment.params.model.starts_with("auto_router/")
+}
+
+/// `litellm_params.use_in_pass_through`, read for truthiness as Python does.
+fn uses_pass_through(deployment: &Deployment) -> bool {
+    match deployment.raw_params.get("use_in_pass_through") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::Number(value)) => value.as_f64().is_some_and(|n| n != 0.0),
+        Some(serde_json::Value::String(value)) => !value.is_empty(),
+        Some(serde_json::Value::Array(value)) => !value.is_empty(),
+        Some(serde_json::Value::Object(value)) => !value.is_empty(),
+    }
+}
+
 impl Core {
     fn context<'a>(
         &'a self,
@@ -123,6 +155,8 @@ impl Core {
         op: &'a Op,
         request: &'a RouterRequest,
         model_group: &'a str,
+        name: &'a str,
+        scope: StrategyScope,
     ) -> RoutingContext<'a> {
         RoutingContext {
             registry: &snapshot.registry,
@@ -131,6 +165,9 @@ impl Core {
             request,
             op,
             model_group,
+            name,
+            scope,
+            pool: &[],
         }
     }
 
@@ -161,12 +198,44 @@ impl Core {
             .ok_or_else(|| Error::UnknownModel {
                 model: name.to_owned(),
             })?;
-        let team_id = request.team_id.as_deref();
-        let all: Vec<Arc<Deployment>> = resolution
+        // `_drop_strategy_markers`: a marker is never a callable deployment.
+        let resolved_any = !resolution.deployments.is_empty();
+        let first_model = resolution
             .deployments
+            .first()
+            .map(|d| d.params.model.clone());
+        let all_resolved = resolution.deployments.clone();
+        let mut deployments: Vec<Arc<Deployment>> = all_resolved
+            .iter()
+            .filter(|d| !is_strategy_marker(d))
+            .cloned()
+            .collect();
+        if request.pre_routes && resolution.kind != ResolveKind::Id {
+            deployments = all_resolved;
+        } else if resolved_any && deployments.is_empty() {
+            return Err(Error::OnlyMarkers {
+                // A marker named by its id is reported by its litellm model.
+                model: match resolution.kind {
+                    ResolveKind::Id => first_model.unwrap_or_else(|| name.to_owned()),
+                    _ => name.to_owned(),
+                },
+            });
+        }
+        let team_id = request.team_id.as_deref();
+        let mut all: Vec<Arc<Deployment>> = deployments
             .into_iter()
             .filter(|d| d.usable_by_team(team_id))
             .collect();
+        let listed =
+            request.pass_through == Some(PassThrough::Listed) && resolution.kind != ResolveKind::Id;
+        if listed {
+            all.retain(|d| uses_pass_through(d));
+            if all.is_empty() {
+                return Err(Error::NoPassThroughDeployments {
+                    model: name.to_owned(),
+                });
+            }
+        }
 
         // A deployment named by its id is served even while it cools down
         // (`get_deployment_by_model_id` returns before the cooldown filter).
@@ -188,6 +257,21 @@ impl Core {
         {
             healthy = all.clone();
         }
+        if resolution.kind == ResolveKind::Id
+            && let Some(deployment) = all.first()
+        {
+            // `_core_async_get_healthy_deployments`: a deployment named by id is checked alone.
+            if deployment.model_info.blocked {
+                return Err(Error::Paused {
+                    model: deployment.params.model.clone(),
+                });
+            }
+            if request.pass_through.is_some() && !uses_pass_through(deployment) {
+                return Err(Error::NotPassThrough {
+                    id: deployment.id.clone(),
+                });
+            }
+        }
         healthy.retain(|d| !d.model_info.blocked);
         // `continuation_deployments`: a mid-stream continuation never lands on a deployment the host
         // named as unable to take its prefill.
@@ -200,6 +284,30 @@ impl Core {
         }
         if inputs.count_only {
             return Ok(Candidates {
+                name: name.to_owned(),
+                model_group: resolution.group,
+                kind: resolution.kind,
+                all,
+                healthy,
+            });
+        }
+
+        if listed {
+            // Only a priority group narrows a listed pass-through pick by order.
+            let priority = resolution.kind == ResolveKind::RoutingGroup
+                && registry.routing_groups().iter().any(|g| {
+                    g.group_name == resolution.group && crate::routing_groups::is_priority(g)
+                });
+            if priority {
+                let order = request
+                    .target_order
+                    .or_else(|| healthy.iter().filter_map(|d| d.order()).min());
+                if let Some(order) = order {
+                    healthy.retain(|d| d.order() == Some(order));
+                }
+            }
+            return Ok(Candidates {
+                name: name.to_owned(),
                 model_group: resolution.group,
                 kind: resolution.kind,
                 all,
@@ -208,11 +316,31 @@ impl Core {
         }
 
         if !settings.plugins.is_empty() && !healthy.is_empty() {
-            let ctx = self.context(snapshot, op, request, &resolution.group);
+            let ctx = self.context(
+                snapshot,
+                op,
+                request,
+                &resolution.group,
+                name,
+                StrategyScope::Default,
+            );
             healthy = self
                 .host
                 .select(&SelectStage::Plugins, &ctx, healthy)
                 .await?;
+        }
+
+        if request.filter_tags && !healthy.is_empty() {
+            let mut ctx = self.context(
+                snapshot,
+                op,
+                request,
+                &resolution.group,
+                name,
+                StrategyScope::Default,
+            );
+            ctx.pool = &all;
+            healthy = self.host.select(&SelectStage::Tags, &ctx, healthy).await?;
         }
 
         if let Some(pinned) = request.pinned_deployment_id.as_deref()
@@ -223,15 +351,21 @@ impl Core {
 
         let order = inputs
             .target_order
+            .or(request.target_order)
             .or_else(|| healthy.iter().filter_map(|d| d.order()).min());
         if let Some(order) = order {
             healthy.retain(|d| d.order() == Some(order));
         }
 
-        if !inputs.skipped_ids.is_empty() {
+        healthy.retain(|d| !request.excluded_ids.contains(&d.id));
+
+        if !inputs.skipped_ids.is_empty() || !request.retry_skipped_ids.is_empty() {
             let kept: Vec<Arc<Deployment>> = healthy
                 .iter()
-                .filter(|d| !inputs.skipped_ids.contains(&d.id))
+                .filter(|d| {
+                    !inputs.skipped_ids.contains(&d.id)
+                        && !request.retry_skipped_ids.contains(&d.id)
+                })
                 .cloned()
                 .collect();
             if !kept.is_empty() {
@@ -239,7 +373,20 @@ impl Core {
             }
         }
 
+        if request.pass_through == Some(PassThrough::Healthy)
+            && resolution.kind != ResolveKind::Id
+            && !healthy.is_empty()
+        {
+            healthy.retain(|d| uses_pass_through(d));
+            if healthy.is_empty() {
+                return Err(Error::NoPassThroughDeployments {
+                    model: name.to_owned(),
+                });
+            }
+        }
+
         Ok(Candidates {
+            name: name.to_owned(),
             model_group: resolution.group,
             kind: resolution.kind,
             all,
@@ -258,17 +405,21 @@ impl Core {
         let no_deployment = || Error::NoHealthyDeployments {
             model: candidates.model_group.clone(),
         };
-        let strategy = match candidates.kind {
-            ResolveKind::RoutingGroup => snapshot
-                .registry
-                .resolve_routing_group_strategy(&candidates.model_group),
-            ResolveKind::SpecificDeployment
-            | ResolveKind::Id
-            | ResolveKind::Alias
-            | ResolveKind::Group
-            | ResolveKind::Wildcard => None,
+        // A deployment named by its id is returned as is, before any strategy runs.
+        if candidates.kind == ResolveKind::Id {
+            return candidates
+                .healthy
+                .first()
+                .cloned()
+                .ok_or_else(no_deployment);
         }
-        .unwrap_or_else(|| snapshot.settings.routing_strategy.clone());
+        let (strategy, scope) = routing_context(
+            &snapshot.registry,
+            &snapshot.settings.routing_strategy,
+            request.routing_strategy.as_deref(),
+            &candidates.kind,
+            &candidates.model_group,
+        );
         if strategy == RoutingStrategy::SimpleShuffle {
             return simple_shuffle(
                 &candidates.healthy,
@@ -278,7 +429,14 @@ impl Core {
             )
             .ok_or_else(no_deployment);
         }
-        let ctx = self.context(snapshot, op, request, &candidates.model_group);
+        let ctx = self.context(
+            snapshot,
+            op,
+            request,
+            &candidates.model_group,
+            &candidates.name,
+            scope,
+        );
         self.host
             .select(
                 &SelectStage::Strategy(strategy),
