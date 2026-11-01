@@ -12,7 +12,7 @@ router core.
 """
 
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, TypeAlias
 
@@ -161,9 +161,21 @@ class StrategySelectors:
 
     def retire(self) -> None:
         self._unregister([self._default, *self._groups.values(), *self._overrides.values()])
+        self.clear()
+
+    def clear(self) -> None:
+        """Forget every selector, after the caller released them from the host lists."""
         self._default = None
         self._groups = {}
         self._overrides = {}
+
+    def callback_selectors(self) -> tuple[Selector, ...]:
+        """``_callback_selectors``: the default group's selector and each routing group's."""
+        return tuple(selector for selector in (self._default, *self._groups.values()) if selector is not None)
+
+    def override_selectors(self) -> tuple[Selector, ...]:
+        """The per-request override selectors built so far."""
+        return tuple(selector for selector in self._overrides.values() if selector is not None)
 
     @property
     def default(self) -> Selector | None:
@@ -294,18 +306,19 @@ def pick_sync(
             return None
 
 
-async def routing_pre_call_checks(host: "PythonHost", deployment: Mapping[str, object]) -> None:
-    """``async_routing_strategy_pre_call_checks``: every ``CustomLogger`` in the host's callbacks
-    checks the picked deployment before the call (usage-based-routing-v2 counts its rpm here). A
-    check's error fails the attempt; the core records that failure like any other."""
-    for callback in tuple(_callbacks(host)):
+async def routing_pre_call_checks(callbacks: Iterable[object], deployment: Mapping[str, object]) -> None:
+    """``async_routing_strategy_pre_call_checks``: every ``CustomLogger`` among the router's routing
+    callbacks (``_routing_callbacks``) checks the picked deployment before the call
+    (usage-based-routing-v2 counts its rpm here). A check's error fails the attempt; the core
+    records that failure like any other."""
+    for callback in tuple(callbacks):
         if isinstance(callback, CustomLogger):
             await callback.async_pre_call_check(dict(deployment), None)  # pyright: ignore[reportUnknownMemberType]  # CustomLogger takes an untyped deployment dict
 
 
-def routing_pre_call_checks_sync(host: "PythonHost", deployment: Mapping[str, object]) -> None:
+def routing_pre_call_checks_sync(callbacks: Iterable[object], deployment: Mapping[str, object]) -> None:
     """``routing_strategy_pre_call_checks``: the sync check of each ``CustomLogger`` callback."""
-    for callback in tuple(_callbacks(host)):
+    for callback in tuple(callbacks):
         if isinstance(callback, CustomLogger):
             callback.pre_call_check(dict(deployment))  # pyright: ignore[reportUnknownMemberType]  # see above
 

@@ -512,6 +512,22 @@ fn answer(ask: &Ask, outcome: Option<Bound<'_, PyAny>>) -> PyResult<Answer> {
                 _ => None,
             }))
         }
+        Ask::Select {
+            stage: Stage::CallbackFilters,
+            ..
+        } => {
+            // The remaining ids, or a failure mapping as an attempt reports one.
+            let outcome = outcome.ok_or_else(missing)?;
+            if let Ok(failure) = outcome.cast::<PyDict>() {
+                return match attempt_outcome(failure)? {
+                    Err(error) => Ok(Answer::Filtered(Err(error))),
+                    Ok(_) => Err(PyValueError::new_err(
+                        "a `callback_filters` outcome is the remaining ids or a failure",
+                    )),
+                };
+            }
+            Ok(Answer::Filtered(Ok(outcome.extract()?)))
+        }
         Ask::Select { .. } => Ok(Answer::Select(outcome.ok_or_else(missing)?.extract()?)),
         Ask::PreRoute { .. } => pre_route_outcome(outcome).map(Answer::PreRoute),
         Ask::Attempt { .. } => {
@@ -839,6 +855,7 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
                 Stage::Tags => ("tags", None),
                 Stage::PreCall => ("pre_call", None),
                 Stage::TextOnly => ("text_only", None),
+                Stage::CallbackFilters => ("callback_filters", None),
                 Stage::RoutingPlugins { run } => {
                     dict.set_item("run", run)?;
                     ("routing_plugins", None)
