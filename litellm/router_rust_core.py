@@ -72,7 +72,13 @@ from litellm.router_rust_fallbacks import (
     rejected_fallback_target,
     validate_fallbacks,
 )
-from litellm.router_rust_health import RustHealthCallbacks, cooled_in_running_loop, failure_status
+from litellm.router_rust_health import (
+    RustHealthCallbacks,
+    async_pre_call_checks,
+    cooled_in_running_loop,
+    failure_status,
+    pre_call_checks,
+)
 from litellm.router_rust_retries import RustRetries, refuse_unserved_retry_policies, resolved_retry_policy
 from litellm.router_rust_walk import FallbackOutcomes, WalkMetadata, await_all
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
@@ -1539,8 +1545,29 @@ class _Driver:
         self._level_errors[level if isinstance(level, int) else 0] = error
         return attempt_failure(error)
 
+    async def _gate(self, step: Mapping[str, object], deployment: Mapping[str, object]) -> Mapping[str, object] | None:
+        """The pre-call checks before the deployment is called: a rate limit from one cools the
+        deployment down (``set_cooldown_deployments``) and any error is the attempt's, recorded."""
+        import litellm.exceptions as litellm_exceptions
+
+        core: Final = self._core
+        try:
+            await async_pre_call_checks(core._host.callback_list("callbacks"), deployment)  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # the driver serves its own core; "callbacks" is a list the host serves untyped
+        except litellm_exceptions.RateLimitError as error:
+            deployment_id: Final = (as_str_mapping(deployment.get("model_info")) or {}).get("id")
+            if isinstance(deployment_id, str):
+                report: Final = core._handle.report_failure(deployment_id, dict(attempt_failure(error)), uncounted=True)  # pyright: ignore[reportPrivateUsage]  # see above
+                await core._drive_cache_steps(report)  # pyright: ignore[reportPrivateUsage]  # see above
+            return {**self._failed(step, deployment, error), "recorded": True}
+        except Exception as error:  # noqa: BLE001  # a pre-call check's error is the attempt's
+            return {**self._failed(step, deployment, error), "recorded": True}
+        return None
+
     async def attempt(self, step: Mapping[str, object]) -> Mapping[str, object]:
         deployment, kwargs = self._kwargs(step)
+        gated: Final = await self._gate(step, deployment)
+        if gated is not None:
+            return gated
         try:
             host: Final = self._core._host  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
             endpoint: Final = host.invoke(_HOST_ENDPOINTS.get(self._op, self._op))
@@ -1555,6 +1582,10 @@ class _Driver:
 
     def attempt_sync(self, step: Mapping[str, object]) -> Mapping[str, object]:
         deployment, kwargs = self._kwargs(step)
+        try:
+            pre_call_checks(self._core._host.callback_list("callbacks"), deployment)  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # see attempt
+        except Exception as error:  # noqa: BLE001  # the sync twin raises the check's error and sets no cooldown
+            return {**self._failed(step, deployment, error), "recorded": True}
         try:
             response: Final = self._core._host.invoke(self._op)(**kwargs)  # pyright: ignore[reportPrivateUsage]  # a sync endpoint
         except Exception as error:  # noqa: BLE001  # see attempt

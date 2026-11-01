@@ -465,6 +465,7 @@ class RouterCoreHandle:
         count_only: bool = False,
         requested_group: str | None = None,
         cooldown_time: float | None = None,
+        uncounted: bool = False,
     ) -> RouterCall: ...
     # A success a logging callback saw, driven like `report_failure`; `done` carries `key`.
     def report_success(self, id: str, total_tokens: float, requests: float) -> RouterCall: ...

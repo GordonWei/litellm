@@ -139,6 +139,9 @@ pub struct AttemptError {
     /// The exception's class names, most specific first (its `__mro__`), for the rules Python
     /// decides by `isinstance`. Empty when the host reports none; the kind then stands in.
     pub classes: Vec<Arc<str>>,
+    /// The host already recorded what this failure does to the deployment's health (a pre-call
+    /// check's failure, which Python's attempt handles itself), so the core records nothing.
+    pub recorded: bool,
     pub payload: Option<Payload>,
 }
 
@@ -151,6 +154,7 @@ impl AttemptError {
             num_retries: None,
             detail: None,
             classes: Vec::new(),
+            recorded: false,
             payload: None,
         }
     }

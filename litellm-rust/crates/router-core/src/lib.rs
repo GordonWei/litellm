@@ -173,6 +173,8 @@ pub struct FailureReport {
     pub count_only: bool,
     /// The model group the request was for, whose fallbacks keep a lone deployment cooling.
     pub requested_group: Option<String>,
+    /// Cool down without counting the failure (`set_cooldown_deployments` alone).
+    pub uncounted: bool,
 }
 
 /// Builds a [`Router`], with test seams.
@@ -369,7 +371,9 @@ impl Router {
         failure: &AttemptError,
         report: FailureReport,
     ) -> Result<bool, Error> {
-        self.core.health.count_failure(id).await?;
+        if !report.uncounted {
+            self.core.health.count_failure(id).await?;
+        }
         let snapshot = self.core.snapshot.load_full();
         let Some(deployment) = snapshot.registry.deployment(id) else {
             return Ok(false);

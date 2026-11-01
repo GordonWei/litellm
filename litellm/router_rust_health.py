@@ -5,7 +5,7 @@ the outcome and decides the cooldown; this module reads litellm's logging kwargs
 failures the Python router does not hold against the deployment, and drives the Rust call.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Final
 
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
@@ -33,6 +33,24 @@ def failure_status(exception_status: object) -> int | None:
     other string 500. A number no status can hold reads as no status."""
     status: Final = _cast_status(exception_status)
     return status if status is not None and 0 <= status <= 65535 else None
+
+
+async def async_pre_call_checks(callbacks: Iterable[object], deployment: Mapping[str, object]) -> None:
+    """``async_routing_strategy_pre_call_checks``: each ``CustomLogger``'s async pre-call check."""
+    from litellm.integrations.custom_logger import CustomLogger
+
+    for callback in callbacks:
+        if isinstance(callback, CustomLogger):
+            await callback.async_pre_call_check(dict(deployment), None)  # pyright: ignore[reportUnknownMemberType]  # the logger's untyped hook
+
+
+def pre_call_checks(callbacks: Iterable[object], deployment: Mapping[str, object]) -> None:
+    """``routing_strategy_pre_call_checks``: each ``CustomLogger``'s sync pre-call check."""
+    from litellm.integrations.custom_logger import CustomLogger
+
+    for callback in callbacks:
+        if isinstance(callback, CustomLogger):
+            callback.pre_call_check(dict(deployment))  # pyright: ignore[reportUnknownMemberType]  # the logger's untyped hook
 
 
 def cooled_in_running_loop(cooled: bool) -> bool:
@@ -186,4 +204,10 @@ class RustHealthCallbacks:
         )
 
 
-__all__ = ["RustHealthCallbacks", "cooled_in_running_loop", "failure_status"]
+__all__ = [
+    "RustHealthCallbacks",
+    "async_pre_call_checks",
+    "cooled_in_running_loop",
+    "failure_status",
+    "pre_call_checks",
+]

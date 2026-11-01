@@ -166,7 +166,7 @@ impl RouterCoreHandle {
     /// Record a failure the router did not see itself (a health check, an interceptor, a
     /// logging callback), driven like `start`: its steps are cache ops, and it ends with `done`
     /// (`cooled`).
-    #[pyo3(signature = (id, failure, deployment_cooldown=false, count_only=false, requested_group=None, cooldown_time=None))]
+    #[pyo3(signature = (id, failure, deployment_cooldown=false, count_only=false, requested_group=None, cooldown_time=None, uncounted=false))]
     #[allow(clippy::too_many_arguments)]
     fn report_failure(
         &self,
@@ -176,6 +176,7 @@ impl RouterCoreHandle {
         count_only: bool,
         requested_group: Option<String>,
         cooldown_time: Option<f64>,
+        uncounted: bool,
     ) -> PyResult<RouterCall> {
         let failure = match attempt_outcome(failure)? {
             Err(failure) => failure,
@@ -192,6 +193,7 @@ impl RouterCoreHandle {
             cooldown_time,
             count_only,
             requested_group,
+            uncounted,
         };
         Ok(RouterCall::new(async move {
             router
@@ -465,6 +467,7 @@ pub(crate) fn attempt_outcome(outcome: &Bound<'_, PyDict>) -> PyResult<Result<u6
     failure.retry_after = retry_after;
     failure.num_retries = item(outcome, "num_retries")?;
     failure.detail = item::<String>(outcome, "detail")?.map(Into::into);
+    failure.recorded = item::<bool>(outcome, "recorded")?.unwrap_or(false);
     failure.classes = item::<Vec<String>>(outcome, "classes")?
         .unwrap_or_default()
         .into_iter()
