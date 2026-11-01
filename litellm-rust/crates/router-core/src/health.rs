@@ -606,6 +606,26 @@ mod tests {
     }
 
     #[rstest]
+    #[case::content_policy_first(&["ContentPolicyViolationError", "BadRequestError"], Some(1.0))]
+    #[case::bad_request(&["BadRequestError"], Some(2.0))]
+    #[case::unnamed(&["Timeout"], None)]
+    fn a_deployment_policy_matches_in_python_order(
+        #[case] classes: &[&str],
+        #[case] expected: Option<f64>,
+    ) {
+        let policy = serde_json::json!({
+            "BadRequestErrorAllowedFails": 2,
+            "ContentPolicyViolationErrorAllowedFails": 1,
+        });
+        let mut failure = AttemptError::new(FailureKind::BadRequest, Some(400));
+        failure.classes = classes.iter().map(|class| (*class).into()).collect();
+        assert_eq!(
+            deployment_allowed_fails(policy.as_object(), &failure),
+            expected
+        );
+    }
+
+    #[rstest]
     fn keys_match_python() {
         assert_eq!(
             (

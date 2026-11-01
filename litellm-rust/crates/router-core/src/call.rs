@@ -185,6 +185,23 @@ fn group_members(snapshot: &Snapshot, group: &str) -> Vec<Arc<crate::registry::D
         .unwrap_or_default()
 }
 
+/// Whether the op's attempt stamps `failed_deployment_id` on its error (`_completion`,
+/// `_acompletion` and the generic API calls), which weighted failover needs.
+fn stamps_failed_deployment(op: &Op) -> bool {
+    match op {
+        Op::Embedding
+        | Op::ImageGeneration
+        | Op::Transcription
+        | Op::Speech
+        | Op::TextCompletion => false,
+        Op::Other(name) => !matches!(
+            name.as_str(),
+            "arerank" | "embedding" | "image_generation" | "text_completion"
+        ),
+        Op::Completion | Op::Responses | Op::Messages | Op::Ocr => true,
+    }
+}
+
 /// `is_bad_request_without_fallback` with `fallback_on_unsupported_params` off: an unsupported
 /// params error, or a provider's plain 400 bad request.
 fn is_bad_request_without_fallback(failure: &AttemptError) -> bool {
@@ -438,8 +455,7 @@ impl Core {
         error: &Error,
         failed_id: Option<&str>,
     ) -> Option<Next> {
-        let _ = op;
-        if !snapshot.settings.enable_weighted_failover {
+        if !snapshot.settings.enable_weighted_failover || !stamps_failed_deployment(op) {
             return None;
         }
         let failure = match error {
