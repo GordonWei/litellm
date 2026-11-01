@@ -491,12 +491,15 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             name,
             scope,
             group,
+            pool,
             candidates,
         } => {
             let (stage, strategy) = match stage {
                 Stage::Plugins => ("plugins", None),
                 Stage::Strategy(strategy) => ("strategy", Some(strategy)),
+                Stage::Tags => ("tags", None),
             };
+            dict.set_item("pool", PyList::new(py, pool)?)?;
             dict.set_item("stage", stage)?;
             dict.set_item("strategy", strategy)?;
             dict.set_item("model_group", model_group)?;

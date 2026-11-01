@@ -51,6 +51,8 @@ pub(crate) enum Stage {
     Plugins,
     /// A strategy router-core does not implement: return the candidates with the pick first.
     Strategy(String),
+    /// Tag routing: return the deployments that remain.
+    Tags,
 }
 
 /// The `op` of a `cache` step: one per [`RouterCache`] method.
@@ -135,6 +137,8 @@ pub(crate) enum Ask {
         /// Whose selector a strategy reads: `default`, `group` (with `group`) or `override`.
         scope: &'static str,
         group: Option<String>,
+        /// The deployments the name resolved to, before health filters (the tag stage reads them).
+        pool: Vec<String>,
         candidates: Vec<String>,
     },
     /// One [`RouterCache`] op against the host's cache. `key` is set for every op but
@@ -472,7 +476,9 @@ impl Host for StepHost {
             stage: match stage {
                 SelectStage::Plugins => Stage::Plugins,
                 SelectStage::Strategy(strategy) => Stage::Strategy(strategy.to_string()),
+                SelectStage::Tags => Stage::Tags,
             },
+            pool: ctx.pool.iter().map(|d| d.id.clone()).collect(),
             model_group: ctx.model_group.to_owned(),
             name: ctx.name.to_owned(),
             scope,

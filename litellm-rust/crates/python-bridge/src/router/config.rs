@@ -164,6 +164,7 @@ struct RequestSpec {
     disable_fallbacks: Option<bool>,
     router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
     routing_strategy: Option<String>,
+    filter_tags: Option<bool>,
     body: Option<Value>,
 }
 
@@ -183,6 +184,7 @@ pub(crate) fn request(value: Value, model: Option<&str>) -> Result<RouterRequest
         disable_fallbacks: spec.disable_fallbacks.unwrap_or(false),
         router_weights: spec.router_weights,
         routing_strategy: spec.routing_strategy,
+        filter_tags: spec.filter_tags.unwrap_or(false),
         payload: None,
     })
 }

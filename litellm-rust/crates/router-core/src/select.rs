@@ -138,6 +138,7 @@ impl Core {
             model_group,
             name,
             scope,
+            pool: &[],
         }
     }
 
@@ -219,6 +220,19 @@ impl Core {
                 .host
                 .select(&SelectStage::Plugins, &ctx, healthy)
                 .await?;
+        }
+
+        if request.filter_tags && !healthy.is_empty() {
+            let mut ctx = self.context(
+                snapshot,
+                op,
+                request,
+                &resolution.group,
+                name,
+                StrategyScope::Default,
+            );
+            ctx.pool = &all;
+            healthy = self.host.select(&SelectStage::Tags, &ctx, healthy).await?;
         }
 
         let order = inputs

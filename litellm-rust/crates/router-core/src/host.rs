@@ -35,6 +35,9 @@ pub struct RouterRequest {
     pub router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
     /// A per-request `routing_strategy` override, as Python normalizes it.
     pub routing_strategy: Option<String>,
+    /// Whether tag routing may apply to this request (router, request or model setting), so the
+    /// host's tag stage runs.
+    pub filter_tags: bool,
     /// What the host needs to run the call itself, such as the Python kwargs.
     pub payload: Option<Payload>,
 }
@@ -81,6 +84,9 @@ pub struct RoutingContext<'a> {
     pub name: &'a str,
     /// Whose selector a strategy stage reads.
     pub scope: StrategyScope,
+    /// The deployments the name resolved to for this caller, before health filters
+    /// (`request_deployments`), for the tag stage.
+    pub pool: &'a [Arc<Deployment>],
 }
 
 /// Which selection step the host is asked to run.
@@ -90,6 +96,8 @@ pub enum SelectStage {
     Plugins,
     /// A strategy not yet ported: return the candidates with the pick first.
     Strategy(RoutingStrategy),
+    /// Tag routing (`get_deployments_for_tag`), not yet ported: return the deployments that remain.
+    Tags,
 }
 
 /// Routing events, delivered through [`Host::observe`].

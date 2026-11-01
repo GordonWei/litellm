@@ -78,6 +78,7 @@ from litellm.router_rust_selection import (
     routing_pre_call_checks,
     routing_pre_call_checks_sync,
 )
+from litellm.router_strategy.auto_router.auto_router_model_naming import classify_strategy_router_model
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
 from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError, RoutingGroup, RoutingStrategy
@@ -149,6 +150,9 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "routing_strategy",
         "routing_strategy_args",
         "routing_groups",
+        "enable_tag_filtering",
+        "tag_filtering_match_any",
+        "tag_routing_prefix",
         "model_group_alias",
         "fallbacks",
         "default_fallbacks",
@@ -225,6 +229,21 @@ _DYNAMIC_SETTINGS: Final = frozenset(
         "fallback_access_check",
         "fallback_budget_check",
         "routing_strategy_args",
+        "enable_tag_filtering",
+        "tag_filtering_match_any",
+        "tag_routing_prefix",
+    }
+)
+
+
+# Settings converted by `Resolved._selection_setting`.
+_SELECTION_SETTINGS: Final = frozenset(
+    {
+        "routing_strategy",
+        "routing_strategy_args",
+        "enable_tag_filtering",
+        "tag_filtering_match_any",
+        "tag_routing_prefix",
     }
 )
 
@@ -331,6 +350,9 @@ class Resolved:
     fallback_access_check: object
     fallback_budget_check: object
     routing_groups: "tuple[RoutingGroup, ...]" = ()
+    enable_tag_filtering: bool = False
+    tag_filtering_match_any: bool = True
+    tag_routing_prefix: str = ""
     assigned: frozenset[str] = frozenset()
 
     @classmethod
@@ -382,6 +404,9 @@ class Resolved:
             default_litellm_params=MappingProxyType(dict(as_str_mapping(get("default_litellm_params")) or {})),
             fallback_access_check=get("fallback_access_check"),
             fallback_budget_check=get("fallback_budget_check"),
+            enable_tag_filtering=bool(get("enable_tag_filtering")),
+            tag_filtering_match_any=_true_unless_given(get("tag_filtering_match_any")),
+            tag_routing_prefix=str(get("tag_routing_prefix") or ""),
             routing_groups=parse_groups(
                 get("routing_groups"),
                 frozenset(
@@ -402,7 +427,7 @@ class Resolved:
         unknown: Final = sorted(
             set(values)
             - {*SETTING_FIELDS, *PLAIN_SETTING_ATTRIBUTES, *ASSIGNABLE_ALIASES}
-            - (updated & {"routing_strategy_args", "routing_groups"})
+            - (updated & {"routing_strategy_args", "routing_groups", "enable_tag_filtering", "tag_routing_prefix"})
         )
         if unknown:
             raise ValueError(f"not assignable router settings: {unknown}")
@@ -423,13 +448,8 @@ class Resolved:
                 )
             elif name == "timeout":
                 updates[name] = float(str(value)) if value is not None else None
-            elif name == "routing_strategy":
-                normalized = normalize_strategy(value) or "simple-shuffle"
-                if name in updated and normalized != self.routing_strategy:
-                    validate_routing_strategy(value)  # pyright: ignore[reportArgumentType]  # validated as given
-                updates[name] = normalized
-            elif name == "routing_strategy_args":
-                updates[name] = MappingProxyType(dict(as_str_mapping(value) or {}))
+            elif name in _SELECTION_SETTINGS:
+                updates[name] = self._selection_setting(name, value, validate=name in updated)
             elif name == "disable_cooldowns":
                 updates[name] = _optional_bool(value)
             elif name in ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks"):
@@ -437,6 +457,20 @@ class Resolved:
             else:
                 updates[name] = value
         return dataclasses.replace(self, **updates, assigned=self.assigned | frozenset(values))  # pyright: ignore[reportArgumentType]  # each value converted to its field's type above
+
+    def _selection_setting(self, name: str, value: object, *, validate: bool) -> object:
+        """A selection setting converted to its field's type; a strategy changed through
+        ``update_settings`` is validated."""
+        if name == "routing_strategy":
+            normalized: Final = normalize_strategy(value) or "simple-shuffle"
+            if validate and normalized != self.routing_strategy:
+                validate_routing_strategy(value)  # pyright: ignore[reportArgumentType]  # validated as given
+            return normalized
+        if name == "routing_strategy_args":
+            return MappingProxyType(dict(as_str_mapping(value) or {}))
+        if name == "tag_routing_prefix":
+            return str(value or "")
+        return bool(value)
 
     def static_document(self, model_list: Sequence[object]) -> Mapping[str, object]:
         values: Final = {
@@ -495,6 +529,10 @@ class Resolved:
         return {"providers": _PROVIDERS, "provider_prefixed": prefixed}
 
 
+def _true_unless_given(value: object) -> bool:
+    return True if value is None else bool(value)
+
+
 def _group_selectors(groups: "Sequence[RoutingGroup]") -> Sequence[tuple[str, str, Mapping[str, object]]]:
     return [
         (
@@ -525,8 +563,17 @@ def unsupported_arguments(config: RouterConfig) -> frozenset[str]:
         and (isinstance(params.get("weight"), bool) or not isinstance(params.get("weight"), int | float))
         for deployment in _as_list(config.get("model_list"))
     )
+    # Tag routing among pre-routing strategy markers needs pre-routing, which is not served yet.
+    tagged_markers: Final = bool(config.get("enable_tag_filtering")) and any(
+        isinstance(
+            model := (as_str_mapping((as_str_mapping(deployment) or {}).get("litellm_params")) or {}).get("model"), str
+        )
+        and classify_strategy_router_model(model) is not None
+        for deployment in _as_list(config.get("model_list"))
+    )
     return (
         unserved
+        | ({"enable_tag_filtering"} if tagged_markers else frozenset[str]())
         # lar1 routes through a custom strategy (`apply_lar1_routing_strategy`), not served yet.
         | ({"routing_strategy"} if strategy == "lar1" else frozenset[str]())
         | ({"model_list"} if odd_weight else frozenset[str]())
@@ -925,6 +972,7 @@ class RustCore(_SettingsSource):
         self._version: int = 1
         self._retired: bool = False
         self._settings: RustSettings | None = None
+        self._tag_filtering_models: tuple[int, bool] | None = None
         self._selectors: Final = StrategySelectors(host, self._cache)
         self._selectors.init_default(resolved.routing_strategy, resolved.routing_strategy_args)
         self._selectors.init_groups(_group_selectors(resolved.routing_groups))
@@ -991,7 +1039,9 @@ class RustCore(_SettingsSource):
             disable_cooldowns=r.disable_cooldowns,
             enable_pre_call_checks=False,
             enable_health_check_routing=False,
-            enable_tag_filtering=False,
+            enable_tag_filtering=r.enable_tag_filtering,
+            tag_filtering_match_any=r.tag_filtering_match_any,
+            tag_routing_prefix=r.tag_routing_prefix,
             fallback_access_check=r.fallback_access_check,  # pyright: ignore[reportArgumentType]  # the check as passed
             fallback_budget_check=r.fallback_budget_check,  # pyright: ignore[reportArgumentType]  # the check as passed
             cache_responses=False,
@@ -1002,8 +1052,6 @@ class RustCore(_SettingsSource):
                     "default_max_parallel_requests",
                     "health_check_ignore_transient_errors",
                     "background_health_check_model_groups",
-                    "tag_filtering_match_any",
-                    "tag_routing_prefix",
                     "router_general_settings",
                     "provider_budget_config",
                     "provider_default_deployment_ids",
@@ -1169,7 +1217,7 @@ class RustCore(_SettingsSource):
         if kind not in ("pick", "healthy"):
             raise RustCoreUnsupported(f"select(kind={kind!r}) is not served by the Rust router core")
         request: Final = request_kwargs if request_kwargs is not None else {}
-        fields: Final = dict(_start_fields(request))
+        fields: Final = dict(self._routing_fields(request))
         if specific_deployment:
             fields["specific_deployment"] = True
         call: Final = (self._handle.select if kind == "pick" else self._handle.healthy)(model, _document(fields))
@@ -1268,7 +1316,31 @@ class RustCore(_SettingsSource):
             raise TypeError(f"{field} must be a mapping")
         aliases: Final = self._resolved.model_group_alias
         prepared: Final = prepare_call(op, request, model if model in aliases else None)
-        return self._handle.start(op, _document({"model": model, **_start_fields(request)})), prepared
+        return self._handle.start(op, _document({"model": model, **self._routing_fields(request)})), prepared
+
+    def _routing_fields(self, request: Mapping[str, object]) -> Mapping[str, object]:
+        """The request fields the Rust core routes on, and whether its tag stage may apply: the
+        router's ``enable_tag_filtering``, the request's own, or a deployment's
+        ``model_info.enable_tag_filtering`` (``get_deployments_for_tag``'s effective setting)."""
+        filter_tags: Final = (
+            self._resolved.enable_tag_filtering
+            or request.get("enable_tag_filtering") is True
+            or self._model_tag_filtering()
+        )
+        return {**_start_fields(request), **({"filter_tags": True} if filter_tags else {})}
+
+    def _model_tag_filtering(self) -> bool:
+        """Whether any deployment sets ``model_info.enable_tag_filtering``, cached per registry version."""
+        cached: Final = self._tag_filtering_models
+        if cached is not None and cached[0] == self._version:
+            return cached[1]
+        found: Final = any(
+            (as_str_mapping((as_str_mapping(record) or {}).get("model_info")) or {}).get("enable_tag_filtering")
+            is not None
+            for record in self._handle.deployments()
+        )
+        self._tag_filtering_models = (self._version, found)
+        return found
 
     async def _drive(self, op: str, request: Mapping[str, object]) -> object:
         call, prepared = self._start(op, request)
@@ -1356,9 +1428,29 @@ class RustCore(_SettingsSource):
         ]
         return strategy, selector, str(step.get("model")), candidates
 
+    def _records_of(self, ids: object) -> list[dict[str, object]]:  # mutable-ok: the deployment dicts filters take
+        return [dict(as_str_mapping(self._handle.deployment(str(id))) or {}) for id in _as_list(ids)]
+
+    async def _answer_tags(self, step: Mapping[str, object], request: Mapping[str, object]) -> object:
+        """``get_deployments_for_tag`` over the step's candidates (bridged: not ported to Rust yet)."""
+        from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs
+        from litellm.router_strategy.tag_based_routing import get_deployments_for_tag
+
+        kept: Final = await get_deployments_for_tag(
+            ctx=RoutingContext(self),  # pyright: ignore[reportArgumentType]  # the filter reads registry() and settings()
+            model=str(step.get("model")),
+            healthy_deployments=self._records_of(step.get("candidates")),  # pyright: ignore[reportArgumentType]  # deployment dicts
+            request_kwargs=dict(request),  # pyright: ignore[reportArgumentType]  # the request kwargs
+            metadata_variable_name=get_metadata_variable_name_from_kwargs(dict(request)),
+            request_deployments=self._records_of(step.get("pool")),  # pyright: ignore[reportArgumentType]  # deployment dicts
+        )
+        return [found for record in kept if (found := picked_id(record)) is not None]
+
     async def _answer_select(
         self, step: Mapping[str, object], request: Mapping[str, object], messages: object, input: object
     ) -> object:
+        if step.get("stage") == "tags":
+            return await self._answer_tags(step, request)
         inputs: Final = self._strategy_inputs(step, request)
         if inputs is None:
             return step["candidates"]
