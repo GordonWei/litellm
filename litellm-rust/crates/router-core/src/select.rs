@@ -233,12 +233,8 @@ impl Core {
         } else {
             None
         };
-        let dynamic = &snapshot.settings.dynamic;
         // No deployment for the name: route to the first default fallback.
-        let default_target = dynamic
-            .fallbacks
-            .default_target()
-            .or_else(|| dynamic.default_fallbacks.first().map(String::as_str));
+        let default_target = crate::resolve::default_target(&snapshot.settings.dynamic);
         let caller = Caller {
             team_id: request.team_id.as_deref(),
             proxy_admin: request.proxy_admin,

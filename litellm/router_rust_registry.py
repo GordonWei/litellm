@@ -473,6 +473,8 @@ class HostRegistry(HostModelInfo):
         self._core_adaptive_routers: dict[str, list[TaggedPreRoutingStrategy[object]]] = {}  # mutable-ok: same
         self._core_quality_routers: dict[str, list[TaggedPreRoutingStrategy[object]]] = {}  # mutable-ok: same
         self.strategies: PreRoutingStrategies | None = None
+        # The Rust core's resolution for a request (`_core_get_routable_deployments`), set by the core.
+        self.routable_lookup: Callable[[str, Mapping[str, object]], Sequence[Mapping[str, object]]] | None = None
         # The routing cache usage reads come from; RustCore sets it to the one its Rust core writes.
         self._core_cache: DualCache = DualCache()
         self._discovered_model_info_cache: InMemoryCache = InMemoryCache(
@@ -1565,6 +1567,19 @@ class HostRegistry(HostModelInfo):
                 backend for entry in listed if (backend := cost_map_backend_model(Deployment.model_validate(entry)))
             )
         return tuple(model for entry in listed if isinstance(model := _params_of(entry).get("model"), str) and model)
+
+    def _core_get_routable_deployments(
+        self, model: str, request_kwargs: Mapping[str, object] = MappingProxyType({}), call_type: str | None = None
+    ) -> tuple[Mapping[str, object], ...]:
+        """The deployments routing would consider for ``request_kwargs``, as the Rust core resolves them
+        (endpoint eligibility for ``call_type`` is not applied: the Rust resolution has none)."""
+        _ = call_type
+        lookup: Final = self.routable_lookup
+        if lookup is None:
+            from litellm.router_rust_core import RustCoreUnsupported
+
+            raise RustCoreUnsupported("registry().get_routable_deployments is not served by the Rust router core")
+        return tuple(lookup(model, request_kwargs))
 
     def _core_get_routable_upstream_model(self, model_name: str, team_id: str | None = None) -> str | None:
         deployment: Final = next(iter(self._routable_deployments(model_name, team_id)), None)

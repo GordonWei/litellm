@@ -346,6 +346,27 @@ impl RouterCoreHandle {
         Ok(Some(dict))
     }
 
+    /// The deployments a pick for `model` would resolve to for `request`, before any team,
+    /// cooldown or strategy filter (`_core_get_routable_deployments`); empty when it refuses.
+    fn routable<'py>(
+        &self,
+        py: Python<'py>,
+        model: &str,
+        request: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let request =
+            config::request(document(request)?, Some(model)).map_err(config_error_to_pyerr)?;
+        let records = litellm_router_core::resolve::routable(
+            &self.router.registry(),
+            &self.router.settings().dynamic,
+            &request,
+        )
+        .iter()
+        .map(|d| to_py(py, &host::deployment_record(d)))
+        .collect::<PyResult<Vec<_>>>()?;
+        PyList::new(py, records)
+    }
+
     /// `_get_routing_context` for a pick of `model`: `(strategy, scope, group)`, spelled as a
     /// strategy select step spells them. A name that resolves to nothing reads its routing group
     /// membership as is.

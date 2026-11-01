@@ -152,6 +152,39 @@ fn reserved(
     }
 }
 
+/// The first default fallback a name no deployment serves is routed to.
+pub fn default_target(dynamic: &crate::config::RouterDynamicConfig) -> Option<&str> {
+    dynamic
+        .fallbacks
+        .default_target()
+        .or_else(|| dynamic.default_fallbacks.first().map(String::as_str))
+}
+
+/// `_core_get_routable_deployments`: the deployments resolution would consider for `request`,
+/// before any team, cooldown or strategy filter; nothing when it resolves to nothing or refuses.
+pub fn routable(
+    registry: &Registry,
+    dynamic: &crate::config::RouterDynamicConfig,
+    request: &crate::host::RouterRequest,
+) -> Vec<Arc<Deployment>> {
+    let caller = Caller {
+        team_id: request.team_id.as_deref(),
+        proxy_admin: request.proxy_admin,
+        allowed_models: &request.allowed_models,
+    };
+    match resolve_request(
+        registry,
+        &request.model,
+        false,
+        caller,
+        default_target(dynamic),
+        Timestamp::now(),
+    ) {
+        Ok(Some(resolution)) => resolution.deployments,
+        Ok(None) | Err(_) => Vec::new(),
+    }
+}
+
 /// Resolve `name` for `caller`. `None` when nothing serves it (`no_healthy_deployments`).
 pub fn resolve_request(
     registry: &Registry,

@@ -836,6 +836,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         self._hosted.build(_as_list(config.get("model_list")) if config.get("model_list") is not None else None)
         self._hosted.set_routing_groups(resolved.routing_groups)
         track_live_registry(self._hosted)
+        self._hosted.routable_lookup = self._routable
         self._handle: RouterCoreHandle = self._new_handle(list(self._hosted._core_model_list))  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
         if resolved.enable_mid_stream_fallback_continuation:
             register_continuation_prefill_check(host)
@@ -1442,6 +1443,18 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
             **(overrides or {}),
         }
         return self._handle.start(plan.endpoint, _document({"model": model, **fields})), prepared
+
+    def _process_renamed(self, model: str, group: str) -> str:
+        """``model`` as the error names it: a group the name resolved to by name, alias or routing
+        group is renamed through the process ``model_alias_map`` (``_common_checks_available_deployment``)."""
+        renames: Final = self._host.dynamic().model_alias_map
+        resolution: Final = self._handle.resolve(model) if group in renames else None
+        if resolution is None or resolution["kind"] not in ("Group", "Alias", "RoutingGroup"):
+            return model
+        return renames[group]
+
+    def _routable(self, model: str, request: Mapping[str, object]) -> Sequence[Mapping[str, object]]:
+        return self._handle.routable(model, _document(_start_fields(request)))
 
     def _routing_fields(self, request: Mapping[str, object]) -> Mapping[str, object]:
         """The request fields the Rust core routes on, and whether its tag stage may apply: the
@@ -2053,7 +2066,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
                 default=_seconds(None, self._resolved.cooldown_time),
             )
             return RouterRateLimitError(
-                model=model,
+                model=self._process_renamed(model, str(group)),
                 cooldown_time=min_cooldown,
                 enable_pre_call_checks=self._resolved.enable_pre_call_checks,
                 cooldown_list=cooling,
