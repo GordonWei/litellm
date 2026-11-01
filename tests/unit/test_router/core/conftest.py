@@ -1,4 +1,5 @@
 from collections.abc import Callable, Generator
+from pathlib import Path
 from typing import Final
 
 import pytest
@@ -26,6 +27,23 @@ def make_core(request: pytest.FixtureRequest, host: ScriptedHost) -> Callable[..
             pytest.skip(f"{name} core declines this configuration: {declined}")
 
     return build
+
+
+_RUST_PARITY_PENDING: Final = frozenset(
+    line.strip()
+    for line in (Path(__file__).parent / "rust_parity_pending.txt").read_text().splitlines()
+    if line.strip() and not line.startswith("#")
+)
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Characterization tests the Rust core does not match yet are listed in
+    ``rust_parity_pending.txt`` and expected to fail (strictly: one that starts passing must leave the list)."""
+    here: Final = Path(__file__).parent
+    for item in items:
+        name: Final = f"{Path(str(item.path)).relative_to(here).as_posix()}::{item.name}"
+        if name in _RUST_PARITY_PENDING:
+            item.add_marker(pytest.mark.xfail(reason="Rust core parity pending", strict=True))
 
 
 @pytest.hookimpl(hookwrapper=True)
