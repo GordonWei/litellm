@@ -89,6 +89,7 @@ from litellm.utils import (
 )
 
 if TYPE_CHECKING:
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
     from litellm.router_python_host import PythonHost
 
 _MODEL_INFO_ADAPTER: Final = TypeAdapter(Mapping[str, object])
@@ -446,6 +447,88 @@ class HostRegistry(HostModelInfo):
             params = _params_of(_LITELLM_PARAMS_ADAPTER.validate_python(entry))
             if "model" in params:
                 self._core_deployment_latency_map[str(params["model"])] = 0
+
+    async def arefresh_model_info(self, client: "AsyncHTTPHandler | None") -> None:
+        """``_core_arefresh_model_info``: token limits the served OpenAI-compatible deployments
+        advertise on their models endpoint, read with a few workers over a snapshot of the list."""
+        import asyncio
+
+        from litellm.llms.openai_like.model_info import MODEL_INFO_REFRESH_CONCURRENCY
+
+        deployments: Final = iter(tuple(self._core_model_list))
+
+        async def refresh_worker() -> None:
+            for raw_deployment in deployments:
+                try:
+                    await self._arefresh_deployment_model_info(raw_deployment, client=client)
+                except Exception:  # noqa: BLE001  # one invalid deployment must not prevent refreshing the others
+                    verbose_router_logger.debug("Could not refresh deployment model info")
+
+        _ = await asyncio.gather(*(refresh_worker() for _ in range(MODEL_INFO_REFRESH_CONCURRENCY)))
+        self._invalidate_model_group_info_cache()
+
+    async def _arefresh_deployment_model_info(
+        self, raw_deployment: Mapping[str, object], *, client: "AsyncHTTPHandler | None"
+    ) -> None:
+        from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
+        from litellm.llms.openai_like.model_info import (
+            MODEL_INFO_DISCOVERY_PROVIDERS,
+            get_openai_compatible_model_info,
+        )
+        from litellm.types.router import DiscoveredDeploymentModelInfo
+        from litellm.types.utils import LlmProviders
+        from litellm.utils import aresolve_api_key_secret_reference
+
+        deployment: Final = Deployment.model_validate(raw_deployment)
+        params: Final = LiteLLM_Params.model_validate(
+            MappingProxyType(
+                {
+                    **deployment.litellm_params.model_dump(exclude_none=True),
+                    **(
+                        self._core_get_deployment_credentials_with_provider(deployment.model_info.id or "")
+                        or MappingProxyType({})
+                    ),
+                }
+            )
+        )
+        model, provider, dynamic_api_key, api_base = self._host.invoke("get_llm_provider")(  # pyright: ignore[reportAny]  # litellm's untyped tuple
+            model=params.model, litellm_params=params
+        )
+        if provider not in MODEL_INFO_DISCOVERY_PROVIDERS:
+            return
+        if api_base is None or "*" in model or params.get("use_clientside_credentials"):  # pyright: ignore[reportUnknownMemberType]  # the params' untyped get
+            return
+        api_key: Final = await aresolve_api_key_secret_reference(
+            params.api_key or dynamic_api_key,  # pyright: ignore[reportAny]  # see above
+            model=model,  # pyright: ignore[reportAny]  # see above
+            llm_provider=provider,  # pyright: ignore[reportAny]  # see above
+            upstream=MappingProxyType({"api_base": params.api_base}),
+        )
+        headers: Final = TypeAdapter(Mapping[str, str]).validate_python(
+            params.get("extra_headers") or params.get("headers") or MappingProxyType({})  # pyright: ignore[reportUnknownMemberType]  # see above
+        )
+        auth_headers: Final = (
+            MappingProxyType({"authorization": f"Bearer {api_key}"}) if api_key else MappingProxyType({})
+        )
+        limits: Final = await get_openai_compatible_model_info(
+            model=model,  # pyright: ignore[reportAny]  # see above
+            api_base=api_base,  # pyright: ignore[reportAny]  # see above
+            headers=MappingProxyType(
+                {**auth_headers, **MappingProxyType({key.lower(): value for key, value in headers.items()})}
+            ),
+            client=client or get_async_httpx_client(llm_provider=LlmProviders.OPENAI),
+            cache=self._core_cache.in_memory_cache,
+        )
+        model_id: Final = deployment.model_info.id
+        if not limits or model_id is None or self._core_get_model_info(model_id) is not raw_deployment:
+            return
+        self._discovered_model_info_cache.max_size_in_memory = max(len(self._core_model_list), 1)
+        self._discovered_model_info_cache.delete_cache(model_id)
+        self._discovered_model_info_cache.set_cache(
+            model_id,
+            DiscoveredDeploymentModelInfo(deployment=raw_deployment, limits=limits),  # pyright: ignore[reportArgumentType]  # the model_list entry, as the core keeps it
+        )
+        self._invalidate_model_group_info_cache()
 
     def _invalidate_model_group_info_cache(self) -> None:
         self._cached_get_model_group_info.cache_clear()  # pyright: ignore[reportFunctionMemberAccess]  # an lru_cache
