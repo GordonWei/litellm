@@ -662,8 +662,10 @@ def _generic_attempt(
 ) -> AttemptCall:
     """`_ageneric_api_call_with_fallbacks_helper` for one deployment."""
     from litellm.llms.base_llm.passthrough.transformation import replace_path_segment
+    from litellm.router_rust_websocket import turn_admission
 
     handler: Final = invoked_handler_name(core, plan)
+    socket: Final = handler == "_aresponses_websocket"
     update_kwargs_with_deployment(
         core._shaping,  # pyright: ignore[reportPrivateUsage]  # the core's own settings
         deployment,
@@ -671,7 +673,7 @@ def _generic_attempt(
         cache=core._cache,  # pyright: ignore[reportPrivateUsage]  # the core's routing cache
         function_name="_ageneric_api_call_with_fallbacks",
         splits_stream_timeout=handler in STREAM_TIMEOUT_AWARE_GENERIC_HANDLERS,
-        opens_responses_socket=handler == "_aresponses_websocket",
+        opens_responses_socket=socket,
     )
     model_name: Final = str(data.get("model"))
     endpoint: Final = kwargs.get("endpoint")
@@ -695,6 +697,7 @@ def _generic_attempt(
         **kwargs,
         "model": model_name,
         **_session_with_model(kwargs.get("session"), model_name),
+        **({"turn_admission": turn_admission(core, requested, deployment, kwargs)} if socket else {}),
     }
     if provider is not None:
         final["custom_llm_provider"] = provider
@@ -1131,8 +1134,6 @@ class RustEndpoints:
         """The public endpoint ``name``, bound to this core, or None when the core has none."""
         if name in _UNBRANCHED:
             return _answers_none
-        if name == "_aresponses_websocket":
-            return None  # bridged to port: each turn's admission (`async_admit_deployment_turn`)
         if name in _ASSISTANTS:
             return self._assistants(name)
         if name in _MANAGED_AGENTS:
