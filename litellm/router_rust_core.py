@@ -1239,6 +1239,27 @@ class RustCore(_SettingsSource):
         picked: Final = await selection.run()
         return picked if isinstance(picked, Mapping) else {}
 
+    def get_available_deployment(
+        self,
+        model: str,
+        messages: object = None,
+        input: object = None,
+        specific_deployment: bool | None = False,
+        request_kwargs: dict[str, object] | None = None,  # mutable-ok: the legacy signature
+    ) -> Mapping[str, object]:
+        """The sync pick: no pre-routing, the sync strategies."""
+        selection: Final = _Selection(
+            self,
+            model,
+            request_kwargs if request_kwargs is not None else {},
+            "sync_pick",
+            specific_deployment,
+            messages,
+            input,
+        )
+        picked: Final = selection.run_sync()
+        return picked if isinstance(picked, Mapping) else {}
+
     def get_available_deployment_for_pass_through(
         self,
         model: str,
@@ -1746,7 +1767,7 @@ class _Selection:
         error: Final = self._core._failure_error(step, self._model, None, pass_through=self._kind)  # pyright: ignore[reportPrivateUsage]  # see above
         logging_obj: Final = self._request.get("litellm_logging_obj")
         dispatch: Final[object] = getattr(logging_obj, "dispatch_failure_handlers", None)
-        if callable(dispatch) and self._kind != "pass_through":
+        if callable(dispatch) and self._kind not in ("pass_through", "sync_pick"):
             import asyncio
             import traceback
 
