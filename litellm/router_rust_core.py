@@ -643,6 +643,7 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             ignore_invalid_deployments=bool(config.get("ignore_invalid_deployments")),
             on_change=self._sync_registry,
         )
+        self._hosted._core_cache = self._cache  # pyright: ignore[reportPrivateUsage]  # usage reads come from the cache the Rust core writes
         self._hosted.build(_as_list(config.get("model_list")) if config.get("model_list") is not None else None)
         self._handle: RouterCoreHandle = self._new_handle(list(self._hosted._core_model_list))  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
 

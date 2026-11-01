@@ -19,6 +19,7 @@ import copy
 import re
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from functools import lru_cache
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, TypeAlias
 
@@ -27,6 +28,9 @@ from pydantic import TypeAdapter
 from litellm import exceptions as litellm_exceptions
 from litellm import get_secret_str
 from litellm._logging import verbose_router_logger
+from litellm.caching.dual_cache import DualCache
+from litellm.caching.in_memory_cache import InMemoryCache
+from litellm.constants import DEFAULT_MAX_LRU_CACHE_SIZE
 from litellm.litellm_core_utils.access_windows import access_windows_config_error
 from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
 from litellm.litellm_core_utils.get_llm_provider_logic import (
@@ -57,8 +61,10 @@ from litellm.litellm_core_utils.routing_common_utils import (
     without_model_capability_flags,
 )
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
+from litellm.llms.openai_like.model_info import MODEL_INFO_REFRESH_SECONDS
 from litellm.responses.bridge_check import keep_registered_mode
 from litellm.router_api import RouterRegistry, deployment_id
+from litellm.router_rust_model_info import HostModelInfo
 from litellm.router_strategy.auto_router.auto_router_model_naming import classify_strategy_router_model
 from litellm.router_utils.endpoint_eligibility import warn_on_unenforced_endpoint_flag
 from litellm.types.router import (
@@ -67,6 +73,7 @@ from litellm.types.router import (
     Deployment,
     DeploymentTypedDict,
     LiteLLM_Params,
+    ModelGroupInfo,
     RouterModelGroupAliasItem,
     holds_secret_pointer,
     validate_litellm_params_strictly,
@@ -367,7 +374,7 @@ def _without_indices(indices: Sequence[int], removal_idx: int) -> list[int]:  # 
     return [idx - 1 if idx > removal_idx else idx for idx in indices if idx != removal_idx]
 
 
-class HostRegistry:
+class HostRegistry(HostModelInfo):
     """The live model_list and its indexes, kept the way the Python router core keeps them."""
 
     def __init__(
@@ -397,6 +404,17 @@ class HostRegistry:
         self._core_deployment_latency_map: dict[str, float] = {}  # mutable-ok: the live latency map
         self._access_groups_cache: Mapping[str, Sequence[str]] | None = None
         self._provider_unresolved_deployments: tuple[Callable[[], Deployment | None], ...] = ()
+        # The routing cache usage reads come from; RustCore sets it to the one its Rust core writes.
+        self._core_cache: DualCache = DualCache()
+        self._discovered_model_info_cache: InMemoryCache = InMemoryCache(
+            max_size_in_memory=1, default_ttl=2 * MODEL_INFO_REFRESH_SECONDS
+        )
+        self._cached_get_model_group_info: Callable[[str], ModelGroupInfo | None] = lru_cache(  # pyright: ignore[reportIncompatibleMethodOverride]  # the per-router cache shadows the uncached method, as the core keeps it
+            maxsize=DEFAULT_MAX_LRU_CACHE_SIZE
+        )(self._core_get_model_group_info)
+        self._core_cached_deployment_model_info: Callable[[str, str], object] = lru_cache(
+            maxsize=DEFAULT_MAX_LRU_CACHE_SIZE
+        )(self._core_get_deployment_model_info)
 
     def __getattr__(self, name: str) -> object:
         from litellm.router_rust_core import RustCoreUnsupported
@@ -409,6 +427,9 @@ class HostRegistry:
         """The constructor's registry: ``set_model_list`` and the latency map, as the core builds them."""
         if model_list is None:
             return
+        self._discovered_model_info_cache = InMemoryCache(
+            max_size_in_memory=max(len(model_list), 1), default_ttl=2 * MODEL_INFO_REFRESH_SECONDS
+        )
         self.set_model_list(model_list)
         for entry in model_list:
             params = _params_of(_LITELLM_PARAMS_ADAPTER.validate_python(entry))
@@ -416,7 +437,8 @@ class HostRegistry:
                 self._core_deployment_latency_map[str(params["model"])] = 0
 
     def _invalidate_model_group_info_cache(self) -> None:
-        self._access_groups_cache = None
+        self._cached_get_model_group_info.cache_clear()  # pyright: ignore[reportFunctionMemberAccess]  # an lru_cache
+        self._core_cached_deployment_model_info.cache_clear()  # pyright: ignore[reportFunctionMemberAccess]  # an lru_cache
 
     def _invalidate_access_groups_cache(self) -> None:
         self._access_groups_cache = None
@@ -424,6 +446,7 @@ class HostRegistry:
 
     def set_model_list(self, model_list: Sequence[object]) -> None:
         """Replace every deployment (``set_model_list``)."""
+        self._discovered_model_info_cache.flush_cache()
         original_model_list: Final[list[UntypedEntry]] = copy.deepcopy(list(model_list))  # pyright: ignore[reportAssignmentType]  # model_list entries  # mutable-ok: a deep copy the build consumes
         with self._deployment_index_lock:
             self._core_model_list = []
