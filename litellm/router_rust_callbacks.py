@@ -351,9 +351,7 @@ class OptionalChecks:
     ) -> list[object]:  # mutable-ok: as the filters return it
         """``async_callback_filter_deployments``: each routing callback narrows the deployments in
         turn; a filter's error is raised for the Rust core to decide on."""
-        remaining: list[object] = list(
-            deployments
-        )  # mutable-ok: the filters' list contract  # rebind-ok: narrowed by each filter
+        remaining: list[object] = list(deployments)  # mutable-ok: filter contract  # rebind-ok: narrowed
         base: Final[object] = CustomLogger.async_filter_deployments  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # untyped deployment dicts
         request_kwargs: Final = dict(request)
         for callback in tuple(self.routing_callbacks()):

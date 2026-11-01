@@ -98,8 +98,6 @@ def read_settings_update(settings: Mapping[str, object]) -> SettingsUpdate:
     """``_core_update_settings``' reading of each setting: names that are not runtime-updatable are
     ignored, the integer settings are cast with ``int``, a retry policy dict becomes a
     ``RetryPolicy`` (any other type but ``None`` is dropped)."""
-    from litellm.router_rust_core import RustCoreUnsupported
-
     values: Final[dict[str, object]] = {}  # mutable-ok: built here, then frozen into the update
     plain: Final[dict[str, object]] = {}  # mutable-ok: same
     continuation: object = MISSING  # rebind-ok: set when the flag is given
