@@ -1005,6 +1005,8 @@ class RustEndpoints:
         }.get(name)
         if direct is not None:
             return direct
+        if name == "responses":
+            return self._sync_factory(name, PLANS["responses"])
         plan: Final = generic_plan(name)
         if plan is None or name in PLANS:
             return None
