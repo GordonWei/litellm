@@ -50,6 +50,7 @@ from litellm.litellm_core_utils.routing_common_utils import (
 from litellm.litellm_core_utils.routing_groups import validate_routing_strategy
 from litellm.litellm_core_utils.secret_redaction import redact_string
 from litellm.router_api import (
+    ROUTER_INIT_ARGS,
     SETTING_FIELDS,
     ApplyResult,
     ChangeSet,
@@ -63,6 +64,7 @@ from litellm.router_attempt import for_requested_model, request_from_call
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
 from litellm.router_rust_access import caller_fields, selection_refusal
+from litellm.router_rust_alerting import initialize_alerting
 from litellm.router_rust_callbacks import OptionalChecks, RustOptionalChecks
 from litellm.router_rust_endpoints import (
     AttemptCall,
@@ -269,12 +271,18 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "deployment_affinity_ttl_seconds",
         "session_affinity_repin_on_failover",
         "model_group_affinity_config",
+        # Kept as given (litellm/router_rust_settings.py) and read host-side by the endpoint plans
+        # (default_litellm_params' caching groups) and the slot limits.
+        "client_ttl",
+        "caching_groups",
+        "default_max_parallel_requests",
+        # Built host-side into a Slack alerting logger (litellm/router_rust_alerting.py).
+        "alerting_config",
     }
 )
 # Arguments that may be passed at their default without asking for anything.
 _UNSET_DEFAULTS: Final[Mapping[str, object]] = MappingProxyType(
     {
-        "client_ttl": 3600,
         "cache_responses": False,
         "enable_pre_call_checks": False,
         "enable_tag_filtering": False,
@@ -922,6 +930,9 @@ class RustCore(
         self._hosted.checks = self._checks
         strategies.ensure_affinity = self._checks.ensure_deployment_affinity_callback
         self._checks.build(config.get("optional_pre_call_checks"), config.get("model_list"))
+        self._slack_alerting_logger: Final = initialize_alerting(host, config.get("alerting_config"))  # pyright: ignore[reportArgumentType]  # the argument as passed
+        if self._slack_alerting_logger is not None:
+            self._checks.slack_alerting_loggers = (self._slack_alerting_logger,)
         if resolved.enable_mid_stream_fallback_continuation:
             register_continuation_prefill_check(host)
         if resolved.routing_strategy == "lar1":
@@ -1065,6 +1076,7 @@ class RustCore(
             default_litellm_params=dict(r.default_litellm_params)
             if "default_litellm_params" in r.assigned
             else default_litellm_params(self._config),
+            default_max_parallel_requests=self._config.get("default_max_parallel_requests"),  # pyright: ignore[reportArgumentType]  # the argument as passed
             cooldown_time=r.cooldown_time,
             allowed_fails=r.allowed_fails,
             allowed_fails_policy=r.allowed_fails_policy,  # pyright: ignore[reportArgumentType]  # the policy as passed
@@ -1125,13 +1137,13 @@ class RustCore(
         return self._health_view
 
     def observe(self, logging_obj: object = None, *, request_scoped: bool = False) -> RoutingObservers:
-        """The routing observers. This core registers no outcome callbacks and builds no alerting
-        (``alerting_config`` is declined), so there is no Slack alerting logger."""
+        """The routing observers: the Slack alerting logger ``alerting_config`` built, if any. This
+        core registers no outcome callbacks."""
         if request_scoped:
             self._serve_through_request_logging()
         if logging_obj is not None:
             raise RustCoreUnsupported("observe(logging_obj) is not served by the Rust router core yet")
-        return RoutingObservers(slack_alerting_logger=None)
+        return RoutingObservers(slack_alerting_logger=self._slack_alerting_logger)
 
     def register_plugin(self, plugin: "CustomRoutingStrategyBase") -> None:
         """``_core_set_custom_routing_strategy``: ``plugin`` picks every deployment from now on, until
@@ -1293,6 +1305,19 @@ class RustCore(
 
         _note("update_redis_cache", "apply(ChangeSet(redis_cache=cache))")
         _ = self.apply(ChangeSet(redis_cache=cache))
+
+    def get_model_list(
+        self, model_name: str | None = None, team_id: str | None = None
+    ) -> "list[DeploymentTypedDict] | None":  # mutable-ok: the old return type, unchanged
+        from litellm.router_deprecated import _note  # pyright: ignore[reportPrivateUsage]  # see upsert_deployment
+
+        _note("get_model_list", "registry().deployments(model_name, team_id=...)")
+        return self._hosted._core_get_model_list(model_name=model_name, team_id=team_id)  # pyright: ignore[reportPrivateUsage, reportReturnType]  # the host registry's listing, as the deprecated member returns it
+
+    @staticmethod
+    def get_valid_args() -> list[str]:  # mutable-ok: the old return type, a fresh list
+        """The arguments ``Router.__init__`` accepts."""
+        return list(ROUTER_INIT_ARGS)
 
     async def arefresh_model_info(self, *, client: "AsyncHTTPHandler | None" = None) -> None:
         from litellm.router_deprecated import _note  # pyright: ignore[reportPrivateUsage]  # see upsert_deployment

@@ -1,3 +1,5 @@
 test_construction_precall_characterization.py::test_observe_with_a_logging_object_binds_the_router_outcome_callbacks[rust]
 # unskipped by p3-selection
 test_construction_precall_characterization.py::test_retiring_one_router_keeps_the_callbacks_of_another_on_the_same_host[rust]
+# unskipped by p6-final
+test_construction_precall_characterization.py::test_alerting_config_registers_slack_alerting_and_its_slow_response_callback[rust]

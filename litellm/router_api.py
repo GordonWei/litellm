@@ -200,11 +200,77 @@ def deployment_id(model_group: str, litellm_params: Mapping[str, object]) -> str
     return hashlib.sha256("".join(parts).encode()).hexdigest()
 
 
+# The arguments ``Router.__init__`` accepts, in its signature's order. Every core reads this list
+# (the Python core's ``get_valid_args`` reads its constructor's signature, and the core suite checks
+# that the two agree).
+ROUTER_INIT_ARGS: Final[tuple[str, ...]] = (
+    "model_list",
+    "assistants_config",
+    "search_tools",
+    "guardrail_list",
+    "redis_url",
+    "redis_host",
+    "redis_port",
+    "redis_password",
+    "redis_db",
+    "cache_responses",
+    "cache_kwargs",
+    "caching_groups",
+    "client_ttl",
+    "polling_interval",
+    "default_priority",
+    "num_retries",
+    "max_fallbacks",
+    "timeout",
+    "stream_timeout",
+    "default_litellm_params",
+    "default_max_parallel_requests",
+    "set_verbose",
+    "debug_level",
+    "default_fallbacks",
+    "fallbacks",
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+    "model_group_alias",
+    "enable_pre_call_checks",
+    "enable_tag_filtering",
+    "tag_filtering_match_any",
+    "tag_routing_prefix",
+    "plugins",
+    "retry_after",
+    "retry_policy",
+    "model_group_retry_policy",
+    "allowed_fails",
+    "allowed_fails_policy",
+    "cooldown_time",
+    "disable_cooldowns",
+    "fallback_on_unsupported_params",
+    "routing_strategy",
+    "optional_pre_call_checks",
+    "routing_strategy_args",
+    "routing_groups",
+    "provider_budget_config",
+    "alerting_config",
+    "router_general_settings",
+    "deployment_affinity_ttl_seconds",
+    "model_group_affinity_config",
+    "ignore_invalid_deployments",
+    "enable_health_check_routing",
+    "health_check_staleness_threshold",
+    "health_check_ignore_transient_errors",
+    "background_health_check_model_groups",
+    "enable_weighted_failover",
+    "enable_mid_stream_fallback_continuation",
+    "fallback_access_check",
+    "fallback_budget_check",
+    "auto_router_capability_limit",
+    "session_affinity_repin_on_failover",
+)
+
+
 def router_init_args() -> tuple[str, ...]:
     """The arguments ``Router.__init__`` accepts (was ``Router.get_valid_args``). Needs no router instance."""
-    from litellm.router_python_core import PythonCore
-
-    return tuple(PythonCore.get_valid_args())
+    return ROUTER_INIT_ARGS
 
 
 def mark_advisor_orchestration_failure(exception: BaseException) -> None:

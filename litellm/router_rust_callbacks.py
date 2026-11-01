@@ -124,6 +124,8 @@ class OptionalChecks:
         )
         self._request_scoped_selectors: tuple[CustomLogger, ...] = ()
         self._request_scoped_policies: tuple[CustomLogger, ...] = ()
+        # ``_slack_alerting_loggers``: the Slack alerting logger ``alerting_config`` builds, if any.
+        self.slack_alerting_loggers: tuple[CustomLogger, ...] = ()
 
     # -- construction ---------------------------------------------------------------------------
 
@@ -379,7 +381,7 @@ class OptionalChecks:
             for tagged in chain.from_iterable(self._hosted._core_adaptive_routers.values())  # pyright: ignore[reportPrivateUsage]  # the host registry's live registry
         )
         self._request_scoped_selectors = (*selectors, *adaptive)
-        self._request_scoped_policies = self.loggers()
+        self._request_scoped_policies = (*self.loggers(), *self.slack_alerting_loggers)
         self.release(dropped)
 
     def own_adaptive_hooks(self) -> tuple[CustomLogger, ...]:
@@ -408,7 +410,10 @@ class OptionalChecks:
         with routers_holding_global_callbacks_lock:
             routers_holding_global_callbacks.discard(self._owner)
         adaptive: Final = self.own_adaptive_hooks()
-        vacated: Final = self._host.callbacks.drop_callbacks((*dropped, *(self.optional_callbacks or ()), *adaptive))
+        slack: Final = self.slack_alerting_loggers
+        vacated: Final = self._host.callbacks.drop_callbacks(
+            (*dropped, *(self.optional_callbacks or ()), *slack, *adaptive), method_owners=(self._owner, *slack)
+        )
         with routers_holding_global_callbacks_lock:
             survivors: Final = tuple(routers_holding_global_callbacks)
         candidates: Final = chain.from_iterable(router._global_callback_candidates() for router in survivors)  # pyright: ignore[reportPrivateUsage]  # the holder protocol
@@ -483,7 +488,7 @@ class RustOptionalChecks:
     # The members another router's retire reads (`global_callback_holders`).
 
     def _global_callback_candidates(self) -> tuple[CustomLogger, ...]:
-        return (*self._sel.callback_selectors(), *self._opt.loggers())
+        return (*self._sel.callback_selectors(), *self._opt.loggers(), *self._opt.slack_alerting_loggers)
 
     @property
     def _core_adaptive_routers(self) -> Mapping[str, object]:
