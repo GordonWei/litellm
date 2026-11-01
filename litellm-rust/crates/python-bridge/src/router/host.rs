@@ -62,6 +62,8 @@ pub(crate) enum Stage {
     TextOnly,
     /// The routing plugins: run them when `run`, then return the candidate models they left.
     RoutingPlugins { run: bool },
+    /// The host's `CustomLogger` deployment filters: return the ids that remain, or a failure.
+    CallbackFilters,
 }
 
 /// The `op` of a `cache` step: one per [`RouterCache`] method.
@@ -207,6 +209,8 @@ pub(crate) enum Answer {
     PreCall(PreCallFacts),
     /// The candidate models a `routing_plugins` select step reported.
     Models(Option<Vec<String>>),
+    /// The ids a `callback_filters` select step left, or the error a filter raised.
+    Filtered(Result<Vec<String>, AttemptError>),
     Cache(CacheOutcome),
 }
 
@@ -216,7 +220,9 @@ impl Answer {
             Self::Attempt(_) | Self::Blocked(..) => StepKind::Attempt,
             Self::Slept => StepKind::Sleep,
             Self::AllowFallback(_) => StepKind::AllowFallback,
-            Self::Select(_) | Self::PreCall(_) | Self::Models(_) => StepKind::Select,
+            Self::Select(_) | Self::PreCall(_) | Self::Models(_) | Self::Filtered(_) => {
+                StepKind::Select
+            }
             Self::PreRoute(_) => StepKind::PreRoute,
             Self::Cache(_) => StepKind::Cache,
         }
@@ -229,7 +235,8 @@ impl Answer {
                 got: self.kind(),
             });
         }
-        if let (Self::Select(ids), Ask::Select { candidates, .. }) = (self, ask)
+        if let (Self::Select(ids) | Self::Filtered(Ok(ids)), Ask::Select { candidates, .. }) =
+            (self, ask)
             && let Some(id) = ids.iter().find(|id| !candidates.contains(id))
         {
             return Err(DriveError::UnknownCandidate { id: id.clone() });
@@ -629,6 +636,31 @@ impl Host for StepHost {
             unreachable!("{CHECKED}");
         };
         Ok(facts)
+    }
+
+    async fn callback_filters(
+        &self,
+        ctx: &RoutingContext<'_>,
+        candidates: Vec<Arc<Deployment>>,
+    ) -> Result<Vec<Arc<Deployment>>, Error> {
+        let (scope, group) = ctx.scope.wire();
+        let question = Ask::Select {
+            stage: Stage::CallbackFilters,
+            pool: Vec::new(),
+            model_group: ctx.model_group.to_owned(),
+            name: ctx.name.to_owned(),
+            scope,
+            group: group.map(str::to_owned),
+            candidates: candidates.iter().map(|d| d.id.clone()).collect(),
+        };
+        let Answer::Filtered(result) = ask(question).await else {
+            unreachable!("{CHECKED}");
+        };
+        let ids = result.map_err(Error::Attempt)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| candidates.iter().find(|d| d.id == *id).cloned())
+            .collect())
     }
 
     async fn allow_fallback(&self, _request: &RouterRequest, target: &str) -> bool {

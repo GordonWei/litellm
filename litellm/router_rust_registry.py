@@ -100,7 +100,9 @@ if TYPE_CHECKING:
     from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
     from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
     from litellm.router_python_host import PythonHost
+    from litellm.router_rust_callbacks import OptionalChecks
     from litellm.router_rust_prerouting import PreRoutingStrategies
+    from litellm.router_strategy.budget_limiter import RouterBudgetLimiting
 
 # The PTU share teams and the team ceilings read so far.
 _PTUMemo: TypeAlias = tuple[
@@ -473,6 +475,9 @@ class HostRegistry(HostModelInfo):
         self._core_adaptive_routers: dict[str, list[TaggedPreRoutingStrategy[object]]] = {}  # mutable-ok: same
         self._core_quality_routers: dict[str, list[TaggedPreRoutingStrategy[object]]] = {}  # mutable-ok: same
         self.strategies: PreRoutingStrategies | None = None
+        # The router's optional pre-call checks (deployment budgets, prompt caching pins);
+        # RustCore installs its ``OptionalChecks`` (litellm/router_rust_callbacks.py).
+        self.checks: OptionalChecks | None = None
         # The routing cache usage reads come from; RustCore sets it to the one its Rust core writes.
         self._core_cache: DualCache = DualCache()
         self._discovered_model_info_cache: InMemoryCache = InMemoryCache(
@@ -922,6 +927,8 @@ class HostRegistry(HostModelInfo):
         register_deployment_pricing(self._host, served)
         self._add_model_to_list_and_index_map(model=entry, model_id=served.model_info.id)
         self._core_model_names.add(served.model_name)
+        if self.checks is not None:
+            self.checks.sync_deployment_budget(served)
         self._on_change()
         return served
 
@@ -997,12 +1004,25 @@ class HostRegistry(HostModelInfo):
                 self._invalidate_model_group_info_cache()
                 self._invalidate_access_groups_cache()
                 self._update_deployment_indices_after_removal(model_id=id, removal_idx=deployment_idx)
+            if self.checks is not None:
+                self.checks.unregister_deployment_budget(id)
             if self.strategies is not None:
                 self.strategies.release_entry(item)
         except Exception:  # noqa: BLE001  # the core answers None for any failed delete
             return None
         self._on_change()
         return item
+
+    def _core_get_router_deployment_budget_limiter(self) -> "RouterBudgetLimiting | None":
+        """The router's deployment-budget callback (``registry().plugins("budget_limiter")``)."""
+        return self.checks.budget_limiter() if self.checks is not None else None
+
+    @property
+    def _core_prompt_caching_pin_cache(self) -> DualCache:
+        """The prompt caching pins (``registry().plugins("prompt_caching_pins")``)."""
+        if self.checks is None:
+            return self.__getattr__("_core_prompt_caching_pin_cache")  # pyright: ignore[reportReturnType]  # raises RustCoreUnsupported
+        return self.checks.prompt_caching_pin_cache
 
     def replay_model_cost_registrations(self) -> None:
         """Re-register every served deployment's cost-map entries (``replay_model_cost_registrations``)."""

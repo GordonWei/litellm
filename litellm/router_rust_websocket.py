@@ -57,11 +57,10 @@ async def admit_deployment_turn(
     from litellm.utils import get_utc_datetime
 
     deployment: Final = _deployment_as_configured_now(core, opened_on)
-    host: Final = core._host  # pyright: ignore[reportPrivateUsage]  # the core's host
     rate_limit_check: Final = next(
         (
             callback
-            for callback in host.callback_list("callbacks")  # pyright: ignore[reportArgumentType]  # litellm.callbacks
+            for callback in core._checks.routing_callbacks()  # pyright: ignore[reportPrivateUsage]  # `_routing_callbacks`
             if isinstance(callback, ModelRateLimitingCheck)
         ),
         None,
@@ -88,7 +87,7 @@ async def admit_deployment_turn(
                 category=litellm_exceptions.RateLimitErrorCategory.LITELLM_RATE_LIMIT,
             ) from e
     await _admit_turn_through_routing_strategy(core, model_group, deployment, request_kwargs)
-    await routing_pre_call_checks(host, dict(without_io_token_limits(deployment)))
+    await routing_pre_call_checks(core._checks.routing_callbacks(), dict(without_io_token_limits(deployment)))  # pyright: ignore[reportPrivateUsage]  # `_routing_callbacks`
     return io_token_admission
 
 

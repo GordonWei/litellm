@@ -30,6 +30,7 @@ const STATIC_KEYS: &[&str] = &[
     "drop_params",
     "enable_pre_call_checks",
     "routing_plugins",
+    "callback_filters",
     "enable_health_check_routing",
     "provider_default_deployment_ids",
 ];

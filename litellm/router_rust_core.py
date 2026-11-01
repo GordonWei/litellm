@@ -61,6 +61,7 @@ from litellm.router_api import (
 from litellm.router_attempt import for_requested_model, request_from_call
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_rust_callbacks import OptionalChecks, RustOptionalChecks
 from litellm.router_rust_endpoints import (
     AttemptCall,
     Plan,
@@ -233,6 +234,13 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "plugins",
         "retry_policy",
         "model_group_retry_policy",
+        # Built host-side as CustomLogger checks (litellm/router_rust_callbacks.py); router-core runs
+        # their deployment filters through its callback_filters stage.
+        "optional_pre_call_checks",
+        "provider_budget_config",
+        "deployment_affinity_ttl_seconds",
+        "session_affinity_repin_on_failover",
+        "model_group_affinity_config",
     }
 )
 # Arguments that may be passed at their default without asking for anything.
@@ -561,6 +569,8 @@ class Resolved:
             "routing_groups": group_documents(self.routing_groups) if self.routing_groups else None,
             "enable_pre_call_checks": True if self.enable_pre_call_checks else None,
             "routing_plugins": True if self.routing_plugins else None,
+            # `async_callback_filter_deployments` runs on every async candidate list.
+            "callback_filters": True,
             "retry_policy": _plain(self.retry_policy),
             "model_group_retry_policy": _plain(self.model_group_retry_policy) or None,
         }
@@ -788,7 +798,9 @@ _EndpointImpl: TypeAlias = Callable[..., Awaitable[object]]
 _StrategyInputs: TypeAlias = tuple[str, object, str, list[dict[str, object]]]
 
 
-class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks, RustHealthCallbacks):
+class RustCore(
+    _SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks, RustHealthCallbacks, RustOptionalChecks
+):
     """A ``RouterCore`` served by the Rust router core over a ``PythonHost``. It holds no Python core."""
 
     def __init__(self, config: RouterConfig, host: PythonHost, resolved: Resolved) -> None:
@@ -835,6 +847,11 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         self._hosted.build(_as_list(config.get("model_list")) if config.get("model_list") is not None else None)
         self._hosted.set_routing_groups(resolved.routing_groups)
         self._handle: RouterCoreHandle = self._new_handle(list(self._hosted._core_model_list))  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
+        self._join_callback_holders()
+        self._checks: Final = OptionalChecks(self, host, self._cache, self._hosted, ctx, config.arguments)
+        self._hosted.checks = self._checks
+        strategies.ensure_affinity = self._checks.ensure_deployment_affinity_callback
+        self._checks.build(config.get("optional_pre_call_checks"), config.get("model_list"))
         if resolved.enable_mid_stream_fallback_continuation:
             register_continuation_prefill_check(host)
         if resolved.routing_strategy == "lar1":
@@ -1039,7 +1056,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         """The routing observers. This core registers no outcome callbacks and builds no alerting
         (``alerting_config`` is declined), so there is no Slack alerting logger."""
         if request_scoped:
-            raise RustCoreUnsupported("observe(request_scoped=True) is not served by the Rust router core yet")
+            self._serve_through_request_logging()
         if logging_obj is not None:
             raise RustCoreUnsupported("observe(logging_obj) is not served by the Rust router core yet")
         return RoutingObservers(slack_alerting_logger=None)
@@ -1059,7 +1076,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
 
     def retire(self) -> None:
         self._retired = True
-        self._selectors.retire()
+        self._retire_callbacks()
         if self._hosted.strategies is not None:
             self._hosted.strategies.retire()
         self._handle.retire()
@@ -1075,6 +1092,8 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         if unknown:
             raise ValueError(f"not assignable router settings: {unknown}")
         update: Final = read_settings_update(changes.settings)
+        if update.optional_pre_call_checks is not MISSING:
+            self._checks.set(update.optional_pre_call_checks)
         if update.continuation is not MISSING:
             self._set_continuation(continuation_flag(update.continuation))
         self._apply_settings(changes.assign, update)
@@ -1085,6 +1104,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         if changes.redis_cache is not None:
             # `_core_update_redis_cache`: the routing state's cache gains the Redis cache.
             self._cache.attach_redis_cache(changes.redis_cache)
+            self._checks.prompt_caching_pin_cache.attach_redis_cache(changes.redis_cache)
         return ApplyResult(
             version=self._hosted._registry_version,  # pyright: ignore[reportPrivateUsage]  # see __init__
             upserted=upserted,
@@ -1208,6 +1228,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         """Drop the host's response cache and the routing state."""
         self._host.set_global_cache(None)
         self._cache.flush_cache()
+        self._checks.prompt_caching_pin_cache.in_memory_cache.flush_cache()
 
     def reset(self) -> None:
         """Empty the host's success and failure callback lists (every entry, not only this core's),
@@ -1846,6 +1867,9 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
             return self._pre_call_facts(step, request, messages, input).answer()
         if step.get("stage") == "routing_plugins":
             return candidate_models(request)
+        if step.get("stage") == "callback_filters":
+            # Only the async candidate lists run the callback filters.
+            return step["candidates"]
         if step.get("stage") == "text_only":
             return self._text_only(step)
         inputs: Final = self._strategy_inputs(step, request)
@@ -2111,6 +2135,8 @@ class _Selection:
         if kind == "pick" or (kind == "sync_pick" and core._custom_strategy is not None):  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
             fields["pre_routes"] = True
         self._specific_deployment: Final = specific_deployment
+        # The error a callback filter raised, which a failed selection raises.
+        self._filter_error: BaseException | None = None
         if kind == "pass_through":
             fields["pass_through"] = "listed"
         elif kind == "async_pass_through":
@@ -2128,7 +2154,7 @@ class _Selection:
         return for_requested_model(as_str_mapping(step.get("deployment")) or {}, self._model)
 
     def _failed(self, step: Mapping[str, object]) -> BaseException:
-        error: Final = self._core._failure_error(step, self._model, None, pass_through=self._kind)  # pyright: ignore[reportPrivateUsage]  # see above
+        error: Final = self._core._failure_error(step, self._model, self._filter_error, pass_through=self._kind)  # pyright: ignore[reportPrivateUsage]  # see above
         logging_obj: Final = self._request.get("litellm_logging_obj")
         dispatch: Final[object] = getattr(logging_obj, "dispatch_failure_handlers", None)
         if callable(dispatch) and self._kind not in ("pass_through", "sync_pick"):
@@ -2152,6 +2178,10 @@ class _Selection:
             match step["kind"]:
                 case "cache":
                     outcome = await core._answer_cache(step)  # pyright: ignore[reportPrivateUsage]  # see above
+                case "select" if step.get("stage") == "callback_filters":
+                    outcome, self._filter_error = await core._answer_callback_filters(  # pyright: ignore[reportPrivateUsage]  # see above
+                        step, self._request, self._messages
+                    )
                 case "select":
                     outcome = await core._answer_select(step, self._request, self._messages, self._input)  # pyright: ignore[reportPrivateUsage]  # see above
                 case "pre_route":
@@ -2243,6 +2273,8 @@ class _Driver:
         self._attempts: int = 0
         self._walk: Final = WalkMetadata(request, plan.metadata_field, self._params_base_model)
         self.outcomes: Final = FallbackOutcomes(request)
+        # The fallback level the walk is at, from its fallback events.
+        self._level: int = 0
 
     @property
     def attempted(self) -> int:
@@ -2330,6 +2362,8 @@ class _Driver:
                 continue
             if event.get("kind") == "fallback":
                 self._walk.hop(event)
+                hop_level = event.get("level")
+                self._level = hop_level if isinstance(hop_level, int) else self._level
                 continue
             if event.get("kind") == "blocked":
                 level = event.get("level")
@@ -2340,6 +2374,7 @@ class _Driver:
             if event.get("kind") == "fallback_done":
                 level = event.get("level")
                 at = level if isinstance(level, int) else 0
+                self._level = at
                 if event.get("succeeded") is not True:
                     self._hint_nested_failure(self._level_errors.get(at + 1), str(event.get("to")))
                 self.outcomes.done(
@@ -2470,7 +2505,10 @@ class _Driver:
                 # `amoderation` run no routing pre-call checks either.
                 if self._plan.kind not in _NO_ROUTING_PRE_CALL_CHECKS:
                     try:
-                        await routing_pre_call_checks(host, as_str_mapping(step.get("deployment")) or {})
+                        await routing_pre_call_checks(
+                            self._core._checks.routing_callbacks(),  # pyright: ignore[reportPrivateUsage]  # see above
+                            as_str_mapping(step.get("deployment")) or {},
+                        )
                     except Exception as refused:  # noqa: BLE001  # handed to the Rust call loop as the attempt's failure
                         return await self._refused(step, deployment, call, refused)
                 pending: Final[object] = (
@@ -2512,6 +2550,13 @@ class _Driver:
 
     async def select(self, step: Mapping[str, object]) -> object:
         request: Final = self._request
+        if step.get("stage") == "callback_filters":
+            answer, error = await self._core._answer_callback_filters(step, request, request.get("messages"))  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+            if error is not None:
+                # The try failed with the filter's error: the level raises it if nothing else serves.
+                self._last_error = error
+                self._level_errors[self._level] = error
+            return answer
         return await self._core._answer_select(step, request, request.get("messages"), request.get("input"))  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
 
     def select_sync(self, step: Mapping[str, object]) -> object:

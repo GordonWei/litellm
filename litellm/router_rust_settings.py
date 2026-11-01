@@ -96,6 +96,7 @@ class SettingsUpdate:
     plain: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))  # plain attributes, as stored
     continuation: object = MISSING  # the continuation flag, when given
     routing_groups: object = MISSING  # the routing groups input, when given
+    optional_pre_call_checks: object = MISSING  # the optional pre-call checks, when given
 
 
 def read_settings_update(settings: Mapping[str, object]) -> SettingsUpdate:
@@ -108,6 +109,7 @@ def read_settings_update(settings: Mapping[str, object]) -> SettingsUpdate:
     plain: Final[dict[str, object]] = {}  # mutable-ok: same
     continuation: object = MISSING  # rebind-ok: set when the flag is given
     routing_groups: object = MISSING  # rebind-ok: set when routing groups are given
+    optional_checks: object = MISSING  # rebind-ok: set when the optional pre-call checks are given
     for name, value in settings.items():
         if name not in RUNTIME_UPDATABLE_ROUTER_SETTINGS:
             verbose_router_logger.debug("Setting %s is not allowed", name)
@@ -116,7 +118,7 @@ def read_settings_update(settings: Mapping[str, object]) -> SettingsUpdate:
         elif name == "routing_groups":
             routing_groups = value
         elif name == "optional_pre_call_checks":
-            raise RustCoreUnsupported("update_settings(optional_pre_call_checks) is not served by the Rust router core")
+            optional_checks = value
         elif name == CONTINUATION_SETTING:
             continuation = value
         elif name == "retry_policy":
@@ -135,6 +137,7 @@ def read_settings_update(settings: Mapping[str, object]) -> SettingsUpdate:
         plain=MappingProxyType(plain),
         continuation=continuation,
         routing_groups=routing_groups,
+        optional_pre_call_checks=optional_checks,
     )
 
 

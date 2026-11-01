@@ -305,6 +305,23 @@ impl Core {
         {
             healthy.retain(|d| !excluded.iter().any(|id| id.as_str() == Some(d.id.as_str())));
         }
+        // `async_callback_filter_deployments` runs after the cooldown and blocked filters on every
+        // async candidate list but a deployment named by id and a listed pass-through pick.
+        if settings.callback_filters
+            && !inputs.count_only
+            && resolution.kind != ResolveKind::Id
+            && request.pass_through != Some(PassThrough::Listed)
+        {
+            let ctx = self.context(
+                snapshot,
+                op,
+                request,
+                &resolution.group,
+                name,
+                StrategyScope::Default,
+            );
+            healthy = self.host.callback_filters(&ctx, healthy).await?;
+        }
         if inputs.count_only {
             return Ok(Candidates {
                 name: name.to_owned(),

@@ -167,6 +167,8 @@ class PreRoutingStrategies:
         self._capability_limit: object = capability_limit
         self._cache: Final = cache
         self._affinity: object = None
+        # The router's own `_ensure_deployment_affinity_callback` (its optional checks), when set.
+        self.ensure_affinity: Callable[[], None] | None = None
 
     # -- the registries ------------------------------------------------------------------------
 
@@ -400,6 +402,9 @@ class PreRoutingStrategies:
         complexity router's session pin needs, registered once."""
         from litellm.router_utils.pre_call_checks.deployment_affinity_check import DeploymentAffinityCheck
 
+        if self.ensure_affinity is not None:
+            self.ensure_affinity()
+            return
         if self._affinity is not None:
             return
         hosted: Final = self._hosted

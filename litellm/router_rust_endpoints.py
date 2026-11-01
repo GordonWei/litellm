@@ -2035,7 +2035,7 @@ class RustEndpoints:
             names: Final = {as_dict(r).get("model_name") for r in self._core._handle.deployments()}  # pyright: ignore[reportPrivateUsage]  # see above
             if model not in names and self._core._handle.deployment(model) is not None:  # pyright: ignore[reportPrivateUsage]  # see above
                 return
-        for callback in self._core._host.callback_list("callbacks"):  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # see above
+        for callback in tuple(self._core._checks.routing_callbacks()):  # pyright: ignore[reportPrivateUsage]  # `_routing_callbacks`
             if isinstance(callback, CustomLogger):
                 callback.pre_call_check(dict(deployment))  # pyright: ignore[reportUnknownMemberType]  # litellm's untyped helpers and request values
 

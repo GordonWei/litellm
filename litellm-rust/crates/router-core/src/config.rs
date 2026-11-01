@@ -201,6 +201,9 @@ pub struct RouterConfig {
     pub enable_pre_call_checks: bool,
     /// `Router(plugins=[...])` is set: the host runs the routing-plugin pipeline.
     pub routing_plugins: bool,
+    /// The host's `CustomLogger` deployment filters run on every async candidate list
+    /// (`async_callback_filter_deployments`).
+    pub callback_filters: bool,
     pub enable_health_check_routing: bool,
     /// Deployment ids that are a provider's default and never cool down
     /// (`provider_default_deployment_ids`).

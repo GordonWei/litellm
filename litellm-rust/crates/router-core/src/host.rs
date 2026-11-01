@@ -326,4 +326,15 @@ pub trait Host: Send + Sync {
     ) -> Result<PreCallFacts, Error> {
         Ok(PreCallFacts::default())
     }
+
+    /// `async_callback_filter_deployments`: the host's routing callbacks narrow `candidates` in
+    /// turn. A filter that raises fails the try with [`Error::Attempt`], which the call retries and
+    /// falls back from like any attempt failure. A host without filters keeps every candidate.
+    async fn callback_filters(
+        &self,
+        _ctx: &RoutingContext<'_>,
+        candidates: Vec<Arc<Deployment>>,
+    ) -> Result<Vec<Arc<Deployment>>, Error> {
+        Ok(candidates)
+    }
 }
