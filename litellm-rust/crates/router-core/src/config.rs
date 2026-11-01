@@ -306,6 +306,8 @@ pub struct RouterConfig {
     pub request_timeout: Option<f64>,
     pub drop_params: Option<bool>,
     pub enable_pre_call_checks: bool,
+    /// `Router(plugins=[...])` is set: the host runs the routing-plugin pipeline.
+    pub routing_plugins: bool,
     pub enable_health_check_routing: bool,
     /// Deployment ids that are a provider's default and never cool down
     /// (`provider_default_deployment_ids`).

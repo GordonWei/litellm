@@ -57,6 +57,14 @@ enum ErrorKind {
     OnlyMarkers,
     #[strum(serialize = "ptu_reserved")]
     PtuReserved,
+    #[strum(serialize = "context_window_exceeded")]
+    ContextWindowExceeded,
+    #[strum(serialize = "unsupported_params")]
+    UnsupportedParams,
+    #[strum(serialize = "routing_plugins_left_nothing")]
+    RoutingPluginsLeftNothing,
+    #[strum(serialize = "routing_plugins_need_async")]
+    RoutingPluginsNeedAsync,
 }
 
 impl From<&Error> for ErrorKind {
@@ -73,6 +81,10 @@ impl From<&Error> for ErrorKind {
             Error::NoPassThroughDeployments { .. } => Self::NoPassThroughDeployments,
             Error::OnlyMarkers { .. } => Self::OnlyMarkers,
             Error::PtuReserved { .. } => Self::PtuReserved,
+            Error::ContextWindowExceeded { .. } => Self::ContextWindowExceeded,
+            Error::UnsupportedParams { .. } => Self::UnsupportedParams,
+            Error::RoutingPluginsLeftNothing { .. } => Self::RoutingPluginsLeftNothing,
+            Error::RoutingPluginsNeedAsync => Self::RoutingPluginsNeedAsync,
         }
     }
 }
@@ -386,6 +398,27 @@ fn answer(ask: &Ask, outcome: Option<Bound<'_, PyAny>>) -> PyResult<Answer> {
         Ask::AllowFallback { .. } => Ok(Answer::AllowFallback(
             outcome.ok_or_else(missing)?.extract()?,
         )),
+        Ask::Select {
+            stage: Stage::PreCall,
+            ..
+        } => {
+            let facts = from_py_argument(&outcome.ok_or_else(missing)?)?;
+            serde_json::from_value(facts)
+                .map(Answer::PreCall)
+                .map_err(|error| PyValueError::new_err(format!("bad pre-call facts: {error}")))
+        }
+        Ask::Select {
+            stage: Stage::RoutingPlugins { .. },
+            ..
+        } => {
+            // `{"models": [...] | None}`: a bare None would read as no outcome.
+            let outcome = outcome.ok_or_else(missing)?;
+            let models = outcome.cast::<PyDict>()?.get_item("models")?;
+            Ok(Answer::Models(match models {
+                Some(models) if !models.is_none() => Some(models.extract()?),
+                _ => None,
+            }))
+        }
         Ask::Select { .. } => Ok(Answer::Select(outcome.ok_or_else(missing)?.extract()?)),
         Ask::PreRoute { .. } => pre_route_outcome(outcome).map(Answer::PreRoute),
         Ask::Attempt { .. } => {
@@ -481,6 +514,7 @@ fn attempt_outcome(outcome: &Bound<'_, PyDict>) -> PyResult<Result<u64, AttemptE
     failure.retry_after = retry_after;
     failure.num_retries = item(outcome, "num_retries")?;
     failure.detail = item::<String>(outcome, "detail")?.map(Into::into);
+    failure.unrecorded = item(outcome, "unrecorded")?.unwrap_or(false);
     Ok(Err(failure))
 }
 
@@ -531,8 +565,22 @@ fn step_dict(py: Python<'_>, step: Step) -> PyResult<Bound<'_, PyDict>> {
             let attempt = error.attempt();
             dict.set_item("error", Report::new(&error).to_string())?;
             dict.set_item("error_kind", <&'static str>::from(ErrorKind::from(&error)))?;
-            if let Error::OnlyMarkers { model } | Error::PtuReserved { model } = &error {
-                dict.set_item("error_model", model)?;
+            match &error {
+                Error::OnlyMarkers { model } | Error::PtuReserved { model } => {
+                    dict.set_item("error_model", model)?;
+                }
+                Error::ContextWindowExceeded { model, detail } => {
+                    dict.set_item("error_model", model)?;
+                    dict.set_item("error_detail", detail)?;
+                }
+                Error::UnsupportedParams { model, params } => {
+                    dict.set_item("error_model", model)?;
+                    dict.set_item("error_params", PyList::new(dict.py(), params)?)?;
+                }
+                Error::RoutingPluginsLeftNothing { models } => {
+                    dict.set_item("error_params", PyList::new(dict.py(), models)?)?;
+                }
+                _ => {}
             }
             dict.set_item("attempt_failed", attempt.is_some())?;
             dict.set_item("status", attempt.and_then(|failure| failure.status))?;
@@ -585,6 +633,12 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
                 Stage::Plugins => ("plugins", None),
                 Stage::Strategy(strategy) => ("strategy", Some(strategy)),
                 Stage::Tags => ("tags", None),
+                Stage::PreCall => ("pre_call", None),
+                Stage::TextOnly => ("text_only", None),
+                Stage::RoutingPlugins { run } => {
+                    dict.set_item("run", run)?;
+                    ("routing_plugins", None)
+                }
             };
             dict.set_item("pool", PyList::new(py, pool)?)?;
             dict.set_item("stage", stage)?;

@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use litellm_router_core::{
     Attempt, AttemptError, Deployment, Error, Host, Output, Payload, PreRoute, PreRouted,
     RouterCache, RouterEvent, RouterRequest, RouterResponse, RoutingContext, SelectStage,
+    precall::PreCallFacts,
 };
 use serde_json::Value;
 
@@ -55,6 +56,12 @@ pub(crate) enum Stage {
     Strategy(String),
     /// Tag routing: return the deployments that remain.
     Tags,
+    /// `enable_pre_call_checks`: return the facts the filter decides by.
+    PreCall,
+    /// `_deployment_declares_no_vision`: return the candidates that declare no vision support.
+    TextOnly,
+    /// The routing plugins: run them when `run`, then return the candidate models they left.
+    RoutingPlugins { run: bool },
 }
 
 /// The `op` of a `cache` step: one per [`RouterCache`] method.
@@ -186,6 +193,10 @@ pub(crate) enum Answer {
     Select(Vec<String>),
     /// The model group to resolve instead, a custom strategy's deployment, or `None`.
     PreRoute(Option<PreRouted>),
+    /// The facts a `pre_call` select step asked for.
+    PreCall(PreCallFacts),
+    /// The candidate models a `routing_plugins` select step reported.
+    Models(Option<Vec<String>>),
     Cache(CacheOutcome),
 }
 
@@ -195,7 +206,7 @@ impl Answer {
             Self::Attempt(_) => StepKind::Attempt,
             Self::Slept => StepKind::Sleep,
             Self::AllowFallback(_) => StepKind::AllowFallback,
-            Self::Select(_) => StepKind::Select,
+            Self::Select(_) | Self::PreCall(_) | Self::Models(_) => StepKind::Select,
             Self::PreRoute(_) => StepKind::PreRoute,
             Self::Cache(_) => StepKind::Cache,
         }
@@ -490,6 +501,7 @@ impl Host for StepHost {
                 SelectStage::Plugins => Stage::Plugins,
                 SelectStage::Strategy(strategy) => Stage::Strategy(strategy.to_string()),
                 SelectStage::Tags => Stage::Tags,
+                SelectStage::TextOnly => Stage::TextOnly,
             },
             pool: ctx.pool.iter().map(|d| d.id.clone()).collect(),
             model_group: ctx.model_group.to_owned(),
@@ -517,6 +529,48 @@ impl Host for StepHost {
             unreachable!("{CHECKED}");
         };
         Ok(routed)
+    }
+
+    async fn routing_plugin_models(
+        &self,
+        ctx: &RoutingContext<'_>,
+        run: bool,
+    ) -> Result<Option<Vec<String>>, Error> {
+        let (scope, group) = ctx.scope.wire();
+        let question = Ask::Select {
+            stage: Stage::RoutingPlugins { run },
+            pool: Vec::new(),
+            model_group: ctx.model_group.to_owned(),
+            name: ctx.name.to_owned(),
+            scope,
+            group: group.map(str::to_owned),
+            candidates: Vec::new(),
+        };
+        let Answer::Models(models) = ask(question).await else {
+            unreachable!("{CHECKED}");
+        };
+        Ok(models)
+    }
+
+    async fn pre_call_facts(
+        &self,
+        ctx: &RoutingContext<'_>,
+        candidates: &[Arc<Deployment>],
+    ) -> Result<PreCallFacts, Error> {
+        let (scope, group) = ctx.scope.wire();
+        let question = Ask::Select {
+            stage: Stage::PreCall,
+            pool: ctx.pool.iter().map(|d| d.id.clone()).collect(),
+            model_group: ctx.model_group.to_owned(),
+            name: ctx.name.to_owned(),
+            scope,
+            group: group.map(str::to_owned),
+            candidates: candidates.iter().map(|d| d.id.clone()).collect(),
+        };
+        let Answer::PreCall(facts) = ask(question).await else {
+            unreachable!("{CHECKED}");
+        };
+        Ok(facts)
     }
 
     async fn allow_fallback(&self, _request: &RouterRequest, target: &str) -> bool {

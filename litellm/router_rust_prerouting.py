@@ -17,7 +17,7 @@ do. It never reaches a Python router core.
 import json
 import logging
 import re
-from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping, Sequence
 from itertools import chain
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, TypeAlias, cast  # noqa: TID251  # the strategy routers are untyped
@@ -712,6 +712,7 @@ class PreRouter:
         enable_tag_filtering: bool,
         match_any: bool,
         public_router: object,
+        run_plugins: Callable[[str], Awaitable[None]] | None = None,
     ) -> str | None:
         """The start of ``_async_get_available_deployment``: run the hook, record its pick and pin the
         tier's litellm_params. The model group to resolve, or ``None`` to resolve ``model`` itself."""
@@ -727,6 +728,7 @@ class PreRouter:
             enable_tag_filtering=enable_tag_filtering,
             match_any=match_any,
             public_router=public_router,
+            run_plugins=run_plugins,
         )
         routed: Final = response.model if response is not None else model
         if response is not None:
@@ -749,6 +751,7 @@ class PreRouter:
         enable_tag_filtering: bool,
         match_any: bool,
         public_router: object,
+        run_plugins: Callable[[str], Awaitable[None]] | None,
     ) -> "PreRoutingHookResponse | None":
         _restore_client_output_ceiling(request_kwargs)
         _record_routing_decision(request_kwargs, None)
@@ -756,6 +759,10 @@ class PreRouter:
         registered: Final = await self._resolve_session_router(
             model, requested, request_kwargs, fallback_depth, enable_tag_filtering, match_any
         )
+        # The routing plugins run on the session-resolved name, before a strategy is selected, so a
+        # strategy reads their signals; router-core narrows the pick to what they left.
+        if run_plugins is not None:
+            await run_plugins(registered)
         selected: Final = self._select_strategy(registered, request_kwargs, enable_tag_filtering, match_any)
         if selected is None:
             await arm_compaction(request_kwargs, None)

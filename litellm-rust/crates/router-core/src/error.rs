@@ -59,6 +59,19 @@ pub enum Error {
     /// Every deployment `model` resolved to is split into PTU shares the caller holds none of.
     #[error("deployment `{model}` is reserved for the teams holding a PTU share of it")]
     PtuReserved { model: String },
+    /// The pre-call checks found no deployment whose context window fits the prompt; `detail`
+    /// names each one dropped for it.
+    #[error("no deployment of `{model}` has a context window large enough for this call")]
+    ContextWindowExceeded { model: String, detail: String },
+    /// The pre-call checks found no deployment of `model` that takes the requested `params`.
+    #[error("no deployment of `{model}` supports {params:?}")]
+    UnsupportedParams { model: String, params: Vec<String> },
+    /// The routing plugins left none of the healthy deployments' models.
+    #[error("no deployments left after routing-plugin filtering: {models:?}")]
+    RoutingPluginsLeftNothing { models: Vec<String> },
+    /// A router with routing plugins was asked for a pick on the sync path, which never runs them.
+    #[error("routing plugins only run on the async selection path")]
+    RoutingPluginsNeedAsync,
 }
 
 impl Error {
@@ -75,7 +88,11 @@ impl Error {
             | Self::NotPassThrough { .. }
             | Self::NoPassThroughDeployments { .. }
             | Self::OnlyMarkers { .. }
-            | Self::PtuReserved { .. } => None,
+            | Self::PtuReserved { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::UnsupportedParams { .. }
+            | Self::RoutingPluginsLeftNothing { .. }
+            | Self::RoutingPluginsNeedAsync => None,
         }
     }
 }
@@ -157,6 +174,9 @@ pub struct AttemptError {
     /// (`exception_received`, masked past 50 characters).
     pub detail: Option<Arc<str>>,
     pub payload: Option<Payload>,
+    /// The host refused the attempt before the deployment saw it in a way Python records no
+    /// outcome for (a sync `pre_call_check`): no cooldown or failure count is written.
+    pub unrecorded: bool,
 }
 
 impl AttemptError {
@@ -168,6 +188,7 @@ impl AttemptError {
             num_retries: None,
             detail: None,
             payload: None,
+            unrecorded: false,
         }
     }
 

@@ -1,6 +1,6 @@
 //! Selection: resolve a name, filter its deployments in the order of
-//! `Router._core_async_get_healthy_deployments` (team, cooldown, blocked, plugins, order, retry
-//! skips), then pick one with the strategy. Simple-shuffle is native
+//! `Router._core_async_get_healthy_deployments` (team, cooldown, blocked, plugins, pre-call
+//! checks, tags, order, retry skips), then pick one with the strategy. Simple-shuffle is native
 //! (`router_strategy/simple_shuffle.py`); other strategies go through `Host::select`.
 
 use std::{collections::BTreeMap, sync::Arc};
@@ -181,6 +181,19 @@ impl Core {
         inputs: &SelectInputs,
     ) -> Result<Candidates, Error> {
         let registry = &snapshot.registry;
+        // The async pick's pre-routing hook runs the routing plugins before anything resolves;
+        // every pick but a listed pass-through one reads what they left on the request.
+        let plugin_models = if snapshot.settings.routing_plugins
+            && !inputs.count_only
+            && request.pass_through != Some(PassThrough::Listed)
+        {
+            let ctx = self.context(snapshot, op, request, name, name, StrategyScope::Default);
+            self.host
+                .routing_plugin_models(&ctx, request.pre_routes)
+                .await?
+        } else {
+            None
+        };
         let scope = ResolveScope {
             specific_deployment: request.specific_deployment,
         };
@@ -303,6 +316,19 @@ impl Core {
         }
 
         if listed {
+            if settings.enable_pre_call_checks && resolution.kind != ResolveKind::Id {
+                healthy = self
+                    .pre_call_checks(
+                        snapshot,
+                        op,
+                        request,
+                        &resolution.group,
+                        name,
+                        &all,
+                        healthy,
+                    )
+                    .await?;
+            }
             // Only a priority group narrows a listed pass-through pick by order.
             let priority = resolution.kind == ResolveKind::RoutingGroup
                 && registry.routing_groups().iter().any(|g| {
@@ -340,6 +366,20 @@ impl Core {
                 .await?;
         }
 
+        if settings.enable_pre_call_checks && resolution.kind != ResolveKind::Id {
+            healthy = self
+                .pre_call_checks(
+                    snapshot,
+                    op,
+                    request,
+                    &resolution.group,
+                    name,
+                    &all,
+                    healthy,
+                )
+                .await?;
+        }
+
         if request.filter_tags && !healthy.is_empty() {
             let mut ctx = self.context(
                 snapshot,
@@ -351,6 +391,35 @@ impl Core {
             );
             ctx.pool = &all;
             healthy = self.host.select(&SelectStage::Tags, &ctx, healthy).await?;
+        }
+
+        if resolution.kind != ResolveKind::Id {
+            healthy = crate::routing_plugins::narrow(healthy, plugin_models.as_deref())?;
+        }
+
+        // `_without_declared_text_only_deployments`: an image request skips the deployments that
+        // declare no vision, unless that leaves nothing.
+        if request.has_image && resolution.kind != ResolveKind::Id && !healthy.is_empty() {
+            let ctx = self.context(
+                snapshot,
+                op,
+                request,
+                &resolution.group,
+                name,
+                StrategyScope::Default,
+            );
+            let text_only = self
+                .host
+                .select(&SelectStage::TextOnly, &ctx, healthy.clone())
+                .await?;
+            let vision: Vec<Arc<Deployment>> = healthy
+                .iter()
+                .filter(|d| !text_only.iter().any(|t| t.id == d.id))
+                .cloned()
+                .collect();
+            if !vision.is_empty() {
+                healthy = vision;
+            }
         }
 
         if let Some(pinned) = request.pinned_deployment_id.as_deref()
@@ -402,6 +471,31 @@ impl Core {
             all,
             healthy,
         })
+    }
+
+    /// `_pre_call_checks` over `healthy`, with the host's facts.
+    #[allow(clippy::too_many_arguments)]
+    async fn pre_call_checks(
+        &self,
+        snapshot: &Snapshot,
+        op: &Op,
+        request: &RouterRequest,
+        model_group: &str,
+        name: &str,
+        pool: &[Arc<Deployment>],
+        healthy: Vec<Arc<Deployment>>,
+    ) -> Result<Vec<Arc<Deployment>>, Error> {
+        let mut ctx = self.context(
+            snapshot,
+            op,
+            request,
+            model_group,
+            name,
+            StrategyScope::Default,
+        );
+        ctx.pool = pool;
+        let facts = self.host.pre_call_facts(&ctx, &healthy).await?;
+        crate::precall::filter(model_group, healthy, pool, &facts)
     }
 
     /// Pick one of `candidates.healthy` with the group's strategy.

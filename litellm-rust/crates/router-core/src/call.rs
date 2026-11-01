@@ -221,7 +221,13 @@ impl Core {
         let kind = match error {
             Error::Attempt(failure) => failure.kind,
             Error::NoHealthyDeployments { .. } => FailureKind::RateLimit,
-            Error::Config(_)
+            // A plain `ValueError` in Python: the generic fallbacks apply.
+            Error::RoutingPluginsLeftNothing { .. } => FailureKind::Other,
+            Error::ContextWindowExceeded { .. } => FailureKind::ContextWindowExceeded,
+            // `is_bad_request_without_fallback`: never a fallback without `fallback_on_unsupported_params`.
+            Error::UnsupportedParams { .. }
+            | Error::RoutingPluginsNeedAsync
+            | Error::Config(_)
             | Error::UnknownModel { .. }
             | Error::Cache(_)
             | Error::Retired
@@ -465,6 +471,11 @@ impl Core {
         retry: u32,
         at: Hop,
     ) -> Result<RouterResponse, Failed> {
+        crate::routing_plugins::refuse_sync_pick(
+            snapshot.settings.routing_plugins,
+            &snapshot.settings.routing_strategy,
+            request,
+        )?;
         let routed = self
             .pre_routed(PreRoute {
                 op,
@@ -547,8 +558,10 @@ impl Core {
                 })
             }
             Err(failure) => {
-                self.record_failure(snapshot, &candidates, &deployment, &failure)
-                    .await;
+                if !failure.unrecorded {
+                    self.record_failure(snapshot, &candidates, &deployment, &failure)
+                        .await;
+                }
                 Err(Failed {
                     error: Error::Attempt(failure),
                     deployment_id: Some(deployment.id.clone()),

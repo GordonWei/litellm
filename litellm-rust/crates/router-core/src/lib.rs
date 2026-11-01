@@ -70,6 +70,7 @@
 //! - [`cache`] / [`health`]: the shared routing cache, cooldowns and usage.
 //! - [`select`]: resolve, filter chain, simple-shuffle.
 //! - [`call`]: retries and fallbacks.
+//! - [`precall`]: the `enable_pre_call_checks` filter.
 //! - [`host`]: the `Host` boundary.
 
 pub mod cache;
@@ -78,10 +79,12 @@ pub mod config;
 pub mod error;
 pub mod health;
 pub mod host;
+pub mod precall;
 pub mod prerouting;
 pub mod ptu;
 pub mod registry;
 pub mod routing_groups;
+pub mod routing_plugins;
 pub mod select;
 pub mod settings;
 pub mod strategy;
@@ -256,6 +259,11 @@ impl Router {
     pub async fn select(&self, op: &Op, request: &RouterRequest) -> Result<Arc<Deployment>, Error> {
         self.live()?;
         let snapshot = self.core.snapshot.load_full();
+        routing_plugins::refuse_sync_pick(
+            snapshot.settings.routing_plugins,
+            &snapshot.settings.routing_strategy,
+            request,
+        )?;
         let routed = self
             .core
             .pre_routed(PreRoute {

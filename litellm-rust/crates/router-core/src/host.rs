@@ -13,6 +13,7 @@ use crate::{
     config::{Op, RoutingStrategy},
     error::{AttemptError, Error, FailureKind, Payload},
     health::Health,
+    precall::PreCallFacts,
     prerouting::{PreRoute, PreRouted},
     registry::{Deployment, Registry},
     settings::Settings,
@@ -50,6 +51,9 @@ pub struct RouterRequest {
     pub excluded_ids: Vec<String>,
     /// `_retry_skipped_deployment_ids`: skipped unless that leaves nothing.
     pub retry_skipped_ids: Vec<String>,
+    /// The request carries an image (`_request_carries_image`), so deployments that declare no
+    /// vision are skipped while any other remains.
+    pub has_image: bool,
     /// An async pick: the host's pre-routing step runs before each pick resolves its name.
     pub pre_routes: bool,
     /// What the host needs to run the call itself, such as the Python kwargs.
@@ -112,6 +116,8 @@ pub enum SelectStage {
     Strategy(RoutingStrategy),
     /// Tag routing (`get_deployments_for_tag`), not yet ported: return the deployments that remain.
     Tags,
+    /// `_deployment_declares_no_vision`: return the candidates that declare no vision support.
+    TextOnly,
 }
 
 /// Routing events, delivered through [`Host::observe`].
@@ -198,5 +204,26 @@ pub trait Host: Send + Sync {
     /// Whether [`Self::select`] can run strategies and plugins.
     fn can_select(&self) -> bool {
         true
+    }
+
+    /// The facts the `enable_pre_call_checks` filter decides by (token count, context windows,
+    /// param support), for `candidates` and the deployments in `ctx.pool`. A host without them
+    /// reports no input, so nothing is checked.
+    /// Run the routing plugins for `ctx.name` when `run` (the async pick's pre-routing hook), and
+    /// report the candidate models they left on the request, if any.
+    async fn routing_plugin_models(
+        &self,
+        _ctx: &RoutingContext<'_>,
+        _run: bool,
+    ) -> Result<Option<Vec<String>>, Error> {
+        Ok(None)
+    }
+
+    async fn pre_call_facts(
+        &self,
+        _ctx: &RoutingContext<'_>,
+        _candidates: &[Arc<Deployment>],
+    ) -> Result<PreCallFacts, Error> {
+        Ok(PreCallFacts::default())
     }
 }

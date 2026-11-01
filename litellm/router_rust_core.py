@@ -22,6 +22,7 @@ import inspect
 import json
 import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
@@ -69,6 +70,8 @@ from litellm.router_rust_endpoints import (
     stamp_error,
 )
 from litellm.router_rust_members import RustRegistryMembers
+from litellm.router_rust_plugins import SYNC_PATH_MESSAGE, candidate_models, run_plugins
+from litellm.router_rust_precall import PreCallFacts, declares_no_vision, request_carries_image
 from litellm.router_rust_prerouting import PreRouter, PreRoutingStrategies
 from litellm.router_rust_registry import HostRegistry, RustRegistry, hosted_registry_view
 from litellm.router_rust_selection import (
@@ -120,7 +123,7 @@ if TYPE_CHECKING:
         RouterCall,
         RouterCoreHandle,
     )
-    from litellm.types.router import CustomRoutingStrategyBase
+    from litellm.types.router import CustomRoutingStrategyBase, RoutingPlugin
 
 # Async endpoints the Rust core routes: select a deployment, then run the attempt on the host.
 RUST_SERVED_OPS: Final[frozenset[str]] = frozenset(
@@ -206,6 +209,10 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "ignore_invalid_deployments",
         # Read host-side by the pre-routing strategies (litellm/router_rust_prerouting.py).
         "auto_router_capability_limit",
+        # Decided in router-core (precall.rs); its facts come from litellm/router_rust_precall.py.
+        "enable_pre_call_checks",
+        # Run host-side (litellm/router_rust_plugins.py); router-core filters on what they leave.
+        "plugins",
     }
 )
 # Arguments that may be passed at their default without asking for anything.
@@ -243,6 +250,7 @@ _STATIC_SETTINGS: Final = frozenset(
         "allowed_fails_policy",
         "retry_after",
         "timeout",
+        "enable_pre_call_checks",
     }
 )
 _DYNAMIC_SETTINGS: Final = frozenset(
@@ -383,6 +391,8 @@ class Resolved:
     enable_tag_filtering: bool = False
     tag_filtering_match_any: bool = True
     tag_routing_prefix: str = ""
+    enable_pre_call_checks: bool = False
+    routing_plugins: "tuple[RoutingPlugin, ...]" = ()
     assigned: frozenset[str] = frozenset()
 
     @classmethod
@@ -438,6 +448,8 @@ class Resolved:
             enable_tag_filtering=bool(get("enable_tag_filtering")),
             tag_filtering_match_any=_true_unless_given(get("tag_filtering_match_any")),
             tag_routing_prefix=str(get("tag_routing_prefix") or ""),
+            enable_pre_call_checks=bool(get("enable_pre_call_checks")),
+            routing_plugins=tuple(_as_list(get("plugins"))),  # pyright: ignore[reportArgumentType]  # the plugins as passed
             routing_groups=parse_groups(
                 get("routing_groups"),
                 frozenset(
@@ -483,6 +495,8 @@ class Resolved:
                 updates[name] = self._selection_setting(name, value, validate=name in updated)
             elif name == "disable_cooldowns":
                 updates[name] = _optional_bool(value)
+            elif name == "enable_pre_call_checks":
+                updates[name] = bool(value)
             elif name in ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks"):
                 updates[name] = list(_as_list(value)) or None
             else:
@@ -513,6 +527,8 @@ class Resolved:
             "retry_after": self.retry_after,
             "timeout": self.timeout,
             "routing_groups": group_documents(self.routing_groups) if self.routing_groups else None,
+            "enable_pre_call_checks": True if self.enable_pre_call_checks else None,
+            "routing_plugins": True if self.routing_plugins else None,
         }
         return {name: value for name, value in values.items() if value is not None}
 
@@ -915,7 +931,7 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             allowed_fails=r.allowed_fails,
             allowed_fails_policy=r.allowed_fails_policy,  # pyright: ignore[reportArgumentType]  # the policy as passed
             disable_cooldowns=r.disable_cooldowns,
-            enable_pre_call_checks=False,
+            enable_pre_call_checks=r.enable_pre_call_checks,
             enable_health_check_routing=False,
             enable_tag_filtering=r.enable_tag_filtering,
             tag_filtering_match_any=r.tag_filtering_match_any,
@@ -1352,7 +1368,11 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             or request.get("enable_tag_filtering") is True
             or self._model_tag_filtering()
         )
-        return {**_start_fields(request), **({"filter_tags": True} if filter_tags else {})}
+        return {
+            **_start_fields(request),
+            **({"filter_tags": True} if filter_tags else {}),
+            **({"has_image": True} if request_carries_image(None, request) else {}),
+        }
 
     def _model_tag_filtering(self) -> bool:
         """Whether any deployment sets ``model_info.enable_tag_filtering``, cached per registry version."""
@@ -1583,6 +1603,27 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             enable_tag_filtering=r.enable_tag_filtering,
             match_any=r.tag_filtering_match_any,
             public_router=public if public is not None else self,
+            run_plugins=partial(
+                self._run_plugins, request, request.get("messages") if messages is _NO_INPUT else messages
+            )  # pyright: ignore[reportUnknownArgumentType]  # the request kwargs the plugins stamp
+            if r.routing_plugins
+            else None,
+        )
+
+    async def _run_plugins(
+        self,
+        request: dict[str, object],  # mutable-ok: the plugins stamp their outcome on the caller's request
+        messages: object,
+        model: str,
+    ) -> None:
+        """``_run_routing_plugins`` over the pre-routing hook's session-resolved ``model``."""
+        await run_plugins(
+            self._resolved.routing_plugins,
+            self._hosted,  # pyright: ignore[reportArgumentType]  # the host registry serves the listing
+            self._resolved.model_group_alias,
+            model,
+            request,
+            messages,
         )
 
     def _custom_pick_sync(
@@ -1643,11 +1684,38 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         )
         return [found for record in kept if (found := picked_id(record)) is not None]
 
+    def _pre_call_facts(
+        self, step: Mapping[str, object], request: Mapping[str, object], messages: object, input: object
+    ) -> PreCallFacts:
+        hosted: Final = self._hosted
+
+        def record(id: str) -> Mapping[str, object]:
+            return hosted._core_get_model_info(id) or as_str_mapping(self._handle.deployment(id)) or {}  # pyright: ignore[reportPrivateUsage]  # see __init__
+
+        return PreCallFacts(self._host, hosted, step, record, request, messages, input)  # pyright: ignore[reportArgumentType]  # the host registry serves the reads
+
+    def _text_only(self, step: Mapping[str, object]) -> list[str]:  # mutable-ok: the step's answer
+        """The candidates that declare no vision support (bridged: needs the cost map)."""
+        group: Final = str(step.get("model_group"))
+        return [
+            str(id)
+            for id in _as_list(step.get("candidates"))
+            if declares_no_vision(as_str_mapping(self._handle.deployment(str(id))) or {}, group)
+        ]
+
     async def _answer_select(
         self, step: Mapping[str, object], request: Mapping[str, object], messages: object, input: object
     ) -> object:
+        if step.get("stage") == "pre_call":
+            return await self._pre_call_facts(step, request, messages, input).answer_async()
+        if step.get("stage") == "routing_plugins":
+            # The plugins already ran in this pick's pre_route step (see `_pre_route`), on the
+            # session-resolved name and before a strategy was selected, as Python's hook runs them.
+            return candidate_models(request)
         if step.get("stage") == "tags":
             return await self._answer_tags(step, request)
+        if step.get("stage") == "text_only":
+            return self._text_only(step)
         inputs: Final = self._strategy_inputs(step, request)
         if inputs is None:
             return step["candidates"]
@@ -1671,6 +1739,12 @@ class RustCore(_SettingsSource, RustRegistryMembers):
     def _answer_select_sync(
         self, step: Mapping[str, object], request: Mapping[str, object], messages: object, input: object
     ) -> object:
+        if step.get("stage") == "pre_call":
+            return self._pre_call_facts(step, request, messages, input).answer()
+        if step.get("stage") == "routing_plugins":
+            return candidate_models(request)
+        if step.get("stage") == "text_only":
+            return self._text_only(step)
         inputs: Final = self._strategy_inputs(step, request)
         if inputs is None:
             return step["candidates"]
@@ -1816,6 +1890,29 @@ class RustCore(_SettingsSource, RustRegistryMembers):
                 "Please add use_in_pass_through: true in the deployment configuration"
             )
             return litellm_exceptions.BadRequestError(message=message, model=model, llm_provider="")
+        if kind == "context_window_exceeded":
+            return litellm_exceptions.ContextWindowExceededError(
+                message="litellm._pre_call_checks: Context Window exceeded for given call. No models have context "
+                f"window large enough for this call.\n{step.get('error_detail')}",
+                model=str(step.get("error_model") or model),
+                llm_provider="",
+            )
+        if kind == "unsupported_params":
+            params: Final = sorted(str(param) for param in _as_list(step.get("error_params")))
+            unsupported_model: Final = str(step.get("error_model") or model)
+            return litellm_exceptions.UnsupportedParamsError(
+                message=(
+                    f"no deployment of model={unsupported_model} supports {params}. "
+                    "To drop these, set `litellm.drop_params=True` or for proxy `litellm_settings: drop_params: true`, "
+                    f"or send allowed_openai_params={params} to pass them through"
+                ),
+                model=unsupported_model,
+            )
+        if kind == "routing_plugins_left_nothing":
+            left: Final = [str(name) for name in _as_list(step.get("error_params"))]
+            return ValueError(f"No deployments left after routing-plugin filtering. candidate_models={left}")
+        if kind == "routing_plugins_need_async":
+            return ValueError(SYNC_PATH_MESSAGE)
         if kind == "unknown_model":
             named: Final = _alias_target(aliases.get(model)) or model if model in aliases else model
             return litellm_exceptions.BadRequestError(
@@ -1841,7 +1938,7 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             return RouterRateLimitError(
                 model=model,
                 cooldown_time=min_cooldown,
-                enable_pre_call_checks=False,
+                enable_pre_call_checks=self._resolved.enable_pre_call_checks,
                 cooldown_list=cooling,
                 model_ids=list(ids),  # pyright: ignore[reportArgumentType]  # a list of ids
             )
@@ -1899,7 +1996,11 @@ class _Selection:
         self._kind: Final = kind
         self._messages: Final = messages
         self._input: Final = input
-        fields: Final = {**core._routing_fields(request), **_narrowing_fields(request, kind)}  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
+        fields: Final = {
+            **core._routing_fields(request),  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
+            **_narrowing_fields(request, kind),
+            **({"has_image": True} if request_carries_image(messages, request) else {}),
+        }  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
         if specific_deployment:
             fields["specific_deployment"] = True
         if kind == "pick" or (kind == "sync_pick" and core._custom_strategy is not None):  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
@@ -2149,7 +2250,11 @@ class _Driver:
         call: AttemptCall | None = None  # rebind-ok: see attempt
         try:
             deployment, call = self._call(step)  # rebind-ok: rebound as the Python router rebinds it
-            self._core._endpoints.sync_pre_call_checks(self._plan, deployment, self._request)  # pyright: ignore[reportPrivateUsage]  # see above
+            try:
+                self._core._endpoints.sync_pre_call_checks(self._plan, deployment, self._request)  # pyright: ignore[reportPrivateUsage]  # see above
+            except Exception as refused:  # noqa: BLE001  # handed to the Rust call loop like any attempt failure
+                # The sync path records no outcome for a refused pre-call check: no cooldown.
+                return {**self._failed(step, deployment, call, refused), "unrecorded": True}
             answered: Final = self._core._host.invoke(call.host_op)(**call.kwargs)  # pyright: ignore[reportPrivateUsage]  # a sync endpoint
             if inspect.isawaitable(answered):
                 raise _NotSynchronous(f"the host's {call.host_op} endpoint is not synchronous")
