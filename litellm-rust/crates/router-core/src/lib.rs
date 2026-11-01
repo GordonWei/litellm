@@ -70,6 +70,7 @@
 //! - [`cache`] / [`health`]: the shared routing cache, cooldowns and usage.
 //! - [`select`]: resolve, filter chain, simple-shuffle.
 //! - [`call`]: retries and fallbacks.
+//! - [`precall`]: the `enable_pre_call_checks` filter.
 //! - [`host`]: the `Host` boundary.
 
 pub mod cache;
@@ -78,6 +79,7 @@ pub mod config;
 pub mod error;
 pub mod health;
 pub mod host;
+pub mod precall;
 pub mod registry;
 pub mod routing_groups;
 pub mod select;

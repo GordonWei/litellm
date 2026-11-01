@@ -13,6 +13,7 @@ use crate::{
     config::{Op, RoutingStrategy},
     error::{AttemptError, Error, FailureKind, Payload},
     health::Health,
+    precall::PreCallFacts,
     registry::{Deployment, Registry},
     settings::Settings,
     strategy::StrategyScope,
@@ -190,5 +191,16 @@ pub trait Host: Send + Sync {
     /// Whether [`Self::select`] can run strategies and plugins.
     fn can_select(&self) -> bool {
         true
+    }
+
+    /// The facts the `enable_pre_call_checks` filter decides by (token count, context windows,
+    /// param support), for `candidates` and the deployments in `ctx.pool`. A host without them
+    /// reports no input, so nothing is checked.
+    async fn pre_call_facts(
+        &self,
+        _ctx: &RoutingContext<'_>,
+        _candidates: &[Arc<Deployment>],
+    ) -> Result<PreCallFacts, Error> {
+        Ok(PreCallFacts::default())
     }
 }

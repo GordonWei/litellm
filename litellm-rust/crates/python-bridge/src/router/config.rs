@@ -75,8 +75,6 @@ pub(crate) enum Error {
     NotObject { document: Document },
     #[error("router-core does not read `{key}` in the {document}")]
     UnknownKey { document: Document, key: String },
-    #[error("router-core does not run `{key}` = {value}")]
-    UnsupportedValue { key: &'static str, value: Value },
     #[error("the {document} does not have the shape router-core reads")]
     Shape {
         document: Document,
@@ -93,7 +91,7 @@ impl Error {
     /// Whether router-core cannot serve this config, so Python keeps its own core.
     pub(crate) fn declined(&self) -> bool {
         match self {
-            Self::UnknownKey { .. } | Self::UnsupportedValue { .. } | Self::Core(_) => true,
+            Self::UnknownKey { .. } | Self::Core(_) => true,
             Self::Shape { document, .. } => {
                 matches!(document, Document::Static | Document::Dynamic)
             }
@@ -137,15 +135,6 @@ fn routing_keys(
 
 pub(crate) fn router_config(value: Value) -> Result<RouterConfig, Error> {
     let object = routing_keys(Document::Static, value, STATIC_KEYS)?;
-    // Pre-call checks reach router-core as plugins; the Python flag alone has no native filter.
-    if let Some(value) = object.get("enable_pre_call_checks")
-        && value != &Value::Bool(false)
-    {
-        return Err(Error::UnsupportedValue {
-            key: "enable_pre_call_checks",
-            value: value.clone(),
-        });
-    }
     shaped(Document::Static, object)
 }
 
@@ -252,21 +241,9 @@ mod tests {
     #[case::null_unknown(json!({"routing_strategy_args": null}))]
     #[case::ignored(json!({"set_verbose": true, "debug_level": "INFO"}))]
     #[case::pre_call_checks_off(json!({"enable_pre_call_checks": false}))]
+    #[case::pre_call_checks_on(json!({"enable_pre_call_checks": true}))]
     fn unset_and_ignored_keys_are_accepted(#[case] json: Value) {
         router_config(json).unwrap();
-    }
-
-    #[rstest]
-    fn pre_call_checks_without_a_plugin_decline() {
-        let error = router_config(json!({"enable_pre_call_checks": true})).unwrap_err();
-        assert!(error.declined());
-        assert!(matches!(
-            error,
-            Error::UnsupportedValue {
-                key: "enable_pre_call_checks",
-                ..
-            }
-        ));
     }
 
     #[rstest]

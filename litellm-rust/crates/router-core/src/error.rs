@@ -56,6 +56,13 @@ pub enum Error {
     /// Every deployment `model` resolved to is a pre-routing strategy marker (`auto_router/...`).
     #[error("every deployment of `{model}` is a strategy router marker")]
     OnlyMarkers { model: String },
+    /// The pre-call checks found no deployment whose context window fits the prompt; `detail`
+    /// names each one dropped for it.
+    #[error("no deployment of `{model}` has a context window large enough for this call")]
+    ContextWindowExceeded { model: String, detail: String },
+    /// The pre-call checks found no deployment of `model` that takes the requested `params`.
+    #[error("no deployment of `{model}` supports {params:?}")]
+    UnsupportedParams { model: String, params: Vec<String> },
 }
 
 impl Error {
@@ -71,7 +78,9 @@ impl Error {
             | Self::Paused { .. }
             | Self::NotPassThrough { .. }
             | Self::NoPassThroughDeployments { .. }
-            | Self::OnlyMarkers { .. } => None,
+            | Self::OnlyMarkers { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::UnsupportedParams { .. } => None,
         }
     }
 }

@@ -21,7 +21,7 @@ use std::{
 use async_trait::async_trait;
 use litellm_router_core::{
     Attempt, AttemptError, Deployment, Error, Host, Output, Payload, RouterCache, RouterEvent,
-    RouterRequest, RouterResponse, RoutingContext, SelectStage,
+    RouterRequest, RouterResponse, RoutingContext, SelectStage, precall::PreCallFacts,
 };
 use serde_json::Value;
 
@@ -53,6 +53,8 @@ pub(crate) enum Stage {
     Strategy(String),
     /// Tag routing: return the deployments that remain.
     Tags,
+    /// `enable_pre_call_checks`: return the facts the filter decides by.
+    PreCall,
 }
 
 /// The `op` of a `cache` step: one per [`RouterCache`] method.
@@ -174,6 +176,8 @@ pub(crate) enum Answer {
     AllowFallback(bool),
     /// The candidate ids that remain, pick first.
     Select(Vec<String>),
+    /// The facts a `pre_call` select step asked for.
+    PreCall(PreCallFacts),
     Cache(CacheOutcome),
 }
 
@@ -183,7 +187,7 @@ impl Answer {
             Self::Attempt(_) => StepKind::Attempt,
             Self::Slept => StepKind::Sleep,
             Self::AllowFallback(_) => StepKind::AllowFallback,
-            Self::Select(_) => StepKind::Select,
+            Self::Select(_) | Self::PreCall(_) => StepKind::Select,
             Self::Cache(_) => StepKind::Cache,
         }
     }
@@ -492,6 +496,27 @@ impl Host for StepHost {
             .iter()
             .filter_map(|id| candidates.iter().find(|d| d.id == *id).cloned())
             .collect())
+    }
+
+    async fn pre_call_facts(
+        &self,
+        ctx: &RoutingContext<'_>,
+        candidates: &[Arc<Deployment>],
+    ) -> Result<PreCallFacts, Error> {
+        let (scope, group) = ctx.scope.wire();
+        let question = Ask::Select {
+            stage: Stage::PreCall,
+            pool: ctx.pool.iter().map(|d| d.id.clone()).collect(),
+            model_group: ctx.model_group.to_owned(),
+            name: ctx.name.to_owned(),
+            scope,
+            group: group.map(str::to_owned),
+            candidates: candidates.iter().map(|d| d.id.clone()).collect(),
+        };
+        let Answer::PreCall(facts) = ask(question).await else {
+            unreachable!("{CHECKED}");
+        };
+        Ok(facts)
     }
 
     async fn allow_fallback(&self, _request: &RouterRequest, target: &str) -> bool {

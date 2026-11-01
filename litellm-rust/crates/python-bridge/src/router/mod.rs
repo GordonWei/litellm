@@ -54,6 +54,10 @@ enum ErrorKind {
     NoPassThroughDeployments,
     #[strum(serialize = "only_markers")]
     OnlyMarkers,
+    #[strum(serialize = "context_window_exceeded")]
+    ContextWindowExceeded,
+    #[strum(serialize = "unsupported_params")]
+    UnsupportedParams,
 }
 
 impl From<&Error> for ErrorKind {
@@ -69,6 +73,8 @@ impl From<&Error> for ErrorKind {
             Error::NotPassThrough { .. } => Self::NotPassThrough,
             Error::NoPassThroughDeployments { .. } => Self::NoPassThroughDeployments,
             Error::OnlyMarkers { .. } => Self::OnlyMarkers,
+            Error::ContextWindowExceeded { .. } => Self::ContextWindowExceeded,
+            Error::UnsupportedParams { .. } => Self::UnsupportedParams,
         }
     }
 }
@@ -382,6 +388,15 @@ fn answer(ask: &Ask, outcome: Option<Bound<'_, PyAny>>) -> PyResult<Answer> {
         Ask::AllowFallback { .. } => Ok(Answer::AllowFallback(
             outcome.ok_or_else(missing)?.extract()?,
         )),
+        Ask::Select {
+            stage: Stage::PreCall,
+            ..
+        } => {
+            let facts = from_py_argument(&outcome.ok_or_else(missing)?)?;
+            serde_json::from_value(facts)
+                .map(Answer::PreCall)
+                .map_err(|error| PyValueError::new_err(format!("bad pre-call facts: {error}")))
+        }
         Ask::Select { .. } => Ok(Answer::Select(outcome.ok_or_else(missing)?.extract()?)),
         Ask::Attempt { .. } => {
             let outcome = outcome.ok_or_else(missing)?;
@@ -511,8 +526,17 @@ fn step_dict(py: Python<'_>, step: Step) -> PyResult<Bound<'_, PyDict>> {
             let attempt = error.attempt();
             dict.set_item("error", Report::new(&error).to_string())?;
             dict.set_item("error_kind", <&'static str>::from(ErrorKind::from(&error)))?;
-            if let Error::OnlyMarkers { model } = &error {
-                dict.set_item("error_model", model)?;
+            match &error {
+                Error::OnlyMarkers { model } => dict.set_item("error_model", model)?,
+                Error::ContextWindowExceeded { model, detail } => {
+                    dict.set_item("error_model", model)?;
+                    dict.set_item("error_detail", detail)?;
+                }
+                Error::UnsupportedParams { model, params } => {
+                    dict.set_item("error_model", model)?;
+                    dict.set_item("error_params", PyList::new(dict.py(), params)?)?;
+                }
+                _ => {}
             }
             dict.set_item("attempt_failed", attempt.is_some())?;
             dict.set_item("status", attempt.and_then(|failure| failure.status))?;
@@ -565,6 +589,7 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
                 Stage::Plugins => ("plugins", None),
                 Stage::Strategy(strategy) => ("strategy", Some(strategy)),
                 Stage::Tags => ("tags", None),
+                Stage::PreCall => ("pre_call", None),
             };
             dict.set_item("pool", PyList::new(py, pool)?)?;
             dict.set_item("stage", stage)?;

@@ -1,6 +1,6 @@
 //! Selection: resolve a name, filter its deployments in the order of
-//! `Router._core_async_get_healthy_deployments` (team, cooldown, blocked, plugins, order, retry
-//! skips), then pick one with the strategy. Simple-shuffle is native
+//! `Router._core_async_get_healthy_deployments` (team, cooldown, blocked, plugins, pre-call
+//! checks, tags, order, retry skips), then pick one with the strategy. Simple-shuffle is native
 //! (`router_strategy/simple_shuffle.py`); other strategies go through `Host::select`.
 
 use std::{collections::BTreeMap, sync::Arc};
@@ -293,6 +293,19 @@ impl Core {
         }
 
         if listed {
+            if settings.enable_pre_call_checks && resolution.kind != ResolveKind::Id {
+                healthy = self
+                    .pre_call_checks(
+                        snapshot,
+                        op,
+                        request,
+                        &resolution.group,
+                        name,
+                        &all,
+                        healthy,
+                    )
+                    .await?;
+            }
             // Only a priority group narrows a listed pass-through pick by order.
             let priority = resolution.kind == ResolveKind::RoutingGroup
                 && registry.routing_groups().iter().any(|g| {
@@ -327,6 +340,20 @@ impl Core {
             healthy = self
                 .host
                 .select(&SelectStage::Plugins, &ctx, healthy)
+                .await?;
+        }
+
+        if settings.enable_pre_call_checks && resolution.kind != ResolveKind::Id {
+            healthy = self
+                .pre_call_checks(
+                    snapshot,
+                    op,
+                    request,
+                    &resolution.group,
+                    name,
+                    &all,
+                    healthy,
+                )
                 .await?;
         }
 
@@ -392,6 +419,31 @@ impl Core {
             all,
             healthy,
         })
+    }
+
+    /// `_pre_call_checks` over `healthy`, with the host's facts.
+    #[allow(clippy::too_many_arguments)]
+    async fn pre_call_checks(
+        &self,
+        snapshot: &Snapshot,
+        op: &Op,
+        request: &RouterRequest,
+        model_group: &str,
+        name: &str,
+        pool: &[Arc<Deployment>],
+        healthy: Vec<Arc<Deployment>>,
+    ) -> Result<Vec<Arc<Deployment>>, Error> {
+        let mut ctx = self.context(
+            snapshot,
+            op,
+            request,
+            model_group,
+            name,
+            StrategyScope::Default,
+        );
+        ctx.pool = pool;
+        let facts = self.host.pre_call_facts(&ctx, &healthy).await?;
+        crate::precall::filter(model_group, healthy, pool, &facts)
     }
 
     /// Pick one of `candidates.healthy` with the group's strategy.

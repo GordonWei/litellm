@@ -220,7 +220,10 @@ impl Core {
         let kind = match error {
             Error::Attempt(failure) => failure.kind,
             Error::NoHealthyDeployments { .. } => FailureKind::RateLimit,
-            Error::Config(_)
+            Error::ContextWindowExceeded { .. } => FailureKind::ContextWindowExceeded,
+            // `is_bad_request_without_fallback`: never a fallback without `fallback_on_unsupported_params`.
+            Error::UnsupportedParams { .. }
+            | Error::Config(_)
             | Error::UnknownModel { .. }
             | Error::Cache(_)
             | Error::Retired

@@ -69,6 +69,7 @@ from litellm.router_rust_endpoints import (
     stamp_error,
 )
 from litellm.router_rust_members import RustRegistryMembers
+from litellm.router_rust_precall import PreCallFacts
 from litellm.router_rust_registry import HostRegistry, RustRegistry, hosted_registry_view
 from litellm.router_rust_selection import (
     SELECTOR_ATTRIBUTES,
@@ -192,6 +193,8 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "default_priority",
         "polling_interval",
         "ignore_invalid_deployments",
+        # Decided in router-core (precall.rs); its facts come from litellm/router_rust_precall.py.
+        "enable_pre_call_checks",
     }
 )
 # Arguments that may be passed at their default without asking for anything.
@@ -229,6 +232,7 @@ _STATIC_SETTINGS: Final = frozenset(
         "allowed_fails_policy",
         "retry_after",
         "timeout",
+        "enable_pre_call_checks",
     }
 )
 _DYNAMIC_SETTINGS: Final = frozenset(
@@ -369,6 +373,7 @@ class Resolved:
     enable_tag_filtering: bool = False
     tag_filtering_match_any: bool = True
     tag_routing_prefix: str = ""
+    enable_pre_call_checks: bool = False
     assigned: frozenset[str] = frozenset()
 
     @classmethod
@@ -424,6 +429,7 @@ class Resolved:
             enable_tag_filtering=bool(get("enable_tag_filtering")),
             tag_filtering_match_any=_true_unless_given(get("tag_filtering_match_any")),
             tag_routing_prefix=str(get("tag_routing_prefix") or ""),
+            enable_pre_call_checks=bool(get("enable_pre_call_checks")),
             routing_groups=parse_groups(
                 get("routing_groups"),
                 frozenset(
@@ -469,6 +475,8 @@ class Resolved:
                 updates[name] = self._selection_setting(name, value, validate=name in updated)
             elif name == "disable_cooldowns":
                 updates[name] = _optional_bool(value)
+            elif name == "enable_pre_call_checks":
+                updates[name] = bool(value)
             elif name in ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks"):
                 updates[name] = list(_as_list(value)) or None
             else:
@@ -499,6 +507,7 @@ class Resolved:
             "retry_after": self.retry_after,
             "timeout": self.timeout,
             "routing_groups": group_documents(self.routing_groups) if self.routing_groups else None,
+            "enable_pre_call_checks": True if self.enable_pre_call_checks else None,
         }
         return {name: value for name, value in values.items() if value is not None}
 
@@ -883,7 +892,7 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             allowed_fails=r.allowed_fails,
             allowed_fails_policy=r.allowed_fails_policy,  # pyright: ignore[reportArgumentType]  # the policy as passed
             disable_cooldowns=r.disable_cooldowns,
-            enable_pre_call_checks=False,
+            enable_pre_call_checks=r.enable_pre_call_checks,
             enable_health_check_routing=False,
             enable_tag_filtering=r.enable_tag_filtering,
             tag_filtering_match_any=r.tag_filtering_match_any,
@@ -955,7 +964,11 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         flag: Final = changes.settings.get(CONTINUATION_FLAG, NO_FLAG)
         if flag is not NO_FLAG:
             self._set_continuation(continuation_flag(flag))
-        values: Final = {**changes.assign, **{k: v for k, v in changes.settings.items() if k != CONTINUATION_FLAG}}
+        # `enable_pre_call_checks` is not runtime updatable: `update_settings` ignores it.
+        values: Final = {
+            **changes.assign,
+            **{k: v for k, v in changes.settings.items() if k not in (CONTINUATION_FLAG, "enable_pre_call_checks")},
+        }
         if "routing_groups" in changes.settings:
             values["routing_groups"] = parse_groups(
                 changes.settings["routing_groups"],
@@ -1449,9 +1462,21 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         )
         return [found for record in kept if (found := picked_id(record)) is not None]
 
+    def _pre_call_facts(
+        self, step: Mapping[str, object], request: Mapping[str, object], messages: object, input: object
+    ) -> PreCallFacts:
+        hosted: Final = self._hosted
+
+        def record(id: str) -> Mapping[str, object]:
+            return hosted._core_get_model_info(id) or as_str_mapping(self._handle.deployment(id)) or {}  # pyright: ignore[reportPrivateUsage]  # see __init__
+
+        return PreCallFacts(self._host, hosted, step, record, request, messages, input)  # pyright: ignore[reportArgumentType]  # the host registry serves the reads
+
     async def _answer_select(
         self, step: Mapping[str, object], request: Mapping[str, object], messages: object, input: object
     ) -> object:
+        if step.get("stage") == "pre_call":
+            return await self._pre_call_facts(step, request, messages, input).answer_async()
         if step.get("stage") == "tags":
             return await self._answer_tags(step, request)
         inputs: Final = self._strategy_inputs(step, request)
@@ -1477,6 +1502,8 @@ class RustCore(_SettingsSource, RustRegistryMembers):
     def _answer_select_sync(
         self, step: Mapping[str, object], request: Mapping[str, object], messages: object, input: object
     ) -> object:
+        if step.get("stage") == "pre_call":
+            return self._pre_call_facts(step, request, messages, input).answer()
         inputs: Final = self._strategy_inputs(step, request)
         if inputs is None:
             return step["candidates"]
@@ -1615,6 +1642,24 @@ class RustCore(_SettingsSource, RustRegistryMembers):
                 "Please add use_in_pass_through: true in the deployment configuration"
             )
             return litellm_exceptions.BadRequestError(message=message, model=model, llm_provider="")
+        if kind == "context_window_exceeded":
+            return litellm_exceptions.ContextWindowExceededError(
+                message="litellm._pre_call_checks: Context Window exceeded for given call. No models have context "
+                f"window large enough for this call.\n{step.get('error_detail')}",
+                model=str(step.get("error_model") or model),
+                llm_provider="",
+            )
+        if kind == "unsupported_params":
+            params: Final = sorted(str(param) for param in _as_list(step.get("error_params")))
+            unsupported_model: Final = str(step.get("error_model") or model)
+            return litellm_exceptions.UnsupportedParamsError(
+                message=(
+                    f"no deployment of model={unsupported_model} supports {params}. "
+                    "To drop these, set `litellm.drop_params=True` or for proxy `litellm_settings: drop_params: true`, "
+                    f"or send allowed_openai_params={params} to pass them through"
+                ),
+                model=unsupported_model,
+            )
         if kind == "unknown_model":
             named: Final = _alias_target(aliases.get(model)) or model if model in aliases else model
             return litellm_exceptions.BadRequestError(
@@ -1640,7 +1685,7 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             return RouterRateLimitError(
                 model=model,
                 cooldown_time=min_cooldown,
-                enable_pre_call_checks=False,
+                enable_pre_call_checks=self._resolved.enable_pre_call_checks,
                 cooldown_list=cooling,
                 model_ids=list(ids),  # pyright: ignore[reportArgumentType]  # a list of ids
             )
