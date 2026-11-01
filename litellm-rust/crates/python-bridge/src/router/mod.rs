@@ -5,6 +5,7 @@
 
 mod config;
 mod host;
+mod retries;
 
 use std::{
     sync::{Arc, Mutex, PoisonError},
@@ -258,6 +259,26 @@ impl RouterCoreHandle {
     fn retire(&self) {
         self.router.retire();
     }
+
+    /// `get_num_retries_from_retry_policy` for a failure shaped like an attempt outcome.
+    #[pyo3(signature = (failure, model_group=None))]
+    fn retry_policy_retries(
+        &self,
+        failure: &Bound<'_, PyDict>,
+        model_group: Option<&str>,
+    ) -> PyResult<Option<u32>> {
+        retries::policy_retries(&self.router, failure, model_group)
+    }
+
+    /// `should_retry_this_error` as a predicate, for a failure shaped like an attempt outcome.
+    fn should_retry(
+        &self,
+        failure: &Bound<'_, PyDict>,
+        counts: (usize, usize),
+        fallbacks: (bool, bool, bool),
+    ) -> PyResult<bool> {
+        retries::should_retry(failure, counts, fallbacks)
+    }
 }
 
 /// One router call, driven a step at a time by Python.
@@ -362,7 +383,7 @@ fn cache_outcome(op: CacheOp, outcome: Option<Bound<'_, PyAny>>) -> PyResult<Cac
 
 /// `{"ok": True, "total_tokens": int}` or `{"ok": False, "kind": str, "status": int | None,
 /// "retry_after": float | None, "num_retries": int | None, "detail": str | None}`.
-fn attempt_outcome(outcome: &Bound<'_, PyDict>) -> PyResult<Result<u64, AttemptError>> {
+pub(crate) fn attempt_outcome(outcome: &Bound<'_, PyDict>) -> PyResult<Result<u64, AttemptError>> {
     fn item<'py, T: FromPyObjectOwned<'py>>(
         outcome: &Bound<'py, PyDict>,
         key: &str,
@@ -392,6 +413,11 @@ fn attempt_outcome(outcome: &Bound<'_, PyDict>) -> PyResult<Result<u64, AttemptE
     failure.retry_after = retry_after;
     failure.num_retries = item(outcome, "num_retries")?;
     failure.detail = item::<String>(outcome, "detail")?.map(Into::into);
+    failure.classes = item::<Vec<String>>(outcome, "classes")?
+        .unwrap_or_default()
+        .into_iter()
+        .map(Into::into)
+        .collect();
     Ok(Err(failure))
 }
 
@@ -419,6 +445,16 @@ fn events_list(py: Python<'_>, events: Vec<RouterEvent>) -> PyResult<Bound<'_, P
                 dict.set_item("to", to)?;
                 dict.set_item("order", order)?;
                 dict.set_item("level", level)?;
+            }
+            RouterEvent::LevelFailed {
+                level,
+                model,
+                unknown,
+            } => {
+                dict.set_item("kind", "level_failed")?;
+                dict.set_item("level", level)?;
+                dict.set_item("model", model)?;
+                dict.set_item("unknown", unknown)?;
             }
             _ => continue,
         }

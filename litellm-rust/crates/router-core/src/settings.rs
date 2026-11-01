@@ -1,7 +1,7 @@
 //! [`Settings`]: one typed, frozen view of the configuration a caller may read, built from the
 //! static config and the current dynamic snapshot.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use crate::{
     config::{
@@ -20,6 +20,7 @@ pub struct Settings {
     pub allowed_fails: Option<u32>,
     pub allowed_fails_policy: Option<AllowedFailsPolicy>,
     pub retry_policy: Option<RetryPolicy>,
+    pub model_group_retry_policy: Arc<BTreeMap<String, RetryPolicy>>,
     pub num_retries: u32,
     pub max_fallbacks: u32,
     pub retry_after: Duration,
@@ -44,6 +45,7 @@ impl Settings {
             allowed_fails: dynamic.allowed_fails,
             allowed_fails_policy: config.allowed_fails_policy.clone(),
             retry_policy: config.retry_policy.clone(),
+            model_group_retry_policy: Arc::new(config.model_group_retry_policy.clone()),
             num_retries: dynamic.num_retries.unwrap_or(0),
             max_fallbacks: dynamic.max_fallbacks,
             retry_after: seconds(config.retry_after),

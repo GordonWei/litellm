@@ -130,30 +130,9 @@ pub struct RetryPolicy {
     pub RateLimitErrorRetries: Option<u32>,
     pub ContentPolicyViolationErrorRetries: Option<u32>,
     pub InternalServerErrorRetries: Option<u32>,
-}
-
-impl RetryPolicy {
-    pub fn retries_for(&self, kind: FailureKind) -> Option<u32> {
-        match kind {
-            FailureKind::BadRequest | FailureKind::ContextWindowExceeded => {
-                self.BadRequestErrorRetries
-            }
-            FailureKind::Authentication => self.AuthenticationErrorRetries,
-            FailureKind::Timeout => self.TimeoutErrorRetries,
-            FailureKind::RateLimit => self.RateLimitErrorRetries,
-            FailureKind::ContentPolicyViolation => self.ContentPolicyViolationErrorRetries,
-            FailureKind::InternalServer => self.InternalServerErrorRetries,
-            FailureKind::PermissionDenied
-            | FailureKind::NotFound
-            | FailureKind::ApiConnection
-            | FailureKind::ServiceUnavailable
-            | FailureKind::BadGateway
-            | FailureKind::GuardrailIntervention
-            | FailureKind::Declined
-            | FailureKind::CallerCredential
-            | FailureKind::Other => None,
-        }
-    }
+    pub ServiceUnavailableErrorRetries: Option<u32>,
+    pub NotFoundErrorRetries: Option<u32>,
+    pub DefaultRetries: Option<u32>,
 }
 
 /// `AllowedFailsPolicy` in `litellm/types/router.py`: allowed fails per minute per exception type.
@@ -295,6 +274,8 @@ pub struct RouterConfig {
     pub disable_cooldowns: bool,
     pub allowed_fails_policy: Option<AllowedFailsPolicy>,
     pub retry_policy: Option<RetryPolicy>,
+    /// `model_group_retry_policy`: a group's own policy, which wins over `retry_policy`.
+    pub model_group_retry_policy: BTreeMap<String, RetryPolicy>,
     /// `retry_after`: the minimum backoff between retries, in seconds.
     pub retry_after: f64,
     pub timeout: Option<f64>,

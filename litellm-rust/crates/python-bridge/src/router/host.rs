@@ -500,7 +500,9 @@ impl Host for StepHost {
     fn observe(&self, event: &RouterEvent) {
         if !matches!(
             event,
-            RouterEvent::RetriesExhausted { .. } | RouterEvent::Fallback { .. }
+            RouterEvent::RetriesExhausted { .. }
+                | RouterEvent::Fallback { .. }
+                | RouterEvent::LevelFailed { .. }
         ) {
             return;
         }

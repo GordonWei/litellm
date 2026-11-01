@@ -28,6 +28,7 @@ ROUTING_KEYS: Final = frozenset(
         "_router_weights",
         "_retry_skipped_deployment_ids",
         "_target_order",
+        "model_group_retry_policy",
     }
 )
 

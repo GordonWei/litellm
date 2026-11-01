@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use litellm_router_core::{
     ChangeSet, ConfigError, DeploymentSpec, RouterConfig, RouterDynamicConfig, RouterRequest,
+    config::RetryPolicy,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -20,6 +21,7 @@ const STATIC_KEYS: &[&str] = &[
     "disable_cooldowns",
     "allowed_fails_policy",
     "retry_policy",
+    "model_group_retry_policy",
     "retry_after",
     "timeout",
     "request_timeout",
@@ -163,6 +165,7 @@ struct RequestSpec {
     num_retries: Option<u32>,
     disable_fallbacks: Option<bool>,
     router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
+    model_group_retry_policy: Option<BTreeMap<String, RetryPolicy>>,
     body: Option<Value>,
 }
 
@@ -181,6 +184,7 @@ pub(crate) fn request(value: Value, model: Option<&str>) -> Result<RouterRequest
         num_retries: spec.num_retries,
         disable_fallbacks: spec.disable_fallbacks.unwrap_or(false),
         router_weights: spec.router_weights,
+        model_group_retry_policy: spec.model_group_retry_policy,
         payload: None,
     })
 }

@@ -79,6 +79,7 @@ pub mod error;
 pub mod health;
 pub mod host;
 pub mod registry;
+pub mod retry;
 pub mod select;
 pub mod settings;
 

@@ -64,6 +64,7 @@ from litellm.router_attempt import (
 )
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_rust_retries import RustRetries, refuse_unserved_retry_policies, resolved_retry_policy
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
 from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError
@@ -157,6 +158,8 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "cache_kwargs",
         "set_verbose",
         "debug_level",
+        "retry_policy",
+        "model_group_retry_policy",
     }
 )
 # Arguments that may be passed at their default without asking for anything.
@@ -180,7 +183,6 @@ _UNSERVED_REQUEST_KEYS: Final = frozenset(
         "content_policy_fallbacks",
         "default_fallbacks",
         "max_fallbacks",
-        "model_group_retry_policy",
         "retry_policy",
     }
 )
@@ -251,6 +253,7 @@ def attempt_failure(error: BaseException) -> Mapping[str, object]:
         "retry_after": _retry_after_seconds(error),
         "num_retries": num_retries if isinstance(num_retries, int) and num_retries >= 0 else None,
         "detail": str(error)[:500],
+        "classes": [cls.__name__ for cls in type(error).__mro__],
     }
 
 
@@ -305,6 +308,8 @@ class Resolved:
     default_litellm_params: Mapping[str, object]
     fallback_access_check: object
     fallback_budget_check: object
+    retry_policy: object = None
+    model_group_retry_policy: object = None
     assigned: frozenset[str] = frozenset()
 
     @classmethod
@@ -353,6 +358,8 @@ class Resolved:
             default_litellm_params=MappingProxyType(dict(as_str_mapping(get("default_litellm_params")) or {})),
             fallback_access_check=get("fallback_access_check"),
             fallback_budget_check=get("fallback_budget_check"),
+            retry_policy=resolved_retry_policy(get("retry_policy")),
+            model_group_retry_policy=get("model_group_retry_policy"),
         )
 
     def changed(self, values: Mapping[str, object]) -> "Resolved":
@@ -397,6 +404,8 @@ class Resolved:
             "allowed_fails_policy": _plain(self.allowed_fails_policy),
             "retry_after": self.retry_after,
             "timeout": self.timeout,
+            "retry_policy": _plain(self.retry_policy),
+            "model_group_retry_policy": _plain(self.model_group_retry_policy) or None,
         }
         return {name: value for name, value in values.items() if value is not None}
 
@@ -502,11 +511,13 @@ def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
         for key in ("specific_deployment", "num_retries", "disable_fallbacks")
         if request.get(key) is not None
     }
+    group_policies: Final = request.get("model_group_retry_policy")
     weights: Final = request.get("_router_weights")
     team_id: Final = _team_id(request)
     return {
         **fields,
         **({"router_weights": weights} if weights is not None else {}),
+        **({"model_group_retry_policy": _plain(group_policies)} if group_policies is not None else {}),
         **({"team_id": team_id} if team_id else {}),
     }
 
@@ -785,7 +796,7 @@ def _limit(params: Sequence[Mapping[str, object]], key: str) -> int | None:
 _EndpointImpl: TypeAlias = Callable[..., Awaitable[object]]
 
 
-class RustCore(_SettingsSource):
+class RustCore(_SettingsSource, RustRetries):
     """A ``RouterCore`` served by the Rust router core over a ``PythonHost``. It holds no Python core."""
 
     def __init__(self, config: RouterConfig, host: PythonHost, resolved: Resolved) -> None:
@@ -1099,6 +1110,7 @@ class RustCore(_SettingsSource):
         )
         if unserved:
             raise RustCoreUnsupported(f"request keys not served by the Rust router core yet: {unserved}")
+        refuse_unserved_retry_policies(request.get("model_group_retry_policy"))
         model: Final = request.get("model")
         if not isinstance(model, str):
             raise TypeError(f"{op}() needs a model name")
@@ -1331,6 +1343,13 @@ class _Driver:
         for raw_event in _as_list(events):
             event = as_str_mapping(raw_event)
             if event is None:
+                continue
+            if event.get("kind") == "level_failed":
+                kind = "unknown_model" if event.get("unknown") else "no_healthy_deployments"
+                level = event.get("level")
+                self._level_errors[level if isinstance(level, int) else 0] = self._core._failure_error(  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+                    {"error_kind": kind}, str(event.get("model")), None
+                )
                 continue
             if event.get("kind") != "retries_exhausted":
                 continue

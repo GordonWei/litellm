@@ -15,6 +15,7 @@ use crate::{
     health::{GroupShape, should_retry_status},
     host::{Attempt, Output, RouterEvent, RouterRequest},
     registry::ResolveKind,
+    retry::{RetryContext, resolve_retry_policy, should_retry},
     select::{Candidates, SelectInputs},
 };
 
@@ -69,35 +70,6 @@ struct Target {
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// `should_retry_this_error`, as a predicate.
-fn should_retry(
-    failure: &AttemptError,
-    healthy: usize,
-    all: usize,
-    has_context_window_fallbacks: bool,
-    has_content_policy_fallbacks: bool,
-    has_regular_fallbacks: bool,
-) -> bool {
-    match failure.kind {
-        FailureKind::ContextWindowExceeded if has_context_window_fallbacks => return false,
-        FailureKind::ContentPolicyViolation if has_content_policy_fallbacks => return false,
-        _ => {}
-    }
-    if let Some(status) = failure.status
-        && !should_retry_status(status)
-        && !matches!(status, 401 | 403)
-        && failure.kind != FailureKind::Declined
-    {
-        return false;
-    }
-    match failure.kind {
-        FailureKind::NotFound => false,
-        FailureKind::RateLimit if healthy == 0 && has_regular_fallbacks => false,
-        FailureKind::Authentication | FailureKind::PermissionDenied if all <= 1 => false,
-        _ => healthy > 0,
-    }
-}
-
 impl Core {
     pub(crate) async fn call(
         &self,
@@ -137,6 +109,13 @@ impl Core {
                 Ok(response) => return Ok(response),
                 Err(error) => error,
             };
+            if let Error::NoHealthyDeployments { model } | Error::UnknownModel { model } = &error {
+                self.host.observe(&RouterEvent::LevelFailed {
+                    level: at.level,
+                    model: model.clone(),
+                    unknown: matches!(error, Error::UnknownModel { .. }),
+                });
+            }
             let Some(targets) = self.fallback_targets(snapshot, request, &target, &error) else {
                 return Err(error);
             };
@@ -309,8 +288,19 @@ impl Core {
             .num_retries
             .or(failure.num_retries)
             .unwrap_or(settings.num_retries);
+        let group_policies = request
+            .model_group_retry_policy
+            .as_ref()
+            .unwrap_or(&settings.model_group_retry_policy);
         let policy_retries = (request.num_retries != Some(0))
-            .then(|| settings.retry_policy.as_ref()?.retries_for(failure.kind))
+            .then(|| {
+                resolve_retry_policy(
+                    settings.retry_policy.as_ref(),
+                    &target.group,
+                    Some(group_policies),
+                )?
+                .retries_for(failure)
+            })
             .flatten();
         let policy_applies = policy_retries.is_some();
         num_retries = policy_retries.unwrap_or(num_retries);
@@ -324,29 +314,38 @@ impl Core {
             .unwrap_or(0);
 
         for retry in 0..=num_retries {
-            let Error::Attempt(failure) = &failed.error else {
-                return Err(failed.error);
-            };
             let healthy = self
                 .candidates(snapshot, op, request, &target.group, &counting)
                 .await
                 .map(|c| counted(&c, c.healthy.len()))
                 .unwrap_or(0);
-            if !policy_applies && !self.should_retry(snapshot, failure, healthy, all) {
+            // A retry that found no deployment raised that error in Python's loop: a retry
+            // policy keeps going, `should_retry_this_error` raises it (nothing is healthy).
+            let failure = match &failed.error {
+                Error::Attempt(failure) => Some(failure),
+                Error::NoHealthyDeployments { .. } if policy_applies => None,
+                _ => return Err(failed.error),
+            };
+            if let Some(failure) = failure
+                && !policy_applies
+                && !self.should_retry(snapshot, failure, healthy, all)
+            {
                 return Err(failed.error);
             }
             if num_retries == 0 {
                 return Err(failed.error);
             }
-            if let (Some(status), Some(id)) = (failure.status, &failed.deployment_id)
-                && !should_retry_status(status)
+            if let (Some(status), Some(id)) = (
+                failure.and_then(|failure| failure.status),
+                &failed.deployment_id,
+            ) && !should_retry_status(status)
                 && !inputs.skipped_ids.contains(id)
             {
                 inputs.skipped_ids.push(id.clone());
             }
             let delay = self.time_to_sleep(
                 snapshot,
-                failure,
+                failure.and_then(|failure| failure.retry_after),
                 num_retries - retry,
                 num_retries,
                 healthy,
@@ -390,11 +389,13 @@ impl Core {
         let dynamic = &snapshot.settings.dynamic;
         should_retry(
             failure,
-            healthy,
-            all,
-            dynamic.context_window_fallbacks.is_some(),
-            dynamic.content_policy_fallbacks.is_some(),
-            dynamic.has_regular_fallbacks(),
+            RetryContext {
+                healthy,
+                all,
+                has_context_window_fallbacks: dynamic.context_window_fallbacks.is_some(),
+                has_content_policy_fallbacks: dynamic.content_policy_fallbacks.is_some(),
+                has_regular_fallbacks: dynamic.has_regular_fallbacks(),
+            },
         )
     }
 
@@ -402,7 +403,7 @@ impl Core {
     fn time_to_sleep(
         &self,
         snapshot: &Snapshot,
-        failure: &AttemptError,
+        retry_after: Option<Duration>,
         remaining_retries: u32,
         num_retries: u32,
         healthy: usize,
@@ -412,7 +413,7 @@ impl Core {
             return Duration::ZERO;
         }
         let jitter = JITTER * self.rng.next_f64();
-        if let Some(retry_after) = failure.retry_after
+        if let Some(retry_after) = retry_after
             && !retry_after.is_zero()
             && retry_after <= MAX_HONOURED_RETRY_AFTER
         {
@@ -542,42 +543,5 @@ impl Core {
                 warn!(deployment_id = %deployment.id, error = %error, "cooldown was not recorded");
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rstest::rstest;
-
-    use super::*;
-
-    #[rstest]
-    #[case::rate_limit_with_healthy(FailureKind::RateLimit, Some(429), 1, 2, false, true)]
-    #[case::rate_limit_none_healthy_with_fallbacks(
-        FailureKind::RateLimit,
-        Some(429),
-        0,
-        2,
-        true,
-        false
-    )]
-    #[case::bad_request(FailureKind::BadRequest, Some(400), 2, 2, false, false)]
-    #[case::auth_lone_deployment(FailureKind::Authentication, Some(401), 1, 1, false, false)]
-    #[case::auth_with_siblings(FailureKind::Authentication, Some(401), 1, 2, false, true)]
-    #[case::not_found(FailureKind::NotFound, Some(404), 2, 2, false, false)]
-    #[case::server_error_no_healthy(FailureKind::InternalServer, Some(500), 0, 2, false, false)]
-    fn should_retry_follows_python(
-        #[case] kind: FailureKind,
-        #[case] status: Option<u16>,
-        #[case] healthy: usize,
-        #[case] all: usize,
-        #[case] regular_fallbacks: bool,
-        #[case] expected: bool,
-    ) {
-        let failure = AttemptError::new(kind, status);
-        assert_eq!(
-            should_retry(&failure, healthy, all, false, false, regular_fallbacks),
-            expected
-        );
     }
 }

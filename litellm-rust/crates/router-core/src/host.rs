@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     cache::RouterCache,
-    config::{Op, RoutingStrategy},
+    config::{Op, RetryPolicy, RoutingStrategy},
     error::{AttemptError, Error, FailureKind, Payload},
     health::Health,
     registry::{Deployment, Registry},
@@ -32,6 +32,8 @@ pub struct RouterRequest {
     pub disable_fallbacks: bool,
     /// `_router_weights`: model group to deployment id to weight.
     pub router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
+    /// A per-request `model_group_retry_policy`, which replaces the router's.
+    pub model_group_retry_policy: Option<BTreeMap<String, RetryPolicy>>,
     /// What the host needs to run the call itself, such as the Python kwargs.
     pub payload: Option<Payload>,
 }
@@ -117,6 +119,14 @@ pub enum RouterEvent {
         depth: u32,
         /// The fallback level `to` is tried at: 1 for the request's own fallbacks.
         level: u32,
+    },
+    /// A level of the fallback walk ended on an error no attempt raised: the group had no
+    /// deployment for the caller (`unknown`) or none available. Python raises that error for
+    /// the level, whatever its earlier attempts raised.
+    LevelFailed {
+        level: u32,
+        model: String,
+        unknown: bool,
     },
     /// A group's retry loop ran every retry and the last one failed: Python stamps
     /// `num_retries` and `max_retries` on that error.
