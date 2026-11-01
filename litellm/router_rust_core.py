@@ -89,13 +89,13 @@ from litellm.router_rust_health import (
 from litellm.router_rust_health_routing import (
     HEALTH_STATE_KEY,
     HealthRouting,
-    all_blocked,
     failover_document,
-    fully_blocked_model_names,
     fully_unhealthy_model_names,
-    is_blocked,
     resolved_allowed_fails_policy,
 )
+from litellm.router_rust_health_routing import all_blocked as deployments_all_blocked
+from litellm.router_rust_health_routing import fully_blocked_model_names as blocked_model_names
+from litellm.router_rust_health_routing import is_blocked as deployment_is_blocked
 from litellm.router_rust_members import RustRegistryMembers
 from litellm.router_rust_plugins import SYNC_PATH_MESSAGE, candidate_models, run_plugins
 from litellm.router_rust_precall import PreCallFacts, declares_no_vision, request_carries_image
@@ -807,14 +807,14 @@ class RustHealth(RouterHealth):
 
     @staticmethod
     def is_blocked(deployment: "Deployment") -> bool:
-        return is_blocked(deployment)
+        return deployment_is_blocked(deployment)
 
     @staticmethod
     def all_blocked(deployments: "Sequence[DeploymentTypedDict]") -> bool:
-        return all_blocked(deployments)
+        return deployments_all_blocked(deployments)
 
     def fully_blocked_model_names(self) -> set[str]:  # mutable-ok: the core's type, a fresh set
-        return fully_blocked_model_names(self._core._hosted._core_get_model_list() or [])  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # see team_ptu_ceiling
+        return blocked_model_names(self._core._hosted._core_get_model_list() or [])  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # see team_ptu_ceiling
 
     async def fully_unhealthy_model_names(self) -> set[str]:  # mutable-ok: the core's type, a fresh set
         core: Final = self._core
