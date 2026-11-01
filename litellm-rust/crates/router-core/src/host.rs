@@ -13,7 +13,7 @@ use crate::{
     config::{Op, RoutingStrategy},
     error::{AttemptError, Error, FailureKind, Payload},
     health::Health,
-    prerouting::PreRoute,
+    prerouting::{PreRoute, PreRouted},
     registry::{Deployment, Registry},
     settings::Settings,
     strategy::StrategyScope,
@@ -170,9 +170,10 @@ pub trait Host: Send + Sync {
         candidates: Vec<Arc<Deployment>>,
     ) -> Result<Vec<Arc<Deployment>>, Error>;
 
-    /// Pre-routing before a pick resolves `ask.name`: the model group to resolve instead, or
-    /// `None` to resolve the name itself. Asked only for async picks (`pre_routes`).
-    async fn pre_route(&self, ask: &PreRoute<'_>) -> Result<Option<String>, Error> {
+    /// Pre-routing before a pick resolves `ask.name`: the model group to resolve instead, a
+    /// custom strategy's deployment to serve, or `None` to resolve the name itself. Asked only
+    /// for picks that pre-route (`pre_routes`).
+    async fn pre_route(&self, ask: &PreRoute<'_>) -> Result<Option<PreRouted>, Error> {
         let _ = ask;
         Ok(None)
     }

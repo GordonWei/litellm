@@ -100,7 +100,7 @@ pub use crate::{
     error::{AttemptError, ConfigError, Error, FailureKind, Payload, Unsupported},
     health::{Clock, Health, Outcome, SystemClock},
     host::{Attempt, Host, Output, RouterEvent, RouterRequest, RoutingContext, SelectStage},
-    prerouting::PreRoute,
+    prerouting::{PreRoute, PreRouted},
     registry::{ChangeSet, Deployment, DeploymentSpec, Registry, RegistryVersion},
     select::{Randomness, SeededRandomness, ThreadRandomness},
     settings::Settings,
@@ -255,7 +255,7 @@ impl Router {
     pub async fn select(&self, op: &Op, request: &RouterRequest) -> Result<Arc<Deployment>, Error> {
         self.live()?;
         let snapshot = self.core.snapshot.load_full();
-        let name = self
+        let routed = self
             .core
             .pre_routed(PreRoute {
                 op,
@@ -265,6 +265,10 @@ impl Router {
                 retry: 0,
             })
             .await?;
+        let name = match routed {
+            PreRouted::Model(name) => name,
+            PreRouted::Deployment(deployment) => return Ok(deployment),
+        };
         let candidates = self
             .core
             .candidates(&snapshot, op, request, &name, &SelectInputs::default())

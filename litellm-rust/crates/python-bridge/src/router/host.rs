@@ -20,8 +20,8 @@ use std::{
 
 use async_trait::async_trait;
 use litellm_router_core::{
-    Attempt, AttemptError, Deployment, Error, Host, Output, Payload, PreRoute, RouterCache,
-    RouterEvent, RouterRequest, RouterResponse, RoutingContext, SelectStage,
+    Attempt, AttemptError, Deployment, Error, Host, Output, Payload, PreRoute, PreRouted,
+    RouterCache, RouterEvent, RouterRequest, RouterResponse, RoutingContext, SelectStage,
 };
 use serde_json::Value;
 
@@ -144,7 +144,7 @@ pub(crate) enum Ask {
         candidates: Vec<String>,
     },
     /// Pre-routing before a pick resolves `model`: answered with the model group to resolve
-    /// instead, or `None`.
+    /// instead (a string), a custom strategy's deployment document (a mapping), or `None`.
     PreRoute {
         model: String,
         fallback_depth: u32,
@@ -184,8 +184,8 @@ pub(crate) enum Answer {
     AllowFallback(bool),
     /// The candidate ids that remain, pick first.
     Select(Vec<String>),
-    /// The model group to resolve instead, or `None`.
-    PreRoute(Option<String>),
+    /// The model group to resolve instead, a custom strategy's deployment, or `None`.
+    PreRoute(Option<PreRouted>),
     Cache(CacheOutcome),
 }
 
@@ -507,7 +507,7 @@ impl Host for StepHost {
             .collect())
     }
 
-    async fn pre_route(&self, pre: &PreRoute<'_>) -> Result<Option<String>, Error> {
+    async fn pre_route(&self, pre: &PreRoute<'_>) -> Result<Option<PreRouted>, Error> {
         let question = Ask::PreRoute {
             model: pre.name.to_owned(),
             fallback_depth: pre.fallback_depth,

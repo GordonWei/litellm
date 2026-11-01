@@ -582,7 +582,6 @@ def unsupported_arguments(config: RouterConfig) -> frozenset[str]:
         for name, value in config.arguments.items()
         if name not in _SERVED_ARGUMENTS and value not in (None, _UNSET_DEFAULTS.get(name))
     )
-    strategy: Final = normalize_strategy(config.get("routing_strategy")) or "simple-shuffle"
     # `simple_shuffle` raises on a non-numeric weight when it picks; only the Python core keeps that.
     odd_weight: Final = any(
         (params := as_str_mapping((as_str_mapping(deployment) or {}).get("litellm_params"))) is not None
@@ -590,12 +589,7 @@ def unsupported_arguments(config: RouterConfig) -> frozenset[str]:
         and (isinstance(params.get("weight"), bool) or not isinstance(params.get("weight"), int | float))
         for deployment in _as_list(config.get("model_list"))
     )
-    return (
-        unserved
-        # lar1 routes through a custom strategy (`apply_lar1_routing_strategy`), not served yet.
-        | ({"routing_strategy"} if strategy == "lar1" else frozenset[str]())
-        | ({"model_list"} if odd_weight else frozenset[str]())
-    )
+    return unserved | ({"model_list"} if odd_weight else frozenset[str]())
 
 
 def _team_id(request: Mapping[str, object]) -> str | None:
@@ -777,11 +771,18 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         )
         self._hosted.strategies = strategies
         self._prerouter: Final = PreRouter(strategies, self._hosted, host, ctx, self._cache)
+        # `register_plugin`: a custom strategy that replaces every pick (the host answers the
+        # Rust core's pre_route step with its deployment).
+        self._custom_strategy: CustomRoutingStrategyBase | None = None
         self._hosted.build(_as_list(config.get("model_list")) if config.get("model_list") is not None else None)
         self._hosted.set_routing_groups(resolved.routing_groups)
         self._handle: RouterCoreHandle = self._new_handle(list(self._hosted._core_model_list))  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
         if resolved.enable_mid_stream_fallback_continuation:
             register_continuation_prefill_check(host)
+        if resolved.routing_strategy == "lar1":
+            from litellm.router_strategy.lar1_routing import apply_lar1_routing_strategy
+
+            apply_lar1_routing_strategy(ctx, resolved.routing_strategy_args)  # pyright: ignore[reportArgumentType]  # the core's RoutingContext
 
     @property
     def _registry_state(self) -> HostRegistry:
@@ -935,13 +936,17 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         raise RustCoreUnsupported("observe() is not served by the Rust router core yet", name="observe", obj=self)
 
     def register_plugin(self, plugin: "CustomRoutingStrategyBase") -> None:
-        # Plugins will run through the host's select step; until then a plugin is refused, never
-        # silently served by another core.
-        raise RustCoreUnsupported(
-            f"register_plugin({type(plugin).__name__}) is not served by the Rust router core yet",
-            name="register_plugin",
-            obj=self,
+        """``_core_set_custom_routing_strategy``: ``plugin`` picks every deployment from now on, until
+        the routing strategy changes."""
+        self._custom_strategy = plugin
+
+    def set_custom_routing_strategy(self, CustomRoutingStrategy: "CustomRoutingStrategyBase") -> None:
+        from litellm.router_deprecated import (
+            _note,  # pyright: ignore[reportPrivateUsage]  # the deprecated alias notes its use like Python's
         )
+
+        _note("set_custom_routing_strategy", "register_plugin(strategy)")
+        self.register_plugin(CustomRoutingStrategy)
 
     def retire(self) -> None:
         self._retired = True
@@ -1000,6 +1005,8 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         """``_core_update_settings``: a changed strategy re-inits the selectors with the args passed
         alongside it (or none); changed args alone rebuild the default selector."""
         if "routing_strategy" in values and resolved.routing_strategy != previous.routing_strategy:
+            # `routing_strategy_init` drops a custom strategy.
+            self._custom_strategy = None
             self._selectors.init_default(
                 resolved.routing_strategy, as_str_mapping(values.get("routing_strategy_args")) or {}
             )
@@ -1007,6 +1014,11 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         elif "routing_groups" in values:
             self._selectors.init_groups(_group_selectors(resolved.routing_groups))
         elif "routing_strategy_args" in values and resolved.routing_strategy_args != previous.routing_strategy_args:
+            if resolved.routing_strategy == "lar1":
+                from litellm.router_strategy.lar1_routing import apply_lar1_routing_strategy
+
+                apply_lar1_routing_strategy(RoutingContext(self), resolved.routing_strategy_args)  # pyright: ignore[reportArgumentType]  # the core's RoutingContext
+                return
             self._selectors.rebuild_default(resolved.routing_strategy_args)
 
     def upsert_deployment(self, deployment: Deployment) -> Deployment | None:
@@ -1214,8 +1226,8 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         fields: Final = {
             **self._routing_fields(prepared),
             **pinned_video_deployment(plan, request),
-            # The sync path never runs pre-routing.
-            **({} if plan.sync else {"pre_routes": True}),
+            # The sync path never runs pre-routing; a custom strategy picks on both.
+            **({} if plan.sync and self._custom_strategy is None else {"pre_routes": True}),
             **(overrides or {}),
         }
         return self._handle.start(plan.endpoint, _document({"model": model, **fields})), prepared
@@ -1318,6 +1330,8 @@ class RustCore(_SettingsSource, RustRegistryMembers):
                     outcome = self._answer_cache_sync(step)
                 case "select":
                     outcome = driver.select_sync(step)
+                case "pre_route":
+                    outcome = self._custom_pick_sync(step, prepared)
                 case "done" | "failed":
                     return driver, step
                 case other:
@@ -1426,9 +1440,22 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         request: Mapping[str, object],
         messages: object = _NO_INPUT,
         input: object = _NO_INPUT,
-    ) -> str | None:
+        specific_deployment: object = _NO_INPUT,
+    ) -> object:
         """The host's pre-routing of one pick (router_rust_prerouting): the model group to resolve
-        instead of the step's ``model``, or ``None``."""
+        instead of the step's ``model``, a custom strategy's deployment, or ``None``."""
+        custom: Final = self._custom_strategy
+        if custom is not None:
+            picked: Final[object] = await custom.async_get_available_deployment(  # pyright: ignore[reportUnknownMemberType]  # the strategy's untyped pick
+                model=str(step.get("model")),
+                messages=request.get("messages") if messages is _NO_INPUT else messages,  # pyright: ignore[reportArgumentType]  # the request's messages, as given
+                input=request.get("input") if input is _NO_INPUT else input,  # pyright: ignore[reportArgumentType]  # the request's input, as given
+                specific_deployment=request.get("specific_deployment")
+                if specific_deployment is _NO_INPUT
+                else specific_deployment,  # pyright: ignore[reportArgumentType]  # same
+                request_kwargs=request,  # pyright: ignore[reportArgumentType]  # the request kwargs, as given
+            )
+            return _custom_pick(picked)
         if not isinstance(request, dict):
             return None
         depth: Final = step.get("fallback_depth")
@@ -1446,6 +1473,29 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             match_any=r.tag_filtering_match_any,
             public_router=public if public is not None else self,
         )
+
+    def _custom_pick_sync(
+        self,
+        step: Mapping[str, object],
+        request: Mapping[str, object],
+        messages: object = _NO_INPUT,
+        input: object = _NO_INPUT,
+        specific_deployment: object = _NO_INPUT,
+    ) -> object:
+        """A custom strategy's sync pick (``get_available_deployment``); without one, no pre-routing."""
+        custom: Final = self._custom_strategy
+        if custom is None:
+            return None
+        picked: Final[object] = custom.get_available_deployment(  # pyright: ignore[reportUnknownMemberType]  # the strategy's untyped pick
+            model=str(step.get("model")),
+            messages=request.get("messages") if messages is _NO_INPUT else messages,  # pyright: ignore[reportArgumentType]  # see _pre_route
+            input=request.get("input") if input is _NO_INPUT else input,  # pyright: ignore[reportArgumentType]  # same
+            specific_deployment=request.get("specific_deployment")
+            if specific_deployment is _NO_INPUT
+            else specific_deployment,  # pyright: ignore[reportArgumentType]  # same
+            request_kwargs=request,  # pyright: ignore[reportArgumentType]  # same
+        )
+        return _custom_pick(picked)
 
     # -- select steps ----------------------------------------------------------------------------
 
@@ -1734,8 +1784,9 @@ class _Selection:
         fields: Final = {**core._routing_fields(request), **_narrowing_fields(request, kind)}  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
         if specific_deployment:
             fields["specific_deployment"] = True
-        if kind == "pick":
+        if kind == "pick" or (kind == "sync_pick" and core._custom_strategy is not None):  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
             fields["pre_routes"] = True
+        self._specific_deployment: Final = specific_deployment
         if kind == "pass_through":
             fields["pass_through"] = "listed"
         elif kind == "async_pass_through":
@@ -1780,7 +1831,9 @@ class _Selection:
                 case "select":
                     outcome = await core._answer_select(step, self._request, self._messages, self._input)  # pyright: ignore[reportPrivateUsage]  # see above
                 case "pre_route":
-                    outcome = await core._pre_route(step, self._request, self._messages, self._input)  # pyright: ignore[reportPrivateUsage]  # see above
+                    outcome = await core._pre_route(  # pyright: ignore[reportPrivateUsage]  # see above
+                        step, self._request, self._messages, self._input, self._specific_deployment
+                    )
                 case "done":
                     return self._done(step)
                 case "failed":
@@ -1798,12 +1851,24 @@ class _Selection:
                     outcome = core._answer_cache_sync(step)  # pyright: ignore[reportPrivateUsage]  # see above
                 case "select":
                     outcome = core._answer_select_sync(step, self._request, self._messages, self._input)  # pyright: ignore[reportPrivateUsage]  # see above
+                case "pre_route":
+                    outcome = core._custom_pick_sync(  # pyright: ignore[reportPrivateUsage]  # see above
+                        step, self._request, self._messages, self._input, self._specific_deployment
+                    )
                 case "done":
                     return self._done(step)
                 case "failed":
                     raise self._failed(step)
                 case other:
                     raise RuntimeError(f"router-core returned an unknown step {other!r}")
+
+
+def _custom_pick(picked: object) -> Mapping[str, object]:
+    """A custom strategy's answer as the deployment document the Rust core serves."""
+    document: Final = as_str_mapping(picked)
+    if document is None:
+        raise TypeError(f"the custom routing strategy returned {type(picked).__name__}, not a deployment")
+    return _document(document)
 
 
 def _narrowing_fields(request: dict[str, object], kind: str) -> Mapping[str, object]:  # mutable-ok: popped

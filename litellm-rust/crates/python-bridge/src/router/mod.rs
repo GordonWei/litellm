@@ -15,7 +15,8 @@ use std::{
 use litellm_error::Report;
 use litellm_host_python::{from_py_argument, json_loads, to_py};
 use litellm_router_core::{
-    AttemptError, Error, FailureKind, Op, Outcome, Router, RouterEvent,
+    AttemptError, Deployment, DeploymentSpec, Error, FailureKind, Op, Outcome, PreRouted, Router,
+    RouterEvent,
     health::{UsageMetric, current_minute, usage_key},
     registry::{DeploymentFilter, ResolveScope},
 };
@@ -383,18 +384,28 @@ fn answer(ask: &Ask, outcome: Option<Bound<'_, PyAny>>) -> PyResult<Answer> {
             outcome.ok_or_else(missing)?.extract()?,
         )),
         Ask::Select { .. } => Ok(Answer::Select(outcome.ok_or_else(missing)?.extract()?)),
-        Ask::PreRoute { .. } => Ok(Answer::PreRoute(
-            outcome
-                .filter(|outcome| !outcome.is_none())
-                .map(|outcome| outcome.extract())
-                .transpose()?,
-        )),
+        Ask::PreRoute { .. } => pre_route_outcome(outcome).map(Answer::PreRoute),
         Ask::Attempt { .. } => {
             let outcome = outcome.ok_or_else(missing)?;
             attempt_outcome(outcome.cast::<PyDict>()?).map(Answer::Attempt)
         }
         Ask::Cache { op, .. } => cache_outcome(*op, outcome).map(Answer::Cache),
     }
+}
+
+/// A pre-route answer: `None`, a model group name, or a custom strategy's deployment document.
+fn pre_route_outcome(outcome: Option<Bound<'_, PyAny>>) -> PyResult<Option<PreRouted>> {
+    let Some(outcome) = outcome.filter(|outcome| !outcome.is_none()) else {
+        return Ok(None);
+    };
+    if let Ok(model) = outcome.cast::<PyString>() {
+        return Ok(Some(PreRouted::Model(model.to_str()?.to_owned())));
+    }
+    let spec: DeploymentSpec = serde_json::from_value(document(&outcome)?)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let deployment = Deployment::from_spec(spec)
+        .map_err(|error| PyValueError::new_err(Report::new(&error).to_string()))?;
+    Ok(Some(PreRouted::Deployment(Arc::new(deployment))))
 }
 
 /// `get`: the JSON value or None; `batch_get`: a list of JSON values or None, one per key;

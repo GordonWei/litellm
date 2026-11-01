@@ -4,8 +4,15 @@
 //! session binding, live host-side; the core asks once per pick, before resolution, and resolves
 //! the name the host answers. The attempt still serves the requested name (its `model_group`):
 //! only the deployments come from the routed group.
+//!
+//! A custom routing strategy (`register_plugin`, `set_custom_routing_strategy`, lar1) replaces the
+//! whole pick (`_core_async_get_available_deployment` and `get_available_deployment`): the host
+//! answers the same step with the deployment document the strategy returned, which may name a
+//! deployment the registry does not hold, and the core serves that deployment as is.
 
-use crate::{Core, config::Op, error::Error, host::RouterRequest};
+use std::sync::Arc;
+
+use crate::{Core, config::Op, error::Error, host::RouterRequest, registry::Deployment};
 
 /// What the host's pre-routing step sees.
 #[derive(Clone, Copy, Debug)]
@@ -21,17 +28,26 @@ pub struct PreRoute<'a> {
     pub retry: u32,
 }
 
+/// The host's answer to a pre-routing step.
+#[derive(Clone, Debug)]
+pub enum PreRouted {
+    /// Resolve this model group instead of the requested name.
+    Model(String),
+    /// A custom strategy's pick: serve this deployment, without resolving or filtering.
+    Deployment(Arc<Deployment>),
+}
+
 impl Core {
-    /// The name a pick of `ask.name` resolves: the host's pre-routed group, else the name itself.
-    /// Only the async picks pre-route (`request.pre_routes`); the sync path never does.
-    pub(crate) async fn pre_routed(&self, ask: PreRoute<'_>) -> Result<String, Error> {
+    /// What a pick of `ask.name` serves: the host's pre-routed group or custom pick, else the
+    /// name itself. Only picks that ask for it pre-route (`request.pre_routes`).
+    pub(crate) async fn pre_routed(&self, ask: PreRoute<'_>) -> Result<PreRouted, Error> {
         if !ask.request.pre_routes {
-            return Ok(ask.name.to_owned());
+            return Ok(PreRouted::Model(ask.name.to_owned()));
         }
         Ok(self
             .host
             .pre_route(&ask)
             .await?
-            .unwrap_or_else(|| ask.name.to_owned()))
+            .unwrap_or_else(|| PreRouted::Model(ask.name.to_owned())))
     }
 }
