@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Final, Literal
+from typing import Final, Literal, TypeAlias
 
 from litellm._service_logger import ServiceLogging
 from litellm.types.services import ServiceTypes
 
-Failure = Literal["timeout", "transport", "server", "decode", "breaker_open"]
-BreakerState = Literal["closed", "open", "half_open"]
+Failure: TypeAlias = Literal["timeout", "transport", "server", "decode", "breaker_open"]
+BreakerState: TypeAlias = Literal["closed", "open", "half_open"]
 
 _HEALTH_FAILURE_CLASSES: Final = {"timeout": "timeout", "transport": "connectivity"}
 

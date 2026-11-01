@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use litellm_circuit_breaker::{Breaker, Config as BreakerConfig};
-use litellm_config::{Expected, RedisAuth, RedisEndpoint, RedisError, RedisTls, ResolvedRedis, parse_seconds};
+use litellm_config::{
+    Expected, RedisAuth, RedisEndpoint, RedisError, RedisTls, ResolvedRedis, parse_seconds,
+};
 use litellm_core_utils::settings::Lookup;
 use litellm_redis_client::{
     ClusterEndpoint, ClusterNode, Credentials, CredentialsProvider, DEFAULT_TIMEOUT, Endpoint,

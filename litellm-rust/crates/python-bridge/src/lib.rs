@@ -118,6 +118,8 @@ mod tests {
                 "aresponses",
                 "ResponsesWebSocketConnection",
                 "NativeDiagnosticProcessor",
+                "NativeRouterCooldowns",
+                "NativeRouterUsage",
                 "NativeClickHouseSpendConfig",
                 "NativeClickHouseSpendStorage",
                 "NativeDatabase",

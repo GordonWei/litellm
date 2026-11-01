@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use litellm_config::{
-    CacheSettings, Config, RedisSettings, ResolvedRedis, SecretSnapshot,
-    Value, environment_has_target,
+    CacheSettings, Config, RedisSettings, ResolvedRedis, SecretSnapshot, Value,
+    environment_has_target,
 };
 use litellm_core_utils::settings::Lookup;
 use litellm_redis_client::{RedisClient, RedisEvents};

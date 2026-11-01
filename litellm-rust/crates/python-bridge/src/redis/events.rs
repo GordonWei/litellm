@@ -51,9 +51,10 @@ impl ServiceLoggingEvents {
         };
         runtime.spawn(async move {
             let reported = attach_blocking(context, move |py| match args {
-                ReportArgs::Call(call_type, duration, failure, caller) => {
-                    record.bind(py).call1((call_type, duration.as_secs_f64(), failure, caller)).map(drop)
-                }
+                ReportArgs::Call(call_type, duration, failure, caller) => record
+                    .bind(py)
+                    .call1((call_type, duration.as_secs_f64(), failure, caller))
+                    .map(drop),
                 ReportArgs::Breaker(state) => record.bind(py).call1((state,)).map(drop),
             })
             .await
@@ -102,12 +103,21 @@ impl RedisEvents for ServiceLoggingEvents {
         let caller = CALL.try_with(Clone::clone).ok();
         let (context, call_type, caller) = match caller {
             Some(call) => (call.context, call.call_type, call.caller),
-            None => (self.context.clone(), operation_call_type(event.operation), None),
+            None => (
+                self.context.clone(),
+                operation_call_type(event.operation),
+                None,
+            ),
         };
         self.report(
             context,
             self.record_call.clone(),
-            ReportArgs::Call(call_type, event.duration, failure_label(event.outcome), caller),
+            ReportArgs::Call(
+                call_type,
+                event.duration,
+                failure_label(event.outcome),
+                caller,
+            ),
         );
     }
 
@@ -145,8 +155,13 @@ def record_redis_breaker(state):
         Python::initialize();
         Python::attach(|py| {
             let name = std::ffi::CString::new(format!("redis_events_recorder_{name}")).unwrap();
-            let module = PyModule::from_code(py, &std::ffi::CString::new(RECORDER).unwrap(), &name, &name).unwrap();
-            (ServiceLoggingEvents::from_module(py, &module).unwrap(), module.unbind())
+            let module =
+                PyModule::from_code(py, &std::ffi::CString::new(RECORDER).unwrap(), &name, &name)
+                    .unwrap();
+            (
+                ServiceLoggingEvents::from_module(py, &module).unwrap(),
+                module.unbind(),
+            )
         })
     }
 
@@ -205,9 +220,16 @@ def record_redis_breaker(state):
     ) {
         let (events, namespace) = recorder(expected);
 
-        events.breaker(&litellm_circuit_breaker::Transition { from: litellm_circuit_breaker::State::HalfOpen, to, generation: 1 });
+        events.breaker(&litellm_circuit_breaker::Transition {
+            from: litellm_circuit_breaker::State::HalfOpen,
+            to,
+            generation: 1,
+        });
 
-        assert_eq!(seen(&namespace, 1).await, format!("[('breaker', '{expected}')]"));
+        assert_eq!(
+            seen(&namespace, 1).await,
+            format!("[('breaker', '{expected}')]")
+        );
     }
 
     #[rstest]
@@ -221,6 +243,9 @@ def record_redis_breaker(state):
             outcome: Outcome::Succeeded,
         });
 
-        assert_eq!(seen(&namespace, 1).await, "[('pipeline', 0.005, None, None, None)]");
+        assert_eq!(
+            seen(&namespace, 1).await,
+            "[('pipeline', 0.005, None, None, None)]"
+        );
     }
 }
