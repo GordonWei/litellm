@@ -1203,8 +1203,9 @@ class RustCore(_SettingsSource, RustRetries, RustFallbacks, RustHealthCallbacks)
                     self._host.sleep_sync(float(str(step["seconds"])))
                     outcome = None
                 case "allow_fallback":
-                    # The fallback checks are awaited on the async path only, as in the Python router.
-                    outcome = True
+                    from litellm.litellm_core_utils import asyncify
+
+                    outcome = asyncify.run_async_function(driver.allow_fallback, str(step["target"]))  # pyright: ignore[reportUnknownMemberType]  # the untyped sync bridge
                 case "cache":
                     outcome = self._answer_cache_sync(step)
                 case "select":
@@ -1490,6 +1491,8 @@ class _Driver:
             if event.get("kind") == "fallback_done":
                 level = event.get("level")
                 at = level if isinstance(level, int) else 0
+                if event.get("succeeded") is not True:
+                    self._hint_nested_failure(self._level_errors.get(at + 1), str(event.get("to")))
                 self.outcomes.done(
                     event,
                     self._level_errors.get(at, self._last_error),
@@ -1565,11 +1568,17 @@ class _Driver:
         """`_is_fallback_target_authorized`, then `_is_fallback_target_within_budget`."""
         if target == self._request.get("model"):
             return True
+        from litellm.types.router import FallbackSkipReason
+
         ctx: Final = RoutingContext(self._core)  # pyright: ignore[reportArgumentType]  # the checks read registry() and settings()
         request: Final = dict(self._request)
         if not await ctx.fallback_access_allowed(model=target, request_kwargs=request):
+            self._walk.targets().record_skip(target, FallbackSkipReason.NOT_AUTHORIZED)
             return False
-        return await ctx.fallback_budget_allowed(model=target, request_kwargs=request)
+        if not await ctx.fallback_budget_allowed(model=target, request_kwargs=request):
+            self._walk.targets().record_skip(target, FallbackSkipReason.OVER_BUDGET)
+            return False
+        return True
 
     def finish(self, step: Mapping[str, object]) -> object:
         """The response with the router's headers: the deployment id, the model group it was
@@ -1613,6 +1622,43 @@ class _Driver:
             primary.message += self._explanation(primary, model)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above
         return primary
 
+    def _hint_nested_failure(self, error: BaseException | None, model: str) -> None:
+        """A fallback level that fails on a context-window or content-policy error with no list
+        of its own appends the hint to set one, as every level of the Python walk does."""
+        from litellm.router_utils.fallback_event_handlers import check_non_standard_fallback_format
+
+        if (
+            error is None
+            or not hasattr(error, "message")
+            or not self._core._host.dynamic().expose_router_debug_in_errors  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+        ):
+            return
+        resolved: Final = self._core._resolved  # pyright: ignore[reportPrivateUsage]  # see above
+        fallbacks: Final = self._request.get("fallbacks", resolved.fallbacks)
+        if check_non_standard_fallback_format(fallbacks=_as_list(fallbacks)):
+            return
+        hint: Final = self._kind_hint(error, model, fallbacks)
+        if hint:
+            error.message += hint  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above  # rebind-ok: the router appends to the error it raises
+
+    def _kind_hint(self, error: BaseException, model: str, fallbacks: object) -> str:
+        """The hint a context-window or content-policy error gets when its own list is unset."""
+        import litellm.exceptions as litellm_exceptions
+
+        resolved: Final = self._core._resolved  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+        if isinstance(error, litellm_exceptions.ContextWindowExceededError):
+            if self._request.get("context_window_fallbacks", resolved.context_window_fallbacks) is not None:
+                return ""
+            return (
+                f"\nmodel={model}. context_window_fallbacks=None. fallbacks={fallbacks}.\n\n"
+                "Set 'context_window_fallback' - https://docs.litellm.ai/docs/routing#fallbacks"
+            )
+        if isinstance(error, litellm_exceptions.ContentPolicyViolationError):
+            if self._request.get("content_policy_fallbacks", resolved.content_policy_fallbacks) is not None:
+                return ""
+            return "\n" + format_content_policy_fallback_hint(model, None, fallbacks)  # pyright: ignore[reportArgumentType]  # the list as configured
+        return ""
+
     def _explanation(self, primary: BaseException, model: str) -> str:
         """What ``_async_function_with_fallbacks_common_utils`` appends to the error it re-raises
         under ``expose_router_debug_in_errors``, from the resolved settings and what the call did."""
@@ -1637,7 +1683,7 @@ class _Driver:
                 if rejected is not None
                 else self._fallback_detail(chain_list)
             )
-            return format_fallback_outcome_message(model, chain_list, detail)
+            return format_fallback_outcome_message(model, chain_list, detail, skipped=self._walk.targets().skipped)
         context_window: Final = isinstance(primary, litellm_exceptions.ContextWindowExceededError)
         content_policy: Final = isinstance(primary, litellm_exceptions.ContentPolicyViolationError)
         # The error kind's own list when it is set, else the generic one with a hint to set it.
@@ -1664,7 +1710,9 @@ class _Driver:
             return hint + format_no_fallback_group_message(lookup, entries)  # pyright: ignore[reportArgumentType]  # the fallbacks config shape
         if chain is None:
             return hint + format_fallback_outcome_message(model, None, "")
-        return hint + format_fallback_outcome_message(model, chain, self._fallback_detail(chain))
+        return hint + format_fallback_outcome_message(
+            model, chain, self._fallback_detail(chain), skipped=self._walk.targets().skipped
+        )
 
     def _fallback_detail(self, chain: Sequence[object]) -> str:
         """The error the fallback walk ended on: the first fallback level's last error, or the

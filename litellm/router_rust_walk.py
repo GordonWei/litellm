@@ -104,16 +104,21 @@ class WalkMetadata:
         found: Final = self._scopes.get(value) if isinstance(value, int) else None
         return found if found is not None else self._scopes[0]
 
-    def hop(self, event: Mapping[str, object]) -> None:
-        """A ``fallback`` event: the new level copies its parent's metadata and kwargs."""
+    def targets(self) -> "AttemptedFallbackTargets":
+        """The walk's ``attempted_targets``: the targets tried and the ones skipped, and why."""
         from litellm.router_utils.fallback_event_handlers import AttemptedFallbackTargets
 
-        parent: Final = self._scope(event.get("parent"))
         if self._attempted is None:
             self._attempted = AttemptedFallbackTargets()
+        return self._attempted
+
+    def hop(self, event: Mapping[str, object]) -> None:
+        """A ``fallback`` event: the new level copies its parent's metadata and kwargs."""
+        parent: Final = self._scope(event.get("parent"))
+        attempted: Final = self.targets()
         for key in (event.get("from"), event.get("to")):
             if isinstance(key, str):
-                self._attempted.record(key)
+                attempted.record(key)
         metadata: Final = dict(parent.metadata)
         original: Final = metadata.pop("original_model_group", self._request.get("model"))
         metadata.pop("model_group", None)
@@ -125,7 +130,7 @@ class WalkMetadata:
             **parent.kwargs,
             "fallback_depth": event.get("depth"),
             "max_fallbacks": event.get("max_fallbacks"),
-            "attempted_targets": self._attempted,
+            "attempted_targets": attempted,
         }
         if self._request.get("include_fallback_errors") is True:
             kwargs["include_fallback_errors"] = True
