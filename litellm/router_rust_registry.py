@@ -27,6 +27,7 @@ from pydantic import TypeAdapter
 
 from litellm import exceptions as litellm_exceptions
 from litellm import get_secret_str
+from litellm._internal_context import service_target
 from litellm._logging import verbose_router_logger
 from litellm.caching.dual_cache import DualCache
 from litellm.caching.in_memory_cache import InMemoryCache
@@ -103,6 +104,8 @@ _PTUMemo: TypeAlias = tuple[
     frozenset[str],
     dict[tuple[str, str], "PTUTeamCeiling | None"],
 ]
+# The SDK-client reads: clients are process-local, so this only names a Redis span on a miss.
+ROUTER_CLIENTS_TARGET: Final = "router_clients"
 _MODEL_INFO_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 _LITELLM_PARAMS_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 _CACHE_PRICING_FIELDS: Final = (
@@ -1472,11 +1475,12 @@ class HostRegistry(HostModelInfo):
         model_id: Final = _model_info_of(deployment).get("id")
         span: Final = get_parent_otel_span_from_kwargs(dict(kwargs))
         stream: Final = "_stream" if kwargs.get("stream") is True else ""
-        if client_type == "async":
-            return self._core_cache.get_cache(
-                key=f"{model_id}{stream}_async_client", local_only=True, parent_otel_span=span
-            )  # pyright: ignore[reportUnknownMemberType]  # DualCache's reads are untyped
-        return self._core_cache.get_cache(key=f"{model_id}{stream}_client", parent_otel_span=span)  # pyright: ignore[reportUnknownMemberType]  # see above
+        with service_target(ROUTER_CLIENTS_TARGET):
+            if client_type == "async":
+                return self._core_cache.get_cache(
+                    key=f"{model_id}{stream}_async_client", local_only=True, parent_otel_span=span
+                )  # pyright: ignore[reportUnknownMemberType]  # DualCache's reads are untyped
+            return self._core_cache.get_cache(key=f"{model_id}{stream}_client", parent_otel_span=span)  # pyright: ignore[reportUnknownMemberType]  # see above
 
     def _core_get_search_tool_support(self, model_name: str, team_id: str | None = None) -> tuple[bool | None, ...]:
         """Per routable deployment: its ``supports_search_tool`` when a bool, else True when its route
