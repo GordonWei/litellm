@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Final
 from urllib.parse import urlsplit
 
-import redis
 import redis.asyncio as async_redis
 
 from litellm._redis import (
@@ -334,7 +333,6 @@ def resolve(kwargs: Mapping[str, object], values: Mapping[str, str]) -> dict[str
 
 def derive() -> dict[str, object]:
     return {
-        "redis_py": redis.__version__,
         "cases": [
             {"name": name, "kwargs": kwargs, "environment": values, "python": resolve(kwargs, values)}
             for name, kwargs, values in CASES

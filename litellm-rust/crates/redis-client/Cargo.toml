@@ -24,4 +24,5 @@ tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 litellm-redis-testing.workspace = true
+rustls.workspace = true
 rstest.workspace = true

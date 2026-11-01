@@ -32,6 +32,9 @@ async fn ping_over_tls(
     check_hostname: bool,
     client_certificate: bool,
 ) -> Result<(), litellm_redis_client::Error> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     let server = litellm_redis_testing::RedisTlsServer::start(require_client_certificate)
         .await
         .unwrap();
