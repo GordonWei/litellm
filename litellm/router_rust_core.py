@@ -54,17 +54,21 @@ from litellm.router_api import (
     RoutingContext,
     RoutingObservers,
 )
-from litellm.router_attempt import (
-    attempt_kwargs,
-    for_requested_model,
-    metadata_field,
-    prepare_call,
-    request_from_call,
-    stamp_attempt_error,
-)
+from litellm.router_attempt import for_requested_model, request_from_call
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_rust_endpoints import (
+    AttemptCall,
+    Plan,
+    RustEndpoints,
+    attempt_call,
+    pinned_video_deployment,
+    plan_for,
+    stamp_error,
+)
+from litellm.router_rust_shaping import Shaping
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
+from litellm.router_utils.router_callbacks.track_deployment_metrics import find_deployment_metadata
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
 from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError
 from litellm.types.utils import LlmProviders
@@ -93,16 +97,6 @@ RUST_SERVED_OPS: Final[frozenset[str]] = frozenset(
         "amoderation",
     }
 )
-# Sync endpoints, routed the same way with the host's sync endpoint and sync cache.
-SYNC_OPS: Final = MappingProxyType(
-    {
-        "completion": "acompletion",
-        "text_completion": "atext_completion",
-        "embedding": "aembedding",
-        "image_generation": "aimage_generation",
-    }
-)
-
 _FAILURE_KINDS: Final = (
     "RateLimitError",
     "ContextWindowExceededError",
@@ -121,8 +115,6 @@ _FAILURE_KINDS: Final = (
 )
 _DECLINED: Final = frozenset({"MalformedRequestFieldError", "UnsupportedEndpointError"})
 _STEP: Final = TypeAdapter(Mapping[str, object])
-# The litellm function an op's attempt calls, where it differs from the op's name.
-_HOST_ENDPOINTS: Final = MappingProxyType({"aanthropic_messages": "anthropic_messages"})
 _PROVIDERS: Final = tuple(provider.value for provider in LlmProviders)
 _DEFAULT_COOLDOWN_SECONDS: Final = 5.0
 
@@ -799,6 +791,7 @@ class RustCore(_SettingsSource):
         self._version: int = 1
         self._retired: bool = False
         self._settings: RustSettings | None = None
+        self._endpoints: Final = RustEndpoints(self, config)
         self._handle: RouterCoreHandle = self._new_handle(list(_as_list(config.get("model_list"))))
 
     @classmethod
@@ -808,11 +801,21 @@ class RustCore(_SettingsSource):
         extra: Final = unsupported_arguments(config)
         if extra:
             raise RustBridgeDeclined(f"router arguments not served by the Rust core: {sorted(extra)}")
+        RustEndpoints.prepare_host(config, host)
         return cls(config, host, Resolved.of(config, host.dynamic()))
 
     def __getattr__(self, name: str) -> object:
-        # Only reached for members this class does not define: never forwarded anywhere.
+        # Only reached for members this class does not define: the endpoints served through the
+        # host, else refused. Never forwarded anywhere.
+        endpoints: Final[object] = self.__dict__.get("_endpoints")
+        endpoint: Final = endpoints.member(name) if isinstance(endpoints, RustEndpoints) else None
+        if endpoint is not None:
+            return endpoint
         raise RustCoreUnsupported(f"'{name}' is not served by the Rust router core", name=name, obj=self)
+
+    @property
+    def _shaping(self) -> Shaping:
+        return self._endpoints.shaping(self._resolved)
 
     # -- building --------------------------------------------------------------------------------
 
@@ -1037,61 +1040,80 @@ class RustCore(_SettingsSource):
     # -- endpoints -------------------------------------------------------------------------------
 
     async def call(self, op: str, request: Mapping[str, object]) -> object:
-        if op in SYNC_OPS:
-            return self._call_sync(op, request)
-        if op not in RUST_SERVED_OPS:
-            raise RustCoreUnsupported(f"endpoint {op!r} is not served by the Rust router core yet", name=op, obj=self)
-        return await self._drive(op, request)
+        """Run one endpoint with the request's keyword payload, as ``getattr(core, op)(**request)``."""
+        member: Final[object] = getattr(self, op)  # pyright: ignore[reportAny]  # litellm's untyped helpers and request values
+        if not callable(member):
+            raise TypeError(f"{op!r} is not an endpoint")
+        result: Final[object] = member(**request)
+        return await result if inspect.isawaitable(result) else result
 
     async def acompletion(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return await self.call("acompletion", request_from_call("acompletion", args, kwargs))
+        return await self._endpoints.acompletion(request_from_call("acompletion", args, kwargs))
 
     async def atext_completion(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return await self.call("atext_completion", request_from_call("atext_completion", args, kwargs))
+        return await self._endpoints.atext_completion(request_from_call("atext_completion", args, kwargs))
 
     async def aembedding(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return await self.call("aembedding", request_from_call("aembedding", args, kwargs))
+        return await self._drive(plan_for("aembedding"), request_from_call("aembedding", args, kwargs))
 
     async def aresponses(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return await self.call("aresponses", request_from_call("aresponses", args, kwargs))
+        return await self._endpoints.generic(plan_for("aresponses"), request_from_call("aresponses", args, kwargs))
 
     async def aanthropic_messages(self, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return await self.call("aanthropic_messages", kwargs)
+        return await self._endpoints.generic(plan_for("aanthropic_messages"), kwargs)
 
     async def anthropic_messages(self, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
         """The proxy's ``/v1/messages`` route name for ``aanthropic_messages``; async, as in PythonCore."""
-        return await self.call("aanthropic_messages", kwargs)
+        return await self._endpoints.generic(plan_for("anthropic_messages"), kwargs)
 
     async def aimage_generation(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return await self.call("aimage_generation", request_from_call("aimage_generation", args, kwargs))
+        return await self._drive(plan_for("aimage_generation"), request_from_call("aimage_generation", args, kwargs))
 
     async def atranscription(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return await self.call("atranscription", request_from_call("atranscription", args, kwargs))
+        return await self._drive(plan_for("atranscription"), request_from_call("atranscription", args, kwargs))
 
     async def aspeech(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return await self.call("aspeech", request_from_call("aspeech", args, kwargs))
+        request: Final = dict(request_from_call("aspeech", args, kwargs))
+        request.setdefault("voice", None)
+        return await self._drive(plan_for("aspeech"), request)
 
     async def arerank(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return await self.call("arerank", request_from_call("arerank", args, kwargs))
+        # `arerank` sets kwargs["input"] = input: the Python builtin, which reaches the deployment call.
+        request: Final = {**request_from_call("arerank", args, kwargs), "input": input}
+        return await self._drive(plan_for("arerank"), request)
 
     async def amoderation(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return await self.call("amoderation", request_from_call("amoderation", args, kwargs))
+        return await self._endpoints.amoderation(request_from_call("amoderation", args, kwargs))
 
     def completion(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return self._call_sync("completion", request_from_call("completion", args, kwargs))
+        return self._call_sync(plan_for("completion"), request_from_call("completion", args, kwargs))
 
     def text_completion(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return self._call_sync("text_completion", request_from_call("text_completion", args, kwargs))
+        return self._endpoints.text_completion(request_from_call("text_completion", args, kwargs))
 
     def embedding(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return self._call_sync("embedding", request_from_call("embedding", args, kwargs))
+        return self._call_sync(plan_for("embedding"), request_from_call("embedding", args, kwargs))
 
     def image_generation(self, *args: object, **kwargs: object) -> object:  # kwargs-ok: endpoint payload
-        return self._call_sync("image_generation", request_from_call("image_generation", args, kwargs))
+        return self._call_sync(plan_for("image_generation"), request_from_call("image_generation", args, kwargs))
+
+    @property
+    def total_calls(self) -> Mapping[str, int]:
+        return self._endpoints.counters.total_calls
+
+    @property
+    def success_calls(self) -> Mapping[str, int]:
+        return self._endpoints.counters.success_calls
+
+    @property
+    def fail_calls(self) -> Mapping[str, int]:
+        return self._endpoints.counters.fail_calls
 
     # -- driving a call --------------------------------------------------------------------------
 
-    def _start(self, op: str, request: Mapping[str, object]) -> "tuple[RouterCall, Mapping[str, object]]":
+    def _start(
+        self, plan: Plan, request: Mapping[str, object], overrides: Mapping[str, object] | None = None
+    ) -> "tuple[RouterCall, Mapping[str, object]]":
         if self._retired:
             raise RuntimeError("this router core was retired")
         unserved: Final = sorted(
@@ -1101,17 +1123,24 @@ class RustCore(_SettingsSource):
             raise RustCoreUnsupported(f"request keys not served by the Rust router core yet: {unserved}")
         model: Final = request.get("model")
         if not isinstance(model, str):
-            raise TypeError(f"{op}() needs a model name")
-        field: Final = metadata_field(op)
+            raise TypeError(f"{plan.endpoint}() needs a model name")
+        field: Final = plan.prepare_field or "metadata"
         if request.get(field) is not None and not isinstance(request.get(field), Mapping):
             raise TypeError(f"{field} must be a mapping")
-        aliases: Final = self._resolved.model_group_alias
-        prepared: Final = prepare_call(op, request, model if model in aliases else None)
-        return self._handle.start(op, _document({"model": model, **_start_fields(request)})), prepared
+        prepared: Final = self._endpoints.prepare(plan, request, model)
+        fields: Final = {**_start_fields(prepared), **pinned_video_deployment(plan, request), **(overrides or {})}
+        return self._handle.start(plan.endpoint, _document({"model": model, **fields})), prepared
 
-    async def _drive(self, op: str, request: Mapping[str, object]) -> object:
-        call, prepared = self._start(op, request)
-        driver: Final = _Driver(self, op, prepared)
+    async def _drive(
+        self,
+        plan: Plan,
+        request: Mapping[str, object],
+        overrides: Mapping[str, object] | None = None,
+        *,
+        passthrough: "Callable[[Mapping[str, object]], Awaitable[object]] | None" = None,
+    ) -> object:
+        call, prepared = self._start(plan, request, overrides)
+        driver: Final = _Driver(self, plan, prepared)
         outcome: object = None  # rebind-ok: the answer to the last step
         while True:
             step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # Rust validates each outcome against the step it answers
@@ -1130,15 +1159,18 @@ class RustCore(_SettingsSource):
                     outcome = step["candidates"]
                 case "done":
                     return await driver.finish_async(step)
+                case "failed" if passthrough is not None and driver.attempted == 0:
+                    return await passthrough(prepared)
                 case "failed":
                     raise driver.failed(step)
                 case other:
                     raise RuntimeError(f"router-core returned an unknown step {other!r}")
 
-    def _call_sync(self, op: str, request: Mapping[str, object]) -> object:
-        async_op: Final = SYNC_OPS[op]
-        call, prepared = self._start(async_op, request)
-        driver: Final = _Driver(self, op, prepared)
+    def _call_sync(
+        self, plan: Plan, request: Mapping[str, object], overrides: Mapping[str, object] | None = None
+    ) -> object:
+        call, prepared = self._start(plan, request, overrides)
+        driver: Final = _Driver(self, plan, prepared)
         outcome: object = None  # rebind-ok: the answer to the last step
         while True:
             step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # see _drive
@@ -1318,14 +1350,21 @@ class _Driver:
     raised, as the Python router does.
     """
 
-    def __init__(self, core: RustCore, op: str, request: Mapping[str, object]) -> None:
+    def __init__(self, core: RustCore, plan: Plan, request: Mapping[str, object]) -> None:
         self._core: Final = core
-        self._op: Final = op
+        self._plan: Final = plan
+        self._op: Final = plan.endpoint
         self._request: Final = request
         self._last_response: object = None
         self._last_error: BaseException | None = None
         self._level_errors: Final[dict[int, BaseException]] = {}  # mutable-ok: filled as the call runs
         self._served: tuple[str | None, Mapping[str, object]] = (None, MappingProxyType({}))
+        self._attempts: int = 0
+
+    @property
+    def attempted(self) -> int:
+        """How many attempts reached the host."""
+        return self._attempts
 
     def take_events(self, events: object) -> None:
         for raw_event in _as_list(events):
@@ -1340,55 +1379,79 @@ class _Driver:
                 error.max_retries = event.get("max")  # pyright: ignore[reportAttributeAccessIssue]  # Python's router stamps the same attributes
                 error.num_retries = event.get("attempted")  # pyright: ignore[reportAttributeAccessIssue]  # same
 
-    def _kwargs(self, step: Mapping[str, object]) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    def _call(self, step: Mapping[str, object]) -> "tuple[Mapping[str, object], AttemptCall]":
         name: Final = step.get("model")
-        requested: Final = str(name) if name is not None else None
+        requested: Final = str(name) if name is not None else str(self._request.get("model"))
         deployment: Final = for_requested_model(as_str_mapping(step.get("deployment")) or {}, requested)
-        resolved: Final = self._core._resolved  # pyright: ignore[reportPrivateUsage]  # see above
-        group: Final = str(step["model_group"])
-        kwargs: Final = attempt_kwargs(
-            self._op,
+        self._attempts += 1
+        level: Final = step.get("fallback_level")
+        call: Final = attempt_call(
+            self._core,
+            self._plan,
             self._request,
             deployment,
-            model_group=requested if requested is not None and "*" in group else group,
-            default_litellm_params=resolved.default_litellm_params,
-            timeout=resolved.timeout,
+            group=requested,
+            requested=requested,
+            fallback_level=level if isinstance(level, int) else 0,
         )
-        self._served = (requested, kwargs)
-        return deployment, kwargs
+        self._served = (requested, call.served)
+        self._core._endpoints.counters.started(self._plan, call)  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+        return deployment, call
 
     def _failed(
-        self, step: Mapping[str, object], deployment: Mapping[str, object], error: BaseException
+        self,
+        step: Mapping[str, object],
+        deployment: Mapping[str, object],
+        call: "AttemptCall | None",
+        error: BaseException,
     ) -> Mapping[str, object]:
-        stamp_attempt_error(error, deployment)
+        served: Final = call.served if call is not None else {}  # pyright: ignore[reportUnknownVariableType]  # litellm's untyped helpers and request values
+        stamp_error(self._plan, error, deployment, served)  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
+        self._core._endpoints.attempt_failed(self._plan, error, deployment, call, str(step.get("model")))  # pyright: ignore[reportPrivateUsage]  # see above
         self._last_error = error
         level: Final = step.get("fallback_level")
         self._level_errors[level if isinstance(level, int) else 0] = error
         return attempt_failure(error)
 
-    async def attempt(self, step: Mapping[str, object]) -> Mapping[str, object]:
-        deployment, kwargs = self._kwargs(step)
-        try:
-            host: Final = self._core._host  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
-            endpoint: Final = host.invoke(_HOST_ENDPOINTS.get(self._op, self._op))
-            # Every op the Rust core serves names an async endpoint, so the call returns an awaitable.
-            pending: Final[object] = endpoint(**kwargs)
-            response: Final[object] = await pending if inspect.isawaitable(pending) else pending
-        except Exception as error:  # noqa: BLE001  # every attempt failure is classified and handed to the Rust call loop
-            return self._failed(step, deployment, error)
+    def _succeeded(self, call: "AttemptCall", response: object) -> Mapping[str, object]:
+        self._core._endpoints.counters.succeeded(self._plan, call)  # pyright: ignore[reportPrivateUsage]  # see above
         self._last_response = response
         return {"ok": True, "total_tokens": total_tokens(response)}
 
-    def attempt_sync(self, step: Mapping[str, object]) -> Mapping[str, object]:
-        deployment, kwargs = self._kwargs(step)
+    async def attempt(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        deployment: Mapping[str, object] = as_str_mapping(step.get("deployment")) or {}  # rebind-ok: the picked one
+        call: AttemptCall | None = None  # rebind-ok: built inside the try
         try:
-            response: Final = self._core._host.invoke(self._op)(**kwargs)  # pyright: ignore[reportPrivateUsage]  # a sync endpoint
+            deployment, call = self._call(step)  # rebind-ok: rebound as the Python router rebinds it
+            host: Final = self._core._host  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+            pending: Final[object] = (
+                self._core._endpoints.create_file_everywhere(  # pyright: ignore[reportPrivateUsage]  # see above
+                    call.kwargs, call.model_name, self._request.get("specific_deployment")
+                )
+                if self._plan.kind == "create_file"
+                else host.invoke(call.host_op)(**call.kwargs)
+            )
+            # The generic helper awaits whatever the handler returns, as the Python router does.
+            awaited: Final = self._plan.kind == "generic" or inspect.isawaitable(pending)
+            response: Final[object] = await pending if awaited else pending  # pyright: ignore[reportGeneralTypeIssues, reportUnknownVariableType]  # see above
+            self._core._endpoints.check_response(self._plan, response, call)  # pyright: ignore[reportPrivateUsage, reportUnknownArgumentType]  # see above
+        except Exception as error:  # noqa: BLE001  # every attempt failure is classified and handed to the Rust call loop
+            return self._failed(step, deployment, call, error)
+        return self._succeeded(call, response)  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
+
+    def attempt_sync(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        deployment: Mapping[str, object] = as_str_mapping(step.get("deployment")) or {}  # rebind-ok: see attempt
+        call: AttemptCall | None = None  # rebind-ok: see attempt
+        try:
+            deployment, call = self._call(step)  # rebind-ok: rebound as the Python router rebinds it
+            self._core._endpoints.sync_pre_call_checks(self._plan, deployment, self._request)  # pyright: ignore[reportPrivateUsage]  # see above
+            response: Final = self._core._host.invoke(call.host_op)(**call.kwargs)  # pyright: ignore[reportPrivateUsage]  # a sync endpoint
+            self._core._endpoints.check_response(self._plan, response, call)  # pyright: ignore[reportPrivateUsage]  # see above
         except Exception as error:  # noqa: BLE001  # see attempt
-            return self._failed(step, deployment, error)
+            return self._failed(step, deployment, call, error)
         if inspect.isawaitable(response):
-            raise TypeError(f"the host's {self._op} endpoint is not synchronous")
-        self._last_response = response
-        return {"ok": True, "total_tokens": total_tokens(response)}
+            raise TypeError(f"the host's {call.host_op} endpoint is not synchronous")
+        return self._succeeded(call, response)
 
     async def allow_fallback(self, target: str) -> bool:
         """`_is_fallback_target_authorized`, then `_is_fallback_target_within_budget`."""
@@ -1403,12 +1466,14 @@ class _Driver:
     def finish(self, step: Mapping[str, object]) -> object:
         """The response with the router's headers: the deployment id, the model group it was
         served as, and the retry and fallback counts (``set_response_headers``)."""
+        if not self._plan.sets_headers:
+            return self._last_response
         response: object = prepare_response_for_header_attachment(self._last_response)  # rebind-ok: gains headers
         if response is None:
             return self._last_response
         name, kwargs = self._served
         additional: Final = ensure_response_additional_headers(response)
-        apply_response_model_id(response, as_str_mapping(kwargs.get(metadata_field(self._op))))
+        apply_response_model_id(response, find_deployment_metadata(kwargs))
         additional["x-litellm-model-group"] = name
         retries: Final = step.get("attempted_retries")
         if isinstance(retries, int):
@@ -1426,7 +1491,7 @@ class _Driver:
     async def finish_async(self, step: Mapping[str, object]) -> object:
         response: Final = self.finish(step)
         name: Final = self._served[0]
-        if name is not None and response is not None:
+        if name is not None and response is not None and self._plan.sets_headers:
             remaining: Final = await self._core.health().usage(name, kind="remaining")
             if isinstance(remaining, Mapping):
                 apply_remaining_usage_headers(ensure_response_additional_headers(response), dict(remaining))
