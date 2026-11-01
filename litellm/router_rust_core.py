@@ -46,6 +46,7 @@ from litellm.litellm_core_utils.routing_common_utils import (
 )
 from litellm.litellm_core_utils.secret_redaction import redact_string
 from litellm.router_api import (
+    SETTING_FIELDS,
     ApplyResult,
     ChangeSet,
     RouterHealth,
@@ -64,6 +65,7 @@ from litellm.router_attempt import (
 )
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_rust_members import RustRegistryMembers
 from litellm.router_rust_registry import HostRegistry, RustRegistry, hosted_registry_view
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
@@ -620,7 +622,7 @@ def _limit(params: Sequence[Mapping[str, object]], key: str) -> int | None:
 _EndpointImpl: TypeAlias = Callable[..., Awaitable[object]]
 
 
-class RustCore(_SettingsSource):
+class RustCore(_SettingsSource, RustRegistryMembers):
     """A ``RouterCore`` served by the Rust router core over a ``PythonHost``. It holds no Python core."""
 
     def __init__(self, config: RouterConfig, host: PythonHost, resolved: Resolved) -> None:
@@ -643,6 +645,14 @@ class RustCore(_SettingsSource):
         )
         self._hosted.build(_as_list(config.get("model_list")) if config.get("model_list") is not None else None)
         self._handle: RouterCoreHandle = self._new_handle(list(self._hosted._core_model_list))  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
+
+    @property
+    def _registry_state(self) -> HostRegistry:
+        return self._hosted
+
+    @property
+    def _python_host(self) -> PythonHost:
+        return self._host
 
     @classmethod
     def build(cls, config: RouterConfig, host: PythonHost) -> "RustCore":
@@ -718,6 +728,7 @@ class RustCore(_SettingsSource):
             fallback_access_check=r.fallback_access_check,  # pyright: ignore[reportArgumentType]  # the check as passed
             fallback_budget_check=r.fallback_budget_check,  # pyright: ignore[reportArgumentType]  # the check as passed
             cache_responses=False,
+            provider_default_deployment_ids=self._hosted._core_provider_default_deployment_ids,  # pyright: ignore[reportPrivateUsage]  # the host registry's live list
             _router=self,  # pyright: ignore[reportArgumentType]  # the snapshot reads as_dict from this core
             _unset=frozenset(
                 {
@@ -729,7 +740,6 @@ class RustCore(_SettingsSource):
                     "tag_routing_prefix",
                     "router_general_settings",
                     "provider_budget_config",
-                    "provider_default_deployment_ids",
                     "kubernetes_pod_discovery",
                     "search_tools",
                     "guardrail_list",
@@ -780,7 +790,8 @@ class RustCore(_SettingsSource):
             resolved: Final = self._resolved.changed(values)
             static_changed: Final = bool(_STATIC_SETTINGS & set(values))
             self._resolved = resolved
-            self._settings = None
+            if set(values) & set(SETTING_FIELDS):
+                self._settings = None  # the snapshot holds settings fields, not the plain attributes
             if "model_group_alias" in values:
                 self._hosted._core_model_group_alias = dict(resolved.model_group_alias)  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]  # see __init__
             if "cooldown_time" in values:
@@ -817,15 +828,16 @@ class RustCore(_SettingsSource):
         return self.apply(ChangeSet(delete=[id])).deleted[0]
 
     def __setattr__(self, name: str, value: object) -> None:
-        # Settings are fixed after construction: only apply() changes them. A public attribute
-        # write would be silently ignored, so it is refused.
-        if not name.startswith("_"):
-            raise RustCoreUnsupported(
-                f"writing {name!r} is not served by the Rust router core; use apply(ChangeSet(assign=...))",
-                name=name,
-                obj=self,
-            )
-        object.__setattr__(self, name, value)
+        # A setting write is a changeset (`router.num_retries = 2` is `apply(ChangeSet(assign=...))`),
+        # a `model_list` write swaps the live list, and any other attribute is kept as written.
+        from litellm.router_api import ASSIGNABLE_ALIASES, PLAIN_SETTING_ATTRIBUTES, SETTING_FIELDS
+
+        if name in PLAIN_SETTING_ATTRIBUTES or name in SETTING_FIELDS or name in ASSIGNABLE_ALIASES:
+            _ = self.apply(ChangeSet(assign={name: value}))
+        elif name == "model_list":
+            self._assign_model_list(_as_list(value))
+        else:
+            object.__setattr__(self, name, value)
 
     async def select(  # pyright: ignore[reportIncompatibleMethodOverride]  # the RouterCore selection
         self,
