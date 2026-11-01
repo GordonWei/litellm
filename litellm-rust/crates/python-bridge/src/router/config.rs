@@ -26,6 +26,7 @@ const STATIC_KEYS: &[&str] = &[
     "request_timeout",
     "drop_params",
     "enable_pre_call_checks",
+    "routing_plugins",
     "enable_health_check_routing",
     "provider_default_deployment_ids",
 ];

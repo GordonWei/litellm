@@ -69,6 +69,7 @@ from litellm.router_rust_endpoints import (
     stamp_error,
 )
 from litellm.router_rust_members import RustRegistryMembers
+from litellm.router_rust_plugins import SYNC_PATH_MESSAGE, candidate_models, run_plugins
 from litellm.router_rust_precall import PreCallFacts
 from litellm.router_rust_registry import HostRegistry, RustRegistry, hosted_registry_view
 from litellm.router_rust_selection import (
@@ -109,7 +110,7 @@ if TYPE_CHECKING:
         RouterCall,
         RouterCoreHandle,
     )
-    from litellm.types.router import CustomRoutingStrategyBase
+    from litellm.types.router import CustomRoutingStrategyBase, RoutingPlugin
 
 # Async endpoints the Rust core routes: select a deployment, then run the attempt on the host.
 RUST_SERVED_OPS: Final[frozenset[str]] = frozenset(
@@ -195,6 +196,8 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "ignore_invalid_deployments",
         # Decided in router-core (precall.rs); its facts come from litellm/router_rust_precall.py.
         "enable_pre_call_checks",
+        # Run host-side (litellm/router_rust_plugins.py); router-core filters on what they leave.
+        "plugins",
     }
 )
 # Arguments that may be passed at their default without asking for anything.
@@ -374,6 +377,7 @@ class Resolved:
     tag_filtering_match_any: bool = True
     tag_routing_prefix: str = ""
     enable_pre_call_checks: bool = False
+    routing_plugins: "tuple[RoutingPlugin, ...]" = ()
     assigned: frozenset[str] = frozenset()
 
     @classmethod
@@ -430,6 +434,7 @@ class Resolved:
             tag_filtering_match_any=_true_unless_given(get("tag_filtering_match_any")),
             tag_routing_prefix=str(get("tag_routing_prefix") or ""),
             enable_pre_call_checks=bool(get("enable_pre_call_checks")),
+            routing_plugins=tuple(_as_list(get("plugins"))),  # pyright: ignore[reportArgumentType]  # the plugins as passed
             routing_groups=parse_groups(
                 get("routing_groups"),
                 frozenset(
@@ -508,6 +513,7 @@ class Resolved:
             "timeout": self.timeout,
             "routing_groups": group_documents(self.routing_groups) if self.routing_groups else None,
             "enable_pre_call_checks": True if self.enable_pre_call_checks else None,
+            "routing_plugins": True if self.routing_plugins else None,
         }
         return {name: value for name, value in values.items() if value is not None}
 
@@ -1477,6 +1483,17 @@ class RustCore(_SettingsSource, RustRegistryMembers):
     ) -> object:
         if step.get("stage") == "pre_call":
             return await self._pre_call_facts(step, request, messages, input).answer_async()
+        if step.get("stage") == "routing_plugins":
+            if step.get("run") is True and isinstance(request, dict):
+                await run_plugins(
+                    self._resolved.routing_plugins,
+                    self._hosted,  # pyright: ignore[reportArgumentType]  # the host registry serves the listing
+                    self._resolved.model_group_alias,
+                    str(step.get("model")),
+                    request,  # pyright: ignore[reportUnknownArgumentType]  # the caller's request kwargs
+                    messages,
+                )
+            return candidate_models(request)
         if step.get("stage") == "tags":
             return await self._answer_tags(step, request)
         inputs: Final = self._strategy_inputs(step, request)
@@ -1504,6 +1521,8 @@ class RustCore(_SettingsSource, RustRegistryMembers):
     ) -> object:
         if step.get("stage") == "pre_call":
             return self._pre_call_facts(step, request, messages, input).answer()
+        if step.get("stage") == "routing_plugins":
+            return candidate_models(request)
         inputs: Final = self._strategy_inputs(step, request)
         if inputs is None:
             return step["candidates"]
@@ -1660,6 +1679,11 @@ class RustCore(_SettingsSource, RustRegistryMembers):
                 ),
                 model=unsupported_model,
             )
+        if kind == "routing_plugins_left_nothing":
+            left: Final = [str(name) for name in _as_list(step.get("error_params"))]
+            return ValueError(f"No deployments left after routing-plugin filtering. candidate_models={left}")
+        if kind == "routing_plugins_need_async":
+            return ValueError(SYNC_PATH_MESSAGE)
         if kind == "unknown_model":
             named: Final = _alias_target(aliases.get(model)) or model if model in aliases else model
             return litellm_exceptions.BadRequestError(

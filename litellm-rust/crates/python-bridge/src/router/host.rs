@@ -55,6 +55,8 @@ pub(crate) enum Stage {
     Tags,
     /// `enable_pre_call_checks`: return the facts the filter decides by.
     PreCall,
+    /// The routing plugins: run them when `run`, then return the candidate models they left.
+    RoutingPlugins { run: bool },
 }
 
 /// The `op` of a `cache` step: one per [`RouterCache`] method.
@@ -178,6 +180,8 @@ pub(crate) enum Answer {
     Select(Vec<String>),
     /// The facts a `pre_call` select step asked for.
     PreCall(PreCallFacts),
+    /// The candidate models a `routing_plugins` select step reported.
+    Models(Option<Vec<String>>),
     Cache(CacheOutcome),
 }
 
@@ -187,7 +191,7 @@ impl Answer {
             Self::Attempt(_) => StepKind::Attempt,
             Self::Slept => StepKind::Sleep,
             Self::AllowFallback(_) => StepKind::AllowFallback,
-            Self::Select(_) | Self::PreCall(_) => StepKind::Select,
+            Self::Select(_) | Self::PreCall(_) | Self::Models(_) => StepKind::Select,
             Self::Cache(_) => StepKind::Cache,
         }
     }
@@ -496,6 +500,27 @@ impl Host for StepHost {
             .iter()
             .filter_map(|id| candidates.iter().find(|d| d.id == *id).cloned())
             .collect())
+    }
+
+    async fn routing_plugin_models(
+        &self,
+        ctx: &RoutingContext<'_>,
+        run: bool,
+    ) -> Result<Option<Vec<String>>, Error> {
+        let (scope, group) = ctx.scope.wire();
+        let question = Ask::Select {
+            stage: Stage::RoutingPlugins { run },
+            pool: Vec::new(),
+            model_group: ctx.model_group.to_owned(),
+            name: ctx.name.to_owned(),
+            scope,
+            group: group.map(str::to_owned),
+            candidates: Vec::new(),
+        };
+        let Answer::Models(models) = ask(question).await else {
+            unreachable!("{CHECKED}");
+        };
+        Ok(models)
     }
 
     async fn pre_call_facts(

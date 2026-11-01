@@ -196,6 +196,16 @@ pub trait Host: Send + Sync {
     /// The facts the `enable_pre_call_checks` filter decides by (token count, context windows,
     /// param support), for `candidates` and the deployments in `ctx.pool`. A host without them
     /// reports no input, so nothing is checked.
+    /// Run the routing plugins for `ctx.name` when `run` (the async pick's pre-routing hook), and
+    /// report the candidate models they left on the request, if any.
+    async fn routing_plugin_models(
+        &self,
+        _ctx: &RoutingContext<'_>,
+        _run: bool,
+    ) -> Result<Option<Vec<String>>, Error> {
+        Ok(None)
+    }
+
     async fn pre_call_facts(
         &self,
         _ctx: &RoutingContext<'_>,

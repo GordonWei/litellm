@@ -58,6 +58,10 @@ enum ErrorKind {
     ContextWindowExceeded,
     #[strum(serialize = "unsupported_params")]
     UnsupportedParams,
+    #[strum(serialize = "routing_plugins_left_nothing")]
+    RoutingPluginsLeftNothing,
+    #[strum(serialize = "routing_plugins_need_async")]
+    RoutingPluginsNeedAsync,
 }
 
 impl From<&Error> for ErrorKind {
@@ -75,6 +79,8 @@ impl From<&Error> for ErrorKind {
             Error::OnlyMarkers { .. } => Self::OnlyMarkers,
             Error::ContextWindowExceeded { .. } => Self::ContextWindowExceeded,
             Error::UnsupportedParams { .. } => Self::UnsupportedParams,
+            Error::RoutingPluginsLeftNothing { .. } => Self::RoutingPluginsLeftNothing,
+            Error::RoutingPluginsNeedAsync => Self::RoutingPluginsNeedAsync,
         }
     }
 }
@@ -397,6 +403,18 @@ fn answer(ask: &Ask, outcome: Option<Bound<'_, PyAny>>) -> PyResult<Answer> {
                 .map(Answer::PreCall)
                 .map_err(|error| PyValueError::new_err(format!("bad pre-call facts: {error}")))
         }
+        Ask::Select {
+            stage: Stage::RoutingPlugins { .. },
+            ..
+        } => {
+            // `{"models": [...] | None}`: a bare None would read as no outcome.
+            let outcome = outcome.ok_or_else(missing)?;
+            let models = outcome.cast::<PyDict>()?.get_item("models")?;
+            Ok(Answer::Models(match models {
+                Some(models) if !models.is_none() => Some(models.extract()?),
+                _ => None,
+            }))
+        }
         Ask::Select { .. } => Ok(Answer::Select(outcome.ok_or_else(missing)?.extract()?)),
         Ask::Attempt { .. } => {
             let outcome = outcome.ok_or_else(missing)?;
@@ -536,6 +554,9 @@ fn step_dict(py: Python<'_>, step: Step) -> PyResult<Bound<'_, PyDict>> {
                     dict.set_item("error_model", model)?;
                     dict.set_item("error_params", PyList::new(dict.py(), params)?)?;
                 }
+                Error::RoutingPluginsLeftNothing { models } => {
+                    dict.set_item("error_params", PyList::new(dict.py(), models)?)?;
+                }
                 _ => {}
             }
             dict.set_item("attempt_failed", attempt.is_some())?;
@@ -590,6 +611,10 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
                 Stage::Strategy(strategy) => ("strategy", Some(strategy)),
                 Stage::Tags => ("tags", None),
                 Stage::PreCall => ("pre_call", None),
+                Stage::RoutingPlugins { run } => {
+                    dict.set_item("run", run)?;
+                    ("routing_plugins", None)
+                }
             };
             dict.set_item("pool", PyList::new(py, pool)?)?;
             dict.set_item("stage", stage)?;

@@ -181,6 +181,19 @@ impl Core {
         inputs: &SelectInputs,
     ) -> Result<Candidates, Error> {
         let registry = &snapshot.registry;
+        // The async pick's pre-routing hook runs the routing plugins before anything resolves;
+        // every pick but a listed pass-through one reads what they left on the request.
+        let plugin_models = if snapshot.settings.routing_plugins
+            && !inputs.count_only
+            && request.pass_through != Some(PassThrough::Listed)
+        {
+            let ctx = self.context(snapshot, op, request, name, name, StrategyScope::Default);
+            self.host
+                .routing_plugin_models(&ctx, request.pre_routes)
+                .await?
+        } else {
+            None
+        };
         let scope = ResolveScope {
             specific_deployment: request.specific_deployment,
         };
@@ -368,6 +381,10 @@ impl Core {
             );
             ctx.pool = &all;
             healthy = self.host.select(&SelectStage::Tags, &ctx, healthy).await?;
+        }
+
+        if resolution.kind != ResolveKind::Id {
+            healthy = crate::routing_plugins::narrow(healthy, plugin_models.as_deref())?;
         }
 
         if let Some(pinned) = request.pinned_deployment_id.as_deref()

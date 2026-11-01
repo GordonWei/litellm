@@ -63,6 +63,12 @@ pub enum Error {
     /// The pre-call checks found no deployment of `model` that takes the requested `params`.
     #[error("no deployment of `{model}` supports {params:?}")]
     UnsupportedParams { model: String, params: Vec<String> },
+    /// The routing plugins left none of the healthy deployments' models.
+    #[error("no deployments left after routing-plugin filtering: {models:?}")]
+    RoutingPluginsLeftNothing { models: Vec<String> },
+    /// A router with routing plugins was asked for a pick on the sync path, which never runs them.
+    #[error("routing plugins only run on the async selection path")]
+    RoutingPluginsNeedAsync,
 }
 
 impl Error {
@@ -80,7 +86,9 @@ impl Error {
             | Self::NoPassThroughDeployments { .. }
             | Self::OnlyMarkers { .. }
             | Self::ContextWindowExceeded { .. }
-            | Self::UnsupportedParams { .. } => None,
+            | Self::UnsupportedParams { .. }
+            | Self::RoutingPluginsLeftNothing { .. }
+            | Self::RoutingPluginsNeedAsync => None,
         }
     }
 }

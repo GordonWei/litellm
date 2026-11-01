@@ -82,6 +82,7 @@ pub mod host;
 pub mod precall;
 pub mod registry;
 pub mod routing_groups;
+pub mod routing_plugins;
 pub mod select;
 pub mod settings;
 pub mod strategy;
@@ -255,6 +256,11 @@ impl Router {
     pub async fn select(&self, op: &Op, request: &RouterRequest) -> Result<Arc<Deployment>, Error> {
         self.live()?;
         let snapshot = self.core.snapshot.load_full();
+        routing_plugins::refuse_sync_pick(
+            snapshot.settings.routing_plugins,
+            &snapshot.settings.routing_strategy,
+            request,
+        )?;
         let candidates = self
             .core
             .candidates(
