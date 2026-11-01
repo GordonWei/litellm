@@ -33,6 +33,10 @@ pub(crate) fn policy_retries(
     Ok(policy.and_then(|policy| policy.retries_for(&failure)))
 }
 
+pub(crate) fn allowed_fails(router: &Router, outcome: &Bound<'_, PyDict>) -> PyResult<Option<u32>> {
+    Ok(router.settings().allowed_fails_for(&failure(outcome)?))
+}
+
 pub(crate) fn should_retry(
     outcome: &Bound<'_, PyDict>,
     (healthy, all): (usize, usize),

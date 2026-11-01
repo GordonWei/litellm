@@ -60,6 +60,8 @@ impl StreamOrigin {
             group: self.group.clone(),
             order: self.order,
             params: None,
+            excluded: Arc::from([]),
+            failover_excluded: Arc::from([]),
         }
     }
 
@@ -350,6 +352,9 @@ fn stream_can_fall_back(
 ) -> bool {
     if request.disable_fallbacks {
         return false;
+    }
+    if snapshot.settings.enable_weighted_failover {
+        return true;
     }
     let mut orders: Vec<i64> = snapshot
         .registry

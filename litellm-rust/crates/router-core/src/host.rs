@@ -76,6 +76,9 @@ pub struct RouterRequest {
     pub mock_failure: Option<MockFailure>,
     /// A per-request `model_group_retry_policy`, which replaces the router's.
     pub model_group_retry_policy: Option<BTreeMap<String, RetryPolicy>>,
+    /// `health_check_probe`: a health check's own pick, which sees no deployment when every
+    /// one is marked unhealthy (the safety net keeps them all for any other request).
+    pub health_check_probe: bool,
     /// What the host needs to run the call itself, such as the Python kwargs.
     pub payload: Option<Payload>,
 }

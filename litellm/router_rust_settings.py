@@ -38,11 +38,6 @@ PLAIN_DEFAULTS: Final[Mapping[str, object]] = MappingProxyType(
         "fallback_on_unsupported_params": True,
     }
 )
-# Plain settings whose effect on routing the Rust core does not have yet: a changeset that sets
-# one to anything but its default is refused, never stored and silently ignored. The retry
-# policies are served (``RustCore._set_retry_policies``).
-_UNSERVED_PLAIN: Final = frozenset(PLAIN_DEFAULTS) - {"retry_policy", "model_group_retry_policy"}
-
 # `get_settings`: the settings it lists, in its order (`routing_groups` comes last).
 _VIEW_ORDER: Final = (
     "routing_strategy_args",
@@ -127,9 +122,6 @@ def read_settings_update(settings: Mapping[str, object]) -> SettingsUpdate:
             plain[name] = value
         else:
             values[name] = value
-    unserved: Final = sorted(name for name in _UNSERVED_PLAIN & set(plain) if plain[name] != PLAIN_DEFAULTS[name])
-    if unserved:
-        raise RustCoreUnsupported(f"update_settings({', '.join(unserved)}) is not served by the Rust router core yet")
     return SettingsUpdate(
         values=MappingProxyType(values),
         plain=MappingProxyType(plain),

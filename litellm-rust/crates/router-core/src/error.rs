@@ -180,6 +180,9 @@ pub struct AttemptError {
     /// pre-call check's failure, which Python's attempt handles itself: a rate limit cools the
     /// deployment down, anything else records nothing), so the core records nothing.
     pub recorded: bool,
+    /// The exception names its provider (`llm_provider` is set), which marks a provider's own
+    /// 400 for `fallback_on_unsupported_params`.
+    pub names_provider: bool,
     pub payload: Option<Payload>,
 }
 
@@ -193,6 +196,7 @@ impl AttemptError {
             detail: None,
             classes: Vec::new(),
             recorded: false,
+            names_provider: false,
             payload: None,
         }
     }

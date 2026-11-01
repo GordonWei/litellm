@@ -139,6 +139,39 @@ fn mask_exception(text: &str) -> String {
     masked
 }
 
+/// `_EXCEPTION_POLICY_FIELDS`: a deployment policy's fields in the order Python matches them
+/// (a content-policy violation is a bad request, so it comes first).
+const DEPLOYMENT_POLICY_FIELDS: [(&str, &str); 9] = [
+    (
+        "ContentPolicyViolationError",
+        "ContentPolicyViolationErrorAllowedFails",
+    ),
+    ("BadRequestError", "BadRequestErrorAllowedFails"),
+    ("AuthenticationError", "AuthenticationErrorAllowedFails"),
+    ("Timeout", "TimeoutErrorAllowedFails"),
+    ("RateLimitError", "RateLimitErrorAllowedFails"),
+    ("InternalServerError", "InternalServerErrorAllowedFails"),
+    (
+        "ServiceUnavailableError",
+        "ServiceUnavailableErrorAllowedFails",
+    ),
+    ("BadGatewayError", "BadGatewayErrorAllowedFails"),
+    ("NotFoundError", "NotFoundErrorAllowedFails"),
+];
+
+/// `_resolve_allowed_fails_from_policy` over a deployment's `model_info.allowed_fails_policy`:
+/// the first field set for a class the failure is an instance of.
+pub fn deployment_allowed_fails(
+    policy: Option<&serde_json::Map<String, serde_json::Value>>,
+    failure: &AttemptError,
+) -> Option<f64> {
+    let policy = policy?;
+    DEPLOYMENT_POLICY_FIELDS
+        .iter()
+        .filter(|(class, _)| failure.is_a(class))
+        .find_map(|(_, field)| policy.get(*field).and_then(serde_json::Value::as_f64))
+}
+
 /// What the cooldown rules need to know about the deployment's group.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GroupShape {
@@ -168,6 +201,10 @@ impl Health {
 
     pub fn cache(&self) -> &Arc<dyn RouterCache> {
         &self.cache
+    }
+
+    pub(crate) fn now_time(&self) -> SystemTime {
+        self.clock.now()
     }
 
     fn now(&self) -> f64 {
@@ -351,7 +388,12 @@ impl Health {
             FailureKind::Declined | FailureKind::CallerCredential
         ) && !cooldown.is_zero()
             && !settings.disable_cooldowns
-            && is_cooldown_required(failure)
+            && (is_cooldown_required(failure)
+                || deployment_allowed_fails(
+                    deployment.model_info.allowed_fails_policy.as_ref(),
+                    failure,
+                )
+                .is_some())
             && !settings
                 .provider_default_deployment_ids
                 .contains(&deployment.id)
@@ -368,18 +410,41 @@ impl Health {
         let status = failure.cooldown_status();
         let policy_fails = settings.allowed_fails_for(failure);
         let lone = shape.single_deployment && !shape.has_fallback_group;
-        if shape.single_deployment && status == 402 && policy_fails.is_none() {
+        let deployment_policy = deployment.model_info.allowed_fails_policy.as_ref();
+        let deployment_fails = deployment_allowed_fails(deployment_policy, failure);
+        if shape.single_deployment
+            && status == 402
+            && deployment_fails.is_none()
+            && policy_fails.is_none()
+        {
             return Ok(false);
         }
-        if let Some(allowed) = deployment.model_info.allowed_fails {
-            // A deployment-wide `allowed_fails` keeps the lone-deployment safety net
-            // (`_should_cooldown_based_on_deployment_policy`).
-            if lone {
+        let deployment_allowed = deployment.model_info.allowed_fails;
+        if deployment_policy.is_some() || deployment_allowed.is_some() {
+            // `_should_cooldown_based_on_deployment_policy`: a deployment-wide `allowed_fails`
+            // keeps the lone-deployment safety net; a policy entry naming the error does not.
+            if deployment_fails.is_none()
+                && lone
+                && (deployment_allowed.is_some() || policy_fails.is_none())
+            {
                 return Ok(false);
             }
+            let (allowed, suffix) = match deployment_fails {
+                Some(allowed) => (
+                    Some(allowed),
+                    failure.class_names().first().map(|name| (*name).to_owned()),
+                ),
+                None => (
+                    deployment_allowed.map(f64::from),
+                    deployment_allowed.map(|_| "generic".to_owned()),
+                ),
+            };
+            let allowed = allowed
+                .or_else(|| policy_fails.map(f64::from))
+                .unwrap_or_else(|| f64::from(settings.effective_allowed_fails()));
             let ttl = Self::configured_cooldown(deployment).unwrap_or(settings.cooldown_time);
             return self
-                .exceeds_allowed_fails(&deployment.id, Some("generic"), allowed, ttl)
+                .exceeds_allowed_fails(&deployment.id, suffix.as_deref(), allowed, ttl)
                 .await;
         }
         if settings.allowed_fails_policy.is_none() && settings.allowed_fails.is_none() {
@@ -401,8 +466,13 @@ impl Health {
             return Ok(false);
         }
         let allowed = policy_fails.unwrap_or_else(|| settings.effective_allowed_fails());
-        self.exceeds_allowed_fails(&deployment.id, None, allowed, settings.cooldown_time)
-            .await
+        self.exceeds_allowed_fails(
+            &deployment.id,
+            None,
+            f64::from(allowed),
+            settings.cooldown_time,
+        )
+        .await
     }
 
     /// `should_cooldown_based_on_allowed_fails_policy`: count this failure, then compare.
@@ -410,14 +480,14 @@ impl Health {
         &self,
         id: &str,
         suffix: Option<&str>,
-        allowed: u32,
+        allowed: f64,
         ttl: Duration,
     ) -> Result<bool, Error> {
         let fails = self
             .cache
             .async_increment(&allowed_fails_key(id, suffix), 1.0, Some(ttl))
             .await?;
-        Ok(fails > f64::from(allowed))
+        Ok(fails > allowed)
     }
 
     /// Count a success, and the tokens and request against the deployment's per-minute usage

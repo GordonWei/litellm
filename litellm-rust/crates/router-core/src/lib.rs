@@ -79,6 +79,7 @@ pub mod config;
 pub mod error;
 pub mod fallback;
 pub mod health;
+pub mod health_routing;
 pub mod host;
 pub mod mock;
 pub mod precall;
@@ -327,6 +328,12 @@ impl Router {
                 &SelectInputs::default(),
             )
             .await?;
+        // `_core_async_get_healthy_deployments` raises when nothing is left.
+        if candidates.healthy.is_empty() {
+            return Err(Error::NoHealthyDeployments {
+                model: candidates.model_group,
+            });
+        }
         Ok(candidates.healthy)
     }
 
@@ -399,7 +406,15 @@ impl Router {
         let Some(deployment) = snapshot.registry.deployment(id) else {
             return Ok(false);
         };
-        if report.count_only {
+        // An empty status is no cooldown (`_is_cooldown_required`), unless the deployment's
+        // own policy names the error.
+        if report.count_only
+            && crate::health::deployment_allowed_fails(
+                deployment.model_info.allowed_fails_policy.as_ref(),
+                failure,
+            )
+            .is_none()
+        {
             return Ok(false);
         }
         let cooldown = if report.deployment_cooldown {

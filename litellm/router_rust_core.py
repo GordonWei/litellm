@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 from pydantic import TypeAdapter
 
 from litellm._internal_context import service_target
+from litellm.constants import HEALTH_CHECKS_TARGET
 from litellm.integrations.custom_guardrail import is_guardrail_intervention
 from litellm.litellm_core_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
@@ -84,12 +85,28 @@ from litellm.router_rust_health import (
     cooled_in_running_loop,
     failure_status,
 )
+from litellm.router_rust_health_routing import (
+    HEALTH_STATE_KEY,
+    HealthRouting,
+    all_blocked,
+    failover_document,
+    fully_blocked_model_names,
+    fully_unhealthy_model_names,
+    is_blocked,
+    resolved_allowed_fails_policy,
+)
 from litellm.router_rust_members import RustRegistryMembers
 from litellm.router_rust_plugins import SYNC_PATH_MESSAGE, candidate_models, run_plugins
 from litellm.router_rust_precall import PreCallFacts, declares_no_vision, request_carries_image
 from litellm.router_rust_prerouting import PreRouter, PreRoutingStrategies
 from litellm.router_rust_registry import HostRegistry, RustRegistry, hosted_registry_view
-from litellm.router_rust_retries import RustRetries, refuse_unserved_retry_policies, resolved_retry_policy
+from litellm.router_rust_retries import (
+    RustRetries,
+    group_policy_document,
+    refuse_unserved_request_retry_policies,
+    refuse_unserved_retry_policies,
+    resolved_retry_policy,
+)
 from litellm.router_rust_selection import (
     SELECTOR_ATTRIBUTES,
     StrategySelectors,
@@ -136,12 +153,14 @@ if TYPE_CHECKING:
     from litellm.caching.redis_cache import RedisCache
     from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
     from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+    from litellm.router_api import UntypedDict
     from litellm.router_utils.cooldown_cache import CooldownCache
+    from litellm.router_utils.health_state_cache import DeploymentHealthCache
     from litellm.rust_bridge._native import (  # pyright: ignore[reportPrivateUsage]  # the stub's step shapes
         RouterCall,
         RouterCoreHandle,
     )
-    from litellm.types.router import CustomRoutingStrategyBase, RoutingPlugin
+    from litellm.types.router import CustomRoutingStrategyBase, DeploymentTypedDict, RoutingPlugin
 
 # Async endpoints the Rust core routes: select a deployment, then run the attempt on the host.
 RUST_SERVED_OPS: Final[frozenset[str]] = frozenset(
@@ -233,6 +252,13 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "plugins",
         "retry_policy",
         "model_group_retry_policy",
+        # Health-check routing and the failover flags (litellm/router_rust_health_routing.py).
+        "enable_health_check_routing",
+        "health_check_staleness_threshold",
+        "health_check_ignore_transient_errors",
+        "background_health_check_model_groups",
+        "enable_weighted_failover",
+        "fallback_on_unsupported_params",
     }
 )
 # Arguments that may be passed at their default without asking for anything.
@@ -310,6 +336,8 @@ class RustCoreUnsupported(AttributeError):
 
 def _cache_target(key: str) -> str:
     """The service target a routing cache read or write is attributed to, as the Python core's."""
+    if key == HEALTH_STATE_KEY:
+        return HEALTH_CHECKS_TARGET
     return ROUTER_COOLDOWNS_TARGET if key.endswith(":cooldown") else ROUTER_USAGE_TARGET
 
 
@@ -351,6 +379,7 @@ def attempt_failure(error: BaseException) -> Mapping[str, object]:
         "num_retries": num_retries if isinstance(num_retries, int) and num_retries >= 0 else None,
         "detail": str(error)[:500],
         "classes": [cls.__name__ for cls in type(error).__mro__],
+        "llm_provider": bool(getattr(error, "llm_provider", "")),
     }
 
 
@@ -415,6 +444,7 @@ class Resolved:
     routing_plugins: "tuple[RoutingPlugin, ...]" = ()
     retry_policy: object = None
     model_group_retry_policy: object = None
+    health_routing: HealthRouting = dataclasses.field(default_factory=HealthRouting)
     assigned: frozenset[str] = frozenset()
 
     @classmethod
@@ -463,7 +493,7 @@ class Resolved:
             explicit_allowed_fails=int(str(allowed_fails)) if allowed_fails is not None else None,
             cooldown_time=float(str(get("cooldown_time") or _DEFAULT_COOLDOWN_SECONDS)),
             disable_cooldowns=_optional_bool(get("disable_cooldowns")),
-            allowed_fails_policy=get("allowed_fails_policy"),
+            allowed_fails_policy=resolved_allowed_fails_policy(get("allowed_fails_policy")),
             retry_after=float(str(get("retry_after") or 0)),
             timeout=float(str(timeout)) if timeout else dynamic.request_timeout,
             fallbacks=fallbacks,
@@ -491,6 +521,7 @@ class Resolved:
             ),
             retry_policy=resolved_retry_policy(get("retry_policy")),
             model_group_retry_policy=get("model_group_retry_policy"),
+            health_routing=HealthRouting.of(config),
         )
 
     def changed(self, values: Mapping[str, object], updated: frozenset[str] = frozenset()) -> "Resolved":
@@ -563,6 +594,7 @@ class Resolved:
             "routing_plugins": True if self.routing_plugins else None,
             "retry_policy": _plain(self.retry_policy),
             "model_group_retry_policy": _plain(self.model_group_retry_policy) or None,
+            **self.health_routing.static_document(),
         }
         return {name: value for name, value in values.items() if value is not None}
 
@@ -666,16 +698,6 @@ def _team_id(request: Mapping[str, object]) -> str | None:
     return team_id if isinstance(team_id, str) else None
 
 
-def _refuse_unserved_deployments(model_list: Sequence[object]) -> None:
-    """Deployment fields the Rust core does not read yet: refused, never silently ignored."""
-    for entry in model_list:
-        model_info = as_str_mapping((as_str_mapping(_record(entry)) or {}).get("model_info")) or {}
-        if model_info.get("allowed_fails_policy") is not None:
-            raise RustCoreUnsupported(
-                "a deployment's model_info.allowed_fails_policy is not served by the Rust router core yet"
-            )
-
-
 # Request fallback settings, which replace the router's for the call.
 _REQUEST_FALLBACK_KEYS: Final = ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks", "max_fallbacks")
 
@@ -700,7 +722,11 @@ def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
         **({"routing_strategy": override} if override is not None else {}),
         **disabled,
         **({"router_weights": weights} if weights is not None else {}),
-        **({"model_group_retry_policy": _plain(group_policies)} if group_policies is not None else {}),
+        **(
+            {"model_group_retry_policy": _plain(group_policy_document(group_policies))}
+            if group_policies is not None
+            else {}
+        ),
         **lists,
         **({"team_id": team_id} if team_id else {}),
     }
@@ -761,6 +787,33 @@ class RustHealth(RouterHealth):
     def team_ptu_ceiling(self, team_id: str, model_group: str) -> "PTUTeamCeiling | None":
         return self._core._hosted._core_team_ptu_ceiling(team_id, model_group)  # pyright: ignore[reportPrivateUsage]  # the host registry's ported ceiling
 
+    @property
+    def health_checks(self) -> "DeploymentHealthCache":
+        return self._core._health_checks  # pyright: ignore[reportPrivateUsage]  # see store
+
+    @property
+    def latency(self) -> "UntypedDict":  # the live latency map, as the Python core keeps it
+        return self._core._hosted._core_deployment_latency_map  # pyright: ignore[reportPrivateUsage]  # see team_ptu_ceiling
+
+    @staticmethod
+    def is_blocked(deployment: "Deployment") -> bool:
+        return is_blocked(deployment)
+
+    @staticmethod
+    def all_blocked(deployments: "Sequence[DeploymentTypedDict]") -> bool:
+        return all_blocked(deployments)
+
+    def fully_blocked_model_names(self) -> set[str]:  # mutable-ok: the core's type, a fresh set
+        return fully_blocked_model_names(self._core._hosted._core_get_model_list() or [])  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # see team_ptu_ceiling
+
+    async def fully_unhealthy_model_names(self) -> set[str]:  # mutable-ok: the core's type, a fresh set
+        core: Final = self._core
+        return await fully_unhealthy_model_names(
+            core._hosted._core_get_model_list() or [],  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # see team_ptu_ceiling
+            core._health_checks,  # pyright: ignore[reportPrivateUsage]  # see store
+            core._resolved.allowed_fails_policy,  # pyright: ignore[reportPrivateUsage]  # see store
+        )
+
     async def usage(  # pyright: ignore[reportIncompatibleMethodOverride]  # the same two kinds
         self, model_group: str, *, kind: Literal["current", "remaining"] = "current"
     ) -> tuple[int | None, int | None] | Mapping[str, int]:
@@ -775,7 +828,20 @@ class RustHealth(RouterHealth):
 
 
 _HEALTH_SERVED: Final = frozenset(
-    {"store", "cooldowns", "failures_this_minute", "record_failure", "usage", "team_ptu_ceiling"}
+    {
+        "store",
+        "cooldowns",
+        "failures_this_minute",
+        "record_failure",
+        "usage",
+        "team_ptu_ceiling",
+        "health_checks",
+        "latency",
+        "is_blocked",
+        "all_blocked",
+        "fully_blocked_model_names",
+        "fully_unhealthy_model_names",
+    }
 )
 
 
@@ -807,6 +873,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         self._health_view: RustHealth | None = None
         self._cache: Final = host.routing_cache(config)
         self._cooldowns: CooldownCache = CooldownCache(cache=self._cache, default_cooldown_time=resolved.cooldown_time)
+        self._health_checks: Final = resolved.health_routing.health_checks(self._cache)
         self._version: int = 1
         self._retired: bool = False
         self._settings: RustSettings | None = None
@@ -926,15 +993,16 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
     def _new_handle(self, model_list: Sequence[object]) -> "RouterCoreHandle":
         from litellm.rust_bridge._native import RouterCoreHandle
 
-        _refuse_unserved_deployments(model_list)
         names: Final = [
             str(name)
             for entry in model_list
             if isinstance(name := (as_str_mapping(entry) or {}).get("model_name"), str)
         ]
-        return RouterCoreHandle(
-            self._resolved.static_document(model_list), self._resolved.dynamic_document(self._version, names)
-        )
+        static: Final = {
+            **self._resolved.static_document(model_list),
+            **{name: value for name, value in failover_document(self._plain).items() if value is not None},
+        }
+        return RouterCoreHandle(static, self._resolved.dynamic_document(self._version, names))
 
     def _rebuild(self) -> None:
         """A new Rust core for changed static settings, over the same deployments."""
@@ -982,7 +1050,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
             allowed_fails_policy=r.allowed_fails_policy,  # pyright: ignore[reportArgumentType]  # the policy as passed
             disable_cooldowns=r.disable_cooldowns,
             enable_pre_call_checks=r.enable_pre_call_checks,
-            enable_health_check_routing=False,
+            enable_health_check_routing=r.health_routing.enable_health_check_routing,
             enable_tag_filtering=r.enable_tag_filtering,
             tag_filtering_match_any=r.tag_filtering_match_any,
             tag_routing_prefix=r.tag_routing_prefix,
@@ -992,7 +1060,8 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
             search_tools=self._endpoints.search_tools,  # pyright: ignore[reportArgumentType]  # the configured entries, as passed
             guardrail_list=self._endpoints.guardrail_list,  # pyright: ignore[reportArgumentType]  # same
             provider_default_deployment_ids=self._hosted._core_provider_default_deployment_ids,  # pyright: ignore[reportPrivateUsage]  # the host registry's live list
-            health_check_ignore_transient_errors=False,
+            health_check_ignore_transient_errors=r.health_routing.health_check_ignore_transient_errors,
+            background_health_check_model_groups=r.health_routing.background_health_check_model_groups,
             router_general_settings=self._config.get("router_general_settings") or RouterGeneralSettings(),  # pyright: ignore[reportArgumentType]  # the argument as passed
             _router=self,  # pyright: ignore[reportArgumentType]  # the snapshot reads as_dict from this core
             _unset=frozenset({"kubernetes_pod_discovery"}),
@@ -1110,7 +1179,10 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
                 frozenset(str(d.get("model_name")) for d in self._handle.deployments()),
                 frozenset(self._resolved.model_group_alias),
             )
+        flags_before: Final = failover_document(self._plain)
         self._plain.update(update.plain)
+        if failover_document(self._plain) != flags_before:
+            self._rebuild()
         if policies:
             self._set_retry_policies(policies)
         if self._deleted & set(values):
@@ -1251,6 +1323,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         specific_deployment: bool | None = None,
         messages: object = None,
         input: object = None,
+        health_check_probe: bool = False,
         **_: object,  # kwargs-ok: the RouterCore select options this core ignores
     ) -> Mapping[str, object] | Sequence[Mapping[str, object]]:
         """Pick a deployment for ``model`` without calling it (``pick``), list the deployments a
@@ -1259,7 +1332,16 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         if kind not in ("pick", "healthy", "pass_through"):
             raise ValueError(f"unknown select kind {kind!r}")
         request: Final = request_kwargs if request_kwargs is not None else {}
-        selection: Final = _Selection(self, model, request, kind, specific_deployment, messages, input)
+        selection: Final = _Selection(
+            self,
+            model,
+            request,
+            kind,
+            specific_deployment,
+            messages,
+            input,
+            probe=kind == "healthy" and health_check_probe,
+        )
         if kind == "pass_through":
             return selection.run_sync()
         return await selection.run()
@@ -1418,7 +1500,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         )
         if unserved:
             raise RustCoreUnsupported(f"request keys not served by the Rust router core yet: {unserved}")
-        refuse_unserved_retry_policies(request.get("model_group_retry_policy"))
+        refuse_unserved_request_retry_policies(plan.endpoint, request)
         model: Final = request.get("model")
         if not isinstance(model, str):
             raise TypeError(f"{plan.endpoint}() needs a model name")
@@ -2073,11 +2155,6 @@ def _amount(value: object) -> float | int:
     return value if isinstance(value, int | float) and not isinstance(value, bool) else 1
 
 
-def _record(deployment: object) -> object:
-    dump: Final = getattr(deployment, "model_dump", None)
-    return dump(exclude_none=True) if callable(dump) else deployment
-
-
 class _NotSynchronous(TypeError):
     """A sync attempt's host endpoint returned an awaitable: a host bug, never an attempt failure."""
 
@@ -2094,6 +2171,8 @@ class _Selection:
         specific_deployment: bool | None,
         messages: object,
         input: object,
+        *,
+        probe: bool = False,
     ) -> None:
         self._core: Final = core
         self._model: Final = model
@@ -2108,6 +2187,8 @@ class _Selection:
         }  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
         if specific_deployment:
             fields["specific_deployment"] = True
+        if probe:
+            fields["health_check_probe"] = True
         if kind == "pick" or (kind == "sync_pick" and core._custom_strategy is not None):  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
             fields["pre_routes"] = True
         self._specific_deployment: Final = specific_deployment
