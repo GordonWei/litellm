@@ -64,6 +64,7 @@ from litellm.router_attempt import (
 )
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_rust_registry import HostRegistry, RustRegistry, hosted_registry_view
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
 from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError
@@ -157,6 +158,7 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "cache_kwargs",
         "set_verbose",
         "debug_level",
+        "ignore_invalid_deployments",
     }
 )
 # Arguments that may be passed at their default without asking for anything.
@@ -444,6 +446,14 @@ class Resolved:
         return {"providers": _PROVIDERS, "provider_prefixed": prefixed}
 
 
+def _alias_target(target: object) -> str | None:
+    mapping: Final = as_str_mapping(target)
+    if mapping is not None:
+        model: Final = mapping.get("model")
+        return model if isinstance(model, str) else None
+    return target if isinstance(target, str) else None
+
+
 def _optional_bool(value: object) -> bool | None:
     return None if value is None else bool(value)
 
@@ -476,15 +486,6 @@ def _team_id(request: Mapping[str, object]) -> str | None:
     return team_id if isinstance(team_id, str) else None
 
 
-def _same_deployment(old: Deployment, new: Deployment) -> bool:
-    """An upsert that changes nothing (``_upsert_deployment``'s equality check)."""
-    return (
-        old.model_name == new.model_name
-        and old.litellm_params == new.litellm_params
-        and old.model_info == new.model_info
-    )
-
-
 def _refuse_unserved_deployments(model_list: Sequence[object]) -> None:
     """Deployment fields the Rust core does not read yet: refused, never silently ignored."""
     for entry in model_list:
@@ -511,173 +512,7 @@ def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
     }
 
 
-def _deployment(record: object) -> Deployment:
-    return Deployment(**dict(as_str_mapping(record) or {}))  # pyright: ignore[reportArgumentType]  # a model_list entry
-
-
 # --- views --------------------------------------------------------------------------------------
-
-
-class RustRegistry(RouterRegistry):
-    """``registry()`` read from the Rust handle. Queries it does not serve raise ``RustCoreUnsupported``."""
-
-    __slots__ = ("_core",)
-
-    def __init__(self, core: "RustCore") -> None:  # pyright: ignore[reportMissingSuperCall]  # reads the Rust core, not a Router
-        self._core = core
-
-    def __getattribute__(self, name: str) -> object:
-        if name in _REGISTRY_SERVED or name.startswith("__") or name == "_core":
-            found: Final[object] = object.__getattribute__(self, name)  # pyright: ignore[reportAny]  # the view's own member
-            return found
-        raise RustCoreUnsupported(f"registry().{name} is not served by the Rust router core", name=name, obj=self)
-
-    @property
-    def version(self) -> int:
-        return self._core._version  # pyright: ignore[reportPrivateUsage]  # the registry reads its own core
-
-    def _records(self) -> Sequence[Mapping[str, object]]:
-        return [as_str_mapping(record) or {} for record in self._core._handle.deployments()]  # pyright: ignore[reportPrivateUsage]  # see above
-
-    def deployment(self, id: str) -> Deployment | None:
-        record: Final = self._core._handle.deployment(id)  # pyright: ignore[reportPrivateUsage]  # see above
-        return None if record is None else _deployment(record)
-
-    def has_deployment(self, id: str) -> bool:
-        return self._core._handle.deployment(id) is not None  # pyright: ignore[reportPrivateUsage]  # see above
-
-    def deployment_dict(self, id: str) -> dict[str, object] | None:  # pyright: ignore[reportIncompatibleMethodOverride]  # mutable-ok: a fresh dict
-        record: Final = self._core._handle.deployment(id)  # pyright: ignore[reportPrivateUsage]  # see above
-        return None if record is None else dict(as_str_mapping(record) or {})
-
-    def deployments(  # pyright: ignore[reportIncompatibleMethodOverride]  # the "group" source only
-        self,
-        model_name: str | None = None,
-        *,
-        source: str = "group",
-        team_id: str | None = None,
-        **_: object,  # kwargs-ok: the RouterRegistry signature
-    ) -> list[Mapping[str, object]] | None:  # mutable-ok: a fresh list, as get_model_list returns
-        if source != "group":
-            raise RustCoreUnsupported(
-                f"registry().deployments(source={source!r}) is not served by the Rust router core"
-            )
-        records: Final = self._records()
-        if model_name is None:
-            return list(records)
-        target: Final = self._target(model_name)
-        found: Final = [
-            record for record in records if record.get("model_name") == target and _usable_by(record, team_id)
-        ]
-        return found
-
-    def all(self) -> list[Mapping[str, object]]:  # pyright: ignore[reportIncompatibleMethodOverride]  # mutable-ok: a fresh list
-        return list(self._records())
-
-    def names(  # pyright: ignore[reportIncompatibleMethodOverride]  # the served kinds only
-        self,
-        model_name: str | None = None,
-        *,
-        kind: str = "groups",
-        team_id: str | None = None,
-        exclude_team_models: bool = False,
-    ) -> list[str] | set[str]:  # mutable-ok: fresh, as the Python core returns them
-        records: Final = self._records()
-        if kind == "ids":
-            return [
-                str((as_str_mapping(record.get("model_info")) or {}).get("id"))
-                for record in records
-                if (model_name is None or record.get("model_name") == model_name)
-                and not (exclude_team_models and _team_of(record) is not None)
-            ]
-        if kind == "group_set":
-            return {str(record.get("model_name")) for record in records}
-        if kind == "groups":
-            names: Final[list[str]] = []  # mutable-ok: filled here, then returned
-            for record in records:
-                team: str | None = _team_of(record)
-                if team is None:
-                    names.append(str(record.get("model_name")))
-                elif team_id is not None and team == team_id:
-                    public = (as_str_mapping(record.get("model_info")) or {}).get("team_public_model_name")
-                    if isinstance(public, str):
-                        names.append(public)
-            aliases: Final = self._core._resolved.model_group_alias  # pyright: ignore[reportPrivateUsage]  # see above
-            names.extend(alias for alias, target in aliases.items() if not _hidden(target))
-            return names
-        raise RustCoreUnsupported(f"registry().names(kind={kind!r}) is not served by the Rust router core")
-
-    def resolve(  # pyright: ignore[reportIncompatibleMethodOverride]  # the served kinds only
-        self,
-        name: str | None,
-        *,
-        kind: str = "group",
-        team_id: str | None = None,
-        **_: object,  # kwargs-ok: the RouterRegistry signature
-    ) -> str | bool | None:
-        aliases: Final = self._core._resolved.model_group_alias  # pyright: ignore[reportPrivateUsage]  # see above
-        if kind == "from_id":
-            record: Final = self._core._handle.deployment(str(name))  # pyright: ignore[reportPrivateUsage]  # see above
-            return None if record is None else str((as_str_mapping(record) or {}).get("model_name"))
-        if name is None:
-            raise TypeError(f"registry().resolve(kind={kind!r}) needs a name")
-        if kind == "alias":
-            return _alias_target(aliases.get(name)) if name in aliases else None
-        if kind == "group":
-            resolution: Final = self._core._handle.resolve(name)  # pyright: ignore[reportPrivateUsage]  # see above
-            if resolution is not None:
-                return str(resolution["model_group"])
-            return _alias_target(aliases.get(name)) if name in aliases else name
-        if kind == "recognized":
-            return self._core._handle.resolve(name) is not None  # pyright: ignore[reportPrivateUsage]  # see above
-        raise RustCoreUnsupported(f"registry().resolve(kind={kind!r}) is not served by the Rust router core")
-
-    def aliases(self) -> dict[str, object]:  # pyright: ignore[reportIncompatibleMethodOverride]  # mutable-ok: a fresh dict
-        return dict(self._core._resolved.model_group_alias)  # pyright: ignore[reportPrivateUsage]  # see above
-
-    def _target(self, name: str) -> str:
-        aliases: Final = self._core._resolved.model_group_alias  # pyright: ignore[reportPrivateUsage]  # see above
-        return _alias_target(aliases.get(name)) or name if name in aliases else name
-
-
-_REGISTRY_SERVED: Final = frozenset(
-    {
-        "version",
-        "deployment",
-        "has_deployment",
-        "deployment_dict",
-        "deployments",
-        "all",
-        "names",
-        "resolve",
-        "aliases",
-        "_records",
-        "_target",
-    }
-)
-
-
-def _team_of(record: Mapping[str, object]) -> str | None:
-    team: Final = (as_str_mapping(record.get("model_info")) or {}).get("team_id")
-    return team if isinstance(team, str) else None
-
-
-def _usable_by(record: Mapping[str, object], team_id: str | None) -> bool:
-    team: Final = _team_of(record)
-    return team is None or team == team_id
-
-
-def _hidden(target: object) -> bool:
-    mapping: Final = as_str_mapping(target)
-    return mapping is not None and mapping.get("hidden") is True
-
-
-def _alias_target(target: object) -> str | None:
-    mapping: Final = as_str_mapping(target)
-    if mapping is not None:
-        model: Final = mapping.get("model")
-        return model if isinstance(model, str) else None
-    return target if isinstance(target, str) else None
 
 
 class RustSettings(RouterSettings):
@@ -799,7 +634,15 @@ class RustCore(_SettingsSource):
         self._version: int = 1
         self._retired: bool = False
         self._settings: RustSettings | None = None
-        self._handle: RouterCoreHandle = self._new_handle(list(_as_list(config.get("model_list"))))
+        self._registry_view: RouterRegistry | None = None
+        self._hosted: Final = HostRegistry(
+            host,
+            model_group_alias=dict(resolved.model_group_alias),  # pyright: ignore[reportArgumentType]  # the configured alias map
+            ignore_invalid_deployments=bool(config.get("ignore_invalid_deployments")),
+            on_change=self._sync_registry,
+        )
+        self._hosted.build(_as_list(config.get("model_list")) if config.get("model_list") is not None else None)
+        self._handle: RouterCoreHandle = self._new_handle(list(self._hosted._core_model_list))  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
 
     @classmethod
     def build(cls, config: RouterConfig, host: PythonHost) -> "RustCore":
@@ -832,13 +675,24 @@ class RustCore(_SettingsSource):
     def _rebuild(self) -> None:
         """A new Rust core for changed static settings, over the same deployments."""
         old: Final = self._handle
-        self._handle = self._new_handle(list(old.deployments()))
+        self._handle = self._new_handle(list(self._hosted._core_model_list))  # pyright: ignore[reportPrivateUsage]  # see __init__
         old.retire()
+
+    def _sync_registry(self) -> None:
+        """Hand the host registry's model_list to the Rust core after a write."""
+        from litellm.rust_bridge._native import RouterCoreHandle
+
+        handle: Final[object] = self.__dict__.get("_handle")
+        if isinstance(handle, RouterCoreHandle):
+            _ = handle.apply({"replace": _plain(list(self._hosted._core_model_list))})  # pyright: ignore[reportPrivateUsage]  # see __init__
 
     # -- entry points ----------------------------------------------------------------------------
 
-    def registry(self) -> RustRegistry:
-        return RustRegistry(self)
+    def registry(self) -> RouterRegistry:
+        """The registry view, built once (``registry()`` returns the same object each time)."""
+        if self._registry_view is None:
+            self._registry_view = hosted_registry_view(self._hosted)
+        return self._registry_view
 
     def settings(self) -> RustSettings:
         """A cached snapshot, replaced when a changeset changes a setting."""
@@ -927,6 +781,8 @@ class RustCore(_SettingsSource):
             static_changed: Final = bool(_STATIC_SETTINGS & set(values))
             self._resolved = resolved
             self._settings = None
+            if "model_group_alias" in values:
+                self._hosted._core_model_group_alias = dict(resolved.model_group_alias)  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]  # see __init__
             if "cooldown_time" in values:
                 from litellm.router_utils.cooldown_cache import CooldownCache
 
@@ -936,41 +792,15 @@ class RustCore(_SettingsSource):
             else:
                 names: Final = [str(d.get("model_name")) for d in self._handle.deployments()]
                 self._handle.apply({"settings": resolved.dynamic_document(self._version, names)})
-        upserted: Final[list[Deployment | None]] = []  # mutable-ok: filled per upsert
-        deleted: Final[list[Deployment | None]] = []  # mutable-ok: filled per delete
-        # The registry as each write leaves it, in order: upserts first, then deletes
-        # (`apply_changes`). Writes that change nothing are not sent and keep the version.
-        view: Final[dict[str, Deployment | None]] = {}  # mutable-ok: filled per write
-        records: Final[list[object]] = []  # mutable-ok: the upserts that change a deployment
-        deletes: Final[list[str]] = []  # mutable-ok: the deletes of a deployment that exists
-
-        def current(id: str) -> Deployment | None:
-            if id in view:
-                return view[id]
-            record: Final = self._handle.deployment(id)
-            return None if record is None else _deployment(record)
-
-        for deployment in changes.upsert:
-            record = _plain(_record(deployment))
-            new = _deployment(record)
-            id = str(new.model_info.id)
-            old = current(id)
-            if old is not None and _same_deployment(old, new):
-                upserted.append(None)
-                continue
-            view[id] = new
-            records.append(record)
-            upserted.append(new)
-        for id in changes.delete:
-            old = current(id)
-            deleted.append(old)
-            if old is not None:
-                view[id] = None
-                deletes.append(id)
-        if records or deletes:
-            self._handle.apply({"upsert": records, "delete": deletes})
-            self._version += 1
-        return ApplyResult(version=self._version, upserted=upserted, deleted=deleted)
+        # Upserts first, then deletes (`apply_changes`), through the host registry, which hands
+        # each change to the Rust core.
+        upserted: Final = [self._hosted._core_upsert_deployment(deployment=d) for d in changes.upsert]  # pyright: ignore[reportPrivateUsage]  # see __init__
+        deleted: Final = [self._hosted._core_delete_deployment(id=i) for i in changes.delete]  # pyright: ignore[reportPrivateUsage]  # see __init__
+        return ApplyResult(
+            version=self._hosted._registry_version,  # pyright: ignore[reportPrivateUsage]  # see __init__
+            upserted=upserted,
+            deleted=deleted,  # pyright: ignore[reportArgumentType]  # the removed model_list entries, as the core returns them
+        )
 
     def upsert_deployment(self, deployment: Deployment) -> Deployment | None:
         from litellm.router_deprecated import (

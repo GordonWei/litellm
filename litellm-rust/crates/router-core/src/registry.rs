@@ -205,9 +205,13 @@ pub struct NameFilter {
     pub include_aliases: bool,
 }
 
-/// One atomic change: upserts, deletes and, optionally, a new dynamic config.
+/// One atomic change: optionally a whole new deployment list, then upserts, deletes and,
+/// optionally, a new dynamic config.
 #[derive(Clone, Debug, Default)]
 pub struct ChangeSet {
+    /// Every deployment, in order, replacing the current list (the host registry's `model_list`
+    /// after a write; it may hold one id more than once, as the Python router's list can).
+    pub replace: Option<Vec<DeploymentSpec>>,
     pub upserts: Vec<DeploymentSpec>,
     pub deletes: Vec<String>,
     pub settings: Option<crate::config::RouterDynamicConfig>,
@@ -231,16 +235,12 @@ impl Registry {
         aliases: BTreeMap<String, String>,
         routing_groups: Vec<RoutingGroupSpec>,
     ) -> Result<Self, ConfigError> {
+        // One id may name several deployments (a per-organization fan-out, or two entries
+        // declaring one id): each is kept, and the id finds the last, as the Python router keeps them.
         let deployments = specs
             .into_iter()
             .map(|spec| Deployment::from_spec(spec).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut seen = BTreeSet::new();
-        if let Some(duplicate) = deployments.iter().find(|d| !seen.insert(d.id.as_str())) {
-            return Err(ConfigError::DuplicateId {
-                id: duplicate.id.clone(),
-            });
-        }
         Ok(Self::index(0, deployments, aliases, routing_groups))
     }
 
@@ -300,7 +300,13 @@ impl Registry {
         changes: &ChangeSet,
         aliases: Option<BTreeMap<String, String>>,
     ) -> Result<Self, ConfigError> {
-        let mut deployments = self.deployments.clone();
+        let mut deployments = match &changes.replace {
+            Some(specs) => specs
+                .iter()
+                .map(|spec| Deployment::from_spec(spec.clone()).map(Arc::new))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => self.deployments.clone(),
+        };
         for spec in &changes.upserts {
             let deployment = Deployment::from_spec(spec.clone())?;
             deployments.retain(|existing| existing.id != deployment.id);
