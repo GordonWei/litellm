@@ -26,6 +26,9 @@ fn port(url: &str) -> u16 {
 #[case::system_roots_only(false, false)]
 #[tokio::test]
 async fn python_tls_kwargs_reach_the_server(#[case] with_ca: bool, #[case] connects: bool) {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     let server = RedisTlsServer::start(false).await.unwrap();
     let kwargs = serde_json::json!({
         "host": server.host(),
