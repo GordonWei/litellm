@@ -32,6 +32,9 @@ pub struct RoutingGroupSpec {
     pub group_name: String,
     pub models: Vec<String>,
     pub routing_strategy: crate::config::RoutingStrategy,
+    /// A priority group's member priorities, served as each member's `order`.
+    #[serde(default)]
+    pub model_priorities: Option<BTreeMap<String, i64>>,
 }
 
 /// The `model_info` fields the router reads; every other key stays in [`Self::raw`].
@@ -417,18 +420,33 @@ impl Registry {
             let group = deployment.model_name.clone();
             return resolution(ResolveKind::Id, &group, vec![deployment]);
         }
+        let routing_group_named = |name: &str| {
+            // A model group of the same name shadows a routing group (`get_routing_group`).
+            (!self.by_group.contains_key(name))
+                .then(|| self.routing_groups.iter().find(|g| g.group_name == name))
+                .flatten()
+        };
         if let Some(target) = self.aliases.get(name) {
+            if let Some(routing_group) = routing_group_named(target) {
+                let deployments = crate::routing_groups::members(routing_group, |model| {
+                    self.by_group
+                        .get(model)
+                        .map(|indices| self.at(indices))
+                        .unwrap_or_default()
+                });
+                return resolution(ResolveKind::RoutingGroup, target, deployments);
+            }
             return self
                 .group(target)
                 .and_then(|deployments| resolution(ResolveKind::Alias, target, deployments));
         }
-        if let Some(routing_group) = self.routing_groups.iter().find(|g| g.group_name == name) {
-            let deployments = routing_group
-                .models
-                .iter()
-                .filter_map(|model| self.by_group.get(model))
-                .flat_map(|indices| self.at(indices))
-                .collect();
+        if let Some(routing_group) = routing_group_named(name) {
+            let deployments = crate::routing_groups::members(routing_group, |model| {
+                self.by_group
+                    .get(model)
+                    .map(|indices| self.at(indices))
+                    .unwrap_or_default()
+            });
             return resolution(ResolveKind::RoutingGroup, name, deployments);
         }
         if let Some(indices) = self.by_group.get(name) {

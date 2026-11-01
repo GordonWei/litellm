@@ -24,7 +24,7 @@ from litellm.router_strategy.lowest_cost import LowestCostLoggingHandler
 from litellm.router_strategy.lowest_latency import LowestLatencyLoggingHandler
 from litellm.router_strategy.lowest_tpm_rpm import LowestTPMLoggingHandler
 from litellm.router_strategy.lowest_tpm_rpm_v2 import LowestTPMLoggingHandler_v2
-from litellm.types.router import RoutingStrategy
+from litellm.types.router import RoutingGroup, RoutingStrategy
 
 if TYPE_CHECKING:
     from litellm.caching.dual_cache import DualCache
@@ -322,10 +322,62 @@ __all__ = [
     "Selector",
     "StrategySelectors",
     "build_selector",
+    "group_documents",
+    "group_settings",
     "normalize_strategy",
+    "parse_groups",
     "pick_async",
     "pick_sync",
     "picked_id",
     "routing_pre_call_checks",
     "routing_pre_call_checks_sync",
 ]
+
+
+def parse_groups(
+    groups_input: object, model_names: frozenset[str], aliases: frozenset[str]
+) -> tuple[RoutingGroup, ...]:
+    """``_init_routing_groups``' validation: ``parse_routing_groups``, then a priority group may not
+    share its name with a model group or alias (a plain group only warns: its name is shadowed)."""
+    from litellm._logging import verbose_router_logger
+    from litellm.litellm_core_utils.routing_groups import (
+        parse_routing_groups,  # pyright: ignore[reportUnknownVariableType]  # takes untyped dicts
+    )
+
+    if not groups_input or not isinstance(groups_input, list | tuple):
+        return ()
+    groups: Final = parse_routing_groups(  # pyright: ignore[reportUnknownVariableType]  # returns RoutingGroup models
+        list(groups_input),  # pyright: ignore[reportUnknownArgumentType]  # validated by parse_routing_groups
+        known_model_names=model_names,
+    )
+    for group in groups:
+        if group.group_name in model_names or group.group_name in aliases:
+            if group.routing_strategy == "priority":
+                raise ValueError("Priority routing group names must not shadow a model or alias")
+            verbose_router_logger.warning(
+                "routing_groups: group_name '%s' is shadowed by an existing model_name or model_group_alias; "
+                "the group's strategy still applies to its members, but the name is not callable until renamed.",
+                group.group_name,
+            )
+    return groups
+
+
+def group_documents(groups: Sequence[RoutingGroup]) -> list[Mapping[str, object]]:  # mutable-ok: a JSON list
+    """The routing groups as the Rust core reads them."""
+    return [
+        {
+            "group_name": group.group_name,
+            "models": list(group.models),
+            "routing_strategy": group.routing_strategy,
+            **({"model_priorities": dict(group.model_priorities)} if group.model_priorities is not None else {}),
+        }
+        for group in groups
+    ]
+
+
+def group_settings(groups: Sequence[RoutingGroup]) -> list[object]:  # mutable-ok: the settings snapshot's list
+    """``get_settings()['routing_groups']``."""
+    return [
+        group.model_dump(exclude={"model_priorities"}) if group.model_priorities is None else group.model_dump()
+        for group in groups
+    ]

@@ -222,9 +222,14 @@ pub(crate) enum Finish {
     Selected {
         deployment_id: String,
         model_group: String,
+        /// The deployment as served: a priority group's member carries its priority as `order`.
+        deployment: Value,
     },
-    /// `healthy`: the deployments a pick would choose among.
-    Healthy { deployment_ids: Vec<String> },
+    /// `healthy`: the deployments a pick would choose among, as served.
+    Healthy {
+        deployment_ids: Vec<String>,
+        deployments: Vec<Value>,
+    },
     /// `report_failure`: whether the deployment was cooled down.
     Reported { cooled: bool },
 }
@@ -998,11 +1003,13 @@ mod tests {
                 .map(|deployment| Finish::Selected {
                     deployment_id: deployment.id.clone(),
                     model_group: deployment.model_name.clone(),
+                    deployment: deployment_record(&deployment),
                 })
         });
         let Step::Done(Finish::Selected {
             deployment_id,
             model_group,
+            ..
         }) = store.resume(&mut driver, None)
         else {
             panic!("a selection should finish with the pick");

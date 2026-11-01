@@ -132,6 +132,7 @@ impl RouterCoreHandle {
             Ok(Finish::Selected {
                 deployment_id: deployment.id.clone(),
                 model_group: deployment.model_name.clone(),
+                deployment: host::deployment_record(&deployment),
             })
         }))
     }
@@ -145,6 +146,10 @@ impl RouterCoreHandle {
             let deployments = router.healthy(&Op::Completion, &request).await?;
             Ok(Finish::Healthy {
                 deployment_ids: deployments.iter().map(|d| d.id.clone()).collect(),
+                deployments: deployments
+                    .iter()
+                    .map(|d| host::deployment_record(d))
+                    .collect(),
             })
         }))
     }
@@ -529,12 +534,24 @@ fn done_items(dict: &Bound<'_, PyDict>, finish: Finish) -> PyResult<()> {
         Finish::Selected {
             deployment_id,
             model_group,
+            deployment,
         } => {
             dict.set_item("deployment_id", deployment_id)?;
-            dict.set_item("model_group", model_group)
+            dict.set_item("model_group", model_group)?;
+            dict.set_item("deployment", to_py(dict.py(), &deployment)?)
         }
         Finish::Reported { cooled } => dict.set_item("cooled", cooled),
-        Finish::Healthy { deployment_ids } => dict.set_item("deployment_ids", deployment_ids),
+        Finish::Healthy {
+            deployment_ids,
+            deployments,
+        } => {
+            dict.set_item("deployment_ids", deployment_ids)?;
+            let records = deployments
+                .iter()
+                .map(|d| to_py(dict.py(), d))
+                .collect::<PyResult<Vec<_>>>()?;
+            dict.set_item("deployments", PyList::new(dict.py(), records)?)
+        }
     }
 }
 

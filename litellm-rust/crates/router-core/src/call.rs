@@ -231,9 +231,15 @@ impl Core {
             FailureKind::ContextWindowExceeded | FailureKind::ContentPolicyViolation
         );
         if !skip_order {
-            let mut orders: Vec<i64> = snapshot
-                .registry
-                .group(&target.group)
+            // A routing group's members, with a priority group's priorities as their order.
+            let members = snapshot.registry.group(&target.group).or_else(|| {
+                snapshot
+                    .registry
+                    .resolve(&target.group, crate::registry::ResolveScope::default())
+                    .filter(|resolution| resolution.kind == ResolveKind::RoutingGroup)
+                    .map(|resolution| resolution.deployments)
+            });
+            let mut orders: Vec<i64> = members
                 .unwrap_or_default()
                 .iter()
                 .filter(|d| d.usable_by_team(request.team_id.as_deref()))
@@ -521,7 +527,10 @@ impl Core {
             single_deployment: snapshot
                 .registry
                 .group(&deployment.model_name)
-                .map_or(candidates.all.len() == 1, |group| group.len() == 1),
+                .map_or(candidates.all.len() == 1, |group| group.len() == 1)
+                // A routing group call with alternatives cools its member down so selection
+                // moves on (`routing_group_alternatives`).
+                && !(candidates.kind == ResolveKind::RoutingGroup && candidates.all.len() > 1),
             has_fallback_group: snapshot
                 .settings
                 .dynamic

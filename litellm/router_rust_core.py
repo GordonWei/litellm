@@ -68,7 +68,10 @@ from litellm.router_python_host import PythonHost
 from litellm.router_rust_selection import (
     SELECTOR_ATTRIBUTES,
     StrategySelectors,
+    group_documents,
+    group_settings,
     normalize_strategy,
+    parse_groups,
     pick_async,
     pick_sync,
     picked_id,
@@ -77,7 +80,7 @@ from litellm.router_rust_selection import (
 )
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
-from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError, RoutingStrategy
+from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError, RoutingGroup, RoutingStrategy
 from litellm.types.utils import LlmProviders
 
 if TYPE_CHECKING:
@@ -145,6 +148,7 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "model_list",
         "routing_strategy",
         "routing_strategy_args",
+        "routing_groups",
         "model_group_alias",
         "fallbacks",
         "default_fallbacks",
@@ -198,7 +202,15 @@ _UNSERVED_REQUEST_KEYS: Final = frozenset(
 # Settings a changeset may change. Static ones rebuild the Rust core (settings are fixed for a
 # core's life); dynamic ones are handed to it as a new dynamic document.
 _STATIC_SETTINGS: Final = frozenset(
-    {"routing_strategy", "cooldown_time", "disable_cooldowns", "allowed_fails_policy", "retry_after", "timeout"}
+    {
+        "routing_strategy",
+        "routing_groups",
+        "cooldown_time",
+        "disable_cooldowns",
+        "allowed_fails_policy",
+        "retry_after",
+        "timeout",
+    }
 )
 _DYNAMIC_SETTINGS: Final = frozenset(
     {
@@ -318,6 +330,7 @@ class Resolved:
     default_litellm_params: Mapping[str, object]
     fallback_access_check: object
     fallback_budget_check: object
+    routing_groups: "tuple[RoutingGroup, ...]" = ()
     assigned: frozenset[str] = frozenset()
 
     @classmethod
@@ -369,6 +382,15 @@ class Resolved:
             default_litellm_params=MappingProxyType(dict(as_str_mapping(get("default_litellm_params")) or {})),
             fallback_access_check=get("fallback_access_check"),
             fallback_budget_check=get("fallback_budget_check"),
+            routing_groups=parse_groups(
+                get("routing_groups"),
+                frozenset(
+                    str(name)
+                    for entry in _as_list(get("model_list"))
+                    if (name := (as_str_mapping(entry) or {}).get("model_name"))
+                ),
+                frozenset(as_str_mapping(get("model_group_alias")) or {}),
+            ),
         )
 
     def changed(self, values: Mapping[str, object], updated: frozenset[str] = frozenset()) -> "Resolved":
@@ -380,7 +402,7 @@ class Resolved:
         unknown: Final = sorted(
             set(values)
             - {*SETTING_FIELDS, *PLAIN_SETTING_ATTRIBUTES, *ASSIGNABLE_ALIASES}
-            - (updated & {"routing_strategy_args"})
+            - (updated & {"routing_strategy_args", "routing_groups"})
         )
         if unknown:
             raise ValueError(f"not assignable router settings: {unknown}")
@@ -425,6 +447,7 @@ class Resolved:
             "allowed_fails_policy": _plain(self.allowed_fails_policy),
             "retry_after": self.retry_after,
             "timeout": self.timeout,
+            "routing_groups": group_documents(self.routing_groups) if self.routing_groups else None,
         }
         return {name: value for name, value in values.items() if value is not None}
 
@@ -470,6 +493,17 @@ class Resolved:
             name: spelled for name in names if (spelled := _provider_prefixed_model_group(name, keys)) is not None
         }
         return {"providers": _PROVIDERS, "provider_prefixed": prefixed}
+
+
+def _group_selectors(groups: "Sequence[RoutingGroup]") -> Sequence[tuple[str, str, Mapping[str, object]]]:
+    return [
+        (
+            group.group_name,
+            group.routing_strategy,
+            as_str_mapping(group.routing_strategy_args) or {},  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # RoutingGroup's untyped dict
+        )
+        for group in groups
+    ]
 
 
 def _optional_bool(value: object) -> bool | None:
@@ -598,6 +632,9 @@ class RustRegistry(RouterRegistry):
         if model_name is None:
             return list(records)
         target: Final = self._target(model_name)
+        group: Final = self._callable_group(target)
+        if group is not None:
+            return self._group_rows(group, model_name, records)
         found: Final = [
             record for record in records if record.get("model_name") == target and _usable_by(record, team_id)
         ]
@@ -636,6 +673,14 @@ class RustRegistry(RouterRegistry):
                         names.append(public)
             aliases: Final = self._core._resolved.model_group_alias  # pyright: ignore[reportPrivateUsage]  # see above
             names.extend(alias for alias, target in aliases.items() if not _hidden(target))
+            # Callable routing groups are listed once per member deployment (`get_model_list` rows).
+            groups: Final = self._core._resolved.routing_groups  # pyright: ignore[reportPrivateUsage]  # see above
+            model_names: Final = {str(record.get("model_name")) for record in records}
+            for group in groups:
+                if group.group_name in model_names or group.group_name in aliases:
+                    continue
+                members = sum(1 for record in records if record.get("model_name") in group.models)
+                names.extend([group.group_name] * members)
             return names
         raise RustCoreUnsupported(f"registry().names(kind={kind!r}) is not served by the Rust router core")
 
@@ -651,6 +696,18 @@ class RustRegistry(RouterRegistry):
         if kind == "from_id":
             record: Final = self._core._handle.deployment(str(name))  # pyright: ignore[reportPrivateUsage]  # see above
             return None if record is None else str((as_str_mapping(record) or {}).get("model_name"))
+        if kind == "routing_group_alternatives":
+            # `_core_routing_group_has_alternatives`: a callable routing group whose members span
+            # more than one deployment.
+            if name is None:
+                return False
+            group_of: Final = self._callable_group(
+                _alias_target(aliases.get(name)) or name if name in aliases else name
+            )
+            if group_of is None:
+                return False
+            records_of: Final = self._records()
+            return sum(1 for record in records_of if record.get("model_name") in group_of.models) > 1
         if name is None:
             raise TypeError(f"registry().resolve(kind={kind!r}) needs a name")
         if kind == "alias":
@@ -663,6 +720,39 @@ class RustRegistry(RouterRegistry):
         if kind == "recognized":
             return self._core._handle.resolve(name) is not None  # pyright: ignore[reportPrivateUsage]  # see above
         raise RustCoreUnsupported(f"registry().resolve(kind={kind!r}) is not served by the Rust router core")
+
+    def _callable_group(self, name: str | None) -> "RoutingGroup | None":
+        """``get_routing_group``: the routing group callable as ``name``; a model group or alias of
+        the same name shadows it."""
+        if name is None:
+            return None
+        groups: Final = self._core._resolved.routing_groups  # pyright: ignore[reportPrivateUsage]  # the registry reads its own core
+        group: Final = next((g for g in groups if g.group_name == name), None)
+        if group is None or name in self._core._resolved.model_group_alias:  # pyright: ignore[reportPrivateUsage]  # see above
+            return None
+        if any(record.get("model_name") == name for record in self._records()):
+            return None
+        return group
+
+    def _group_rows(
+        self, group: "RoutingGroup", name: str, records: Sequence[Mapping[str, object]]
+    ) -> list[Mapping[str, object]]:  # mutable-ok: a fresh list, as get_model_list returns
+        """A routing group's member deployments listed under ``name``, without the members' access
+        groups, a priority group's priority as each one's order (``_materialize_routing_group_rows``)."""
+        rows: Final[list[Mapping[str, object]]] = []  # mutable-ok: filled here, then returned
+        for member in group.models:
+            priority = (group.model_priorities or {}).get(member) if group.routing_strategy == "priority" else None
+            for record in records:
+                if record.get("model_name") != member:
+                    continue
+                params = dict(as_str_mapping(record.get("litellm_params")) or {})
+                if priority is not None:
+                    params["order"] = priority
+                info = {
+                    k: v for k, v in (as_str_mapping(record.get("model_info")) or {}).items() if k != "access_groups"
+                }
+                rows.append({**record, "model_name": name, "litellm_params": params, "model_info": info})
+        return rows
 
     def aliases(self) -> dict[str, object]:  # pyright: ignore[reportIncompatibleMethodOverride]  # mutable-ok: a fresh dict
         return dict(self._core._resolved.model_group_alias)  # pyright: ignore[reportPrivateUsage]  # see above
@@ -685,6 +775,8 @@ _REGISTRY_SERVED: Final = frozenset(
         "aliases",
         "_records",
         "_target",
+        "_callable_group",
+        "_group_rows",
     }
 )
 
@@ -835,6 +927,7 @@ class RustCore(_SettingsSource):
         self._settings: RustSettings | None = None
         self._selectors: Final = StrategySelectors(host, self._cache)
         self._selectors.init_default(resolved.routing_strategy, resolved.routing_strategy_args)
+        self._selectors.init_groups(_group_selectors(resolved.routing_groups))
         self._handle: RouterCoreHandle = self._new_handle(list(_as_list(config.get("model_list"))))
 
     @classmethod
@@ -937,7 +1030,7 @@ class RustCore(_SettingsSource):
             "fallbacks": r.fallbacks,
             "context_window_fallbacks": r.context_window_fallbacks,
             "model_group_alias": dict(r.model_group_alias),
-            "routing_groups": [],
+            "routing_groups": group_settings(r.routing_groups),
         }
 
     def health(self) -> RustHealth:
@@ -964,6 +1057,12 @@ class RustCore(_SettingsSource):
         if changes.redis_cache is not None or changes.refresh_model_info:
             raise RustCoreUnsupported("apply(redis_cache / refresh_model_info) is not served by the Rust router core")
         values: Final = {**changes.assign, **changes.settings}
+        if "routing_groups" in changes.settings:
+            values["routing_groups"] = parse_groups(
+                changes.settings["routing_groups"],
+                frozenset(str(d.get("model_name")) for d in self._handle.deployments()),
+                frozenset(self._resolved.model_group_alias),
+            )
         if values:
             previous: Final = self._resolved
             resolved: Final = previous.changed(values, frozenset(changes.settings))
@@ -1023,6 +1122,9 @@ class RustCore(_SettingsSource):
             self._selectors.init_default(
                 resolved.routing_strategy, as_str_mapping(values.get("routing_strategy_args")) or {}
             )
+            self._selectors.init_groups(_group_selectors(resolved.routing_groups))
+        elif "routing_groups" in values:
+            self._selectors.init_groups(_group_selectors(resolved.routing_groups))
         elif "routing_strategy_args" in values and resolved.routing_strategy_args != previous.routing_strategy_args:
             self._selectors.rebuild_default(resolved.routing_strategy_args)
 
@@ -1081,11 +1183,13 @@ class RustCore(_SettingsSource):
                 case "select":
                     outcome = await self._answer_select(step, request, messages, input)
                 case "done" if kind == "healthy":
-                    records = (self._handle.deployment(str(i)) for i in _as_list(step.get("deployment_ids")))
-                    return [for_requested_model(as_str_mapping(record) or {}, model) for record in records]
+                    # The deployments as served: a priority group's members carry their priority as order.
+                    return [
+                        for_requested_model(as_str_mapping(record) or {}, model)
+                        for record in _as_list(step.get("deployments"))
+                    ]
                 case "done":
-                    record = self._handle.deployment(str(step["deployment_id"]))
-                    return for_requested_model(as_str_mapping(record) or {}, model)
+                    return for_requested_model(as_str_mapping(step.get("deployment")) or {}, model)
                 case "failed":
                     raise self._failure_error(step, model, None)
                 case other:
