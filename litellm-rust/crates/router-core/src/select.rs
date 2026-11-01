@@ -13,7 +13,8 @@ use crate::{
     config::{Op, RoutingStrategy},
     error::Error,
     host::{RouterRequest, RoutingContext, SelectStage},
-    registry::{Deployment, ResolveKind, ResolveScope},
+    registry::{Deployment, ResolveKind},
+    resolve::{Caller, resolve_request},
     strategy::{StrategyScope, routing_context},
 };
 
@@ -151,6 +152,41 @@ fn uses_pass_through(deployment: &Deployment) -> bool {
     }
 }
 
+/// `filter_team_based_models`: a team-owned deployment serves only its team, except that a proxy
+/// admin without a team keeps deployments that are all team-owned and listed under the model the
+/// request names, unless they belong to several teams.
+fn filter_team_based(
+    deployments: Vec<Arc<Deployment>>,
+    request: &RouterRequest,
+) -> Result<Vec<Arc<Deployment>>, Error> {
+    let team_id = request.team_id.as_deref();
+    if team_id.is_none()
+        && request.proxy_admin
+        && let Some(requested) = request.admin_model.as_deref()
+        && !deployments.is_empty()
+        && deployments.iter().all(|d| {
+            d.model_info.team_id.is_some()
+                && (d.model_name == requested
+                    || d.model_info.team_public_model_name.as_deref() == Some(requested))
+        })
+    {
+        let teams: std::collections::BTreeSet<&str> = deployments
+            .iter()
+            .filter_map(|d| d.model_info.team_id.as_deref())
+            .collect();
+        if teams.len() > 1 {
+            return Err(Error::MultipleTeams {
+                model: requested.to_owned(),
+            });
+        }
+        return Ok(deployments);
+    }
+    Ok(deployments
+        .into_iter()
+        .filter(|d| d.usable_by_team(team_id))
+        .collect())
+}
+
 impl Core {
     fn context<'a>(
         &'a self,
@@ -197,49 +233,34 @@ impl Core {
         } else {
             None
         };
-        let scope = ResolveScope {
-            specific_deployment: request.specific_deployment,
-        };
         let dynamic = &snapshot.settings.dynamic;
-        let resolution = registry
-            .resolve_for(name, scope, request.team_id.as_deref())
-            .or_else(|| {
-                // No deployment for the name: route to the first default fallback.
-                let default = dynamic
-                    .fallbacks
-                    .default_target()
-                    .or_else(|| dynamic.default_fallbacks.first().map(String::as_str))?;
-                registry.resolve(default, scope)
-            })
-            .ok_or_else(|| Error::UnknownModel {
-                model: name.to_owned(),
-            })?;
-        // `_drop_strategy_markers`: a marker is never a callable deployment.
-        let resolved_any = !resolution.deployments.is_empty();
+        // No deployment for the name: route to the first default fallback.
+        let default_target = dynamic
+            .fallbacks
+            .default_target()
+            .or_else(|| dynamic.default_fallbacks.first().map(String::as_str));
+        let caller = Caller {
+            team_id: request.team_id.as_deref(),
+            proxy_admin: request.proxy_admin,
+            allowed_models: &request.allowed_models,
+        };
+        let resolution = resolve_request(
+            registry,
+            name,
+            request.specific_deployment,
+            caller,
+            default_target,
+            jiff::Timestamp::now(),
+        )?
+        .ok_or_else(|| Error::UnknownModel {
+            model: name.to_owned(),
+        })?;
         let first_model = resolution
             .deployments
             .first()
             .map(|d| d.params.model.clone());
-        let deployments: Vec<Arc<Deployment>> = resolution
-            .deployments
-            .iter()
-            .filter(|d| !is_strategy_marker(d))
-            .cloned()
-            .collect();
-        if resolved_any && deployments.is_empty() {
-            return Err(Error::OnlyMarkers {
-                // A marker named by its id is reported by its litellm model.
-                model: match resolution.kind {
-                    ResolveKind::Id => first_model.unwrap_or_else(|| name.to_owned()),
-                    _ => name.to_owned(),
-                },
-            });
-        }
         let team_id = request.team_id.as_deref();
-        let usable: Vec<Arc<Deployment>> = deployments
-            .into_iter()
-            .filter(|d| d.usable_by_team(team_id))
-            .collect();
+        let usable = filter_team_based(resolution.deployments.clone(), request)?;
         // `_filter_reserved_deployments`: PTU shares keep holders to their share and everyone
         // else to the deployments split into none.
         let (mut all, withheld) = crate::ptu::filter_shared(usable, team_id);

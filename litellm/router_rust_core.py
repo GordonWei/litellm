@@ -61,6 +61,7 @@ from litellm.router_api import (
 from litellm.router_attempt import for_requested_model, request_from_call
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_rust_access import caller_fields, selection_refusal
 from litellm.router_rust_endpoints import (
     AttemptCall,
     Plan,
@@ -702,6 +703,7 @@ def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
         **({"model_group_retry_policy": _plain(group_policies)} if group_policies is not None else {}),
         **lists,
         **({"team_id": team_id} if team_id else {}),
+        **caller_fields(request),
     }
 
 
@@ -1964,6 +1966,9 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
 
         kind: Final = step.get("error_kind")
         aliases: Final = self._resolved.model_group_alias
+        refused: Final = selection_refusal(step, model, request or {})
+        if refused is not None:
+            return refused
         if kind == "paused":
             # The message names the deployment's litellm model, not the id that was asked for.
             record: Final = as_str_mapping(self._handle.deployment(model)) or {}
@@ -2025,10 +2030,6 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
             return ValueError(f"No deployments left after routing-plugin filtering. candidate_models={left}")
         if kind == "routing_plugins_need_async":
             return ValueError(SYNC_PATH_MESSAGE)
-        if kind == "invalid_router_weights":
-            return router_weights_error((request or {}).get("_router_weights"))
-        if kind == "non_numeric_weight":
-            return TypeError(f"Deployment {step.get('error_detail')} must be numeric")
         if kind == "unknown_model":
             named: Final = _alias_target(aliases.get(model)) or model if model in aliases else model
             return litellm_exceptions.BadRequestError(
@@ -2061,19 +2062,6 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         if last is not None:
             return last
         return RuntimeError(f"router-core ({kind}): {step.get('error')}")
-
-
-def router_weights_error(raw: object) -> BaseException:
-    """The error ``validate_router_weights`` raises for weights the Rust core refused."""
-    from pydantic import ValidationError
-
-    from litellm.types.router_weights import validate_router_weights
-
-    try:
-        _ = validate_router_weights(raw)
-    except ValidationError as error:
-        return error
-    return RuntimeError(f"router-core refused router weights the validator accepts: {raw!r}")
 
 
 def _uses_pass_through(record: object) -> bool:

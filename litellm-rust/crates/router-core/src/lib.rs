@@ -73,6 +73,7 @@
 //! - [`precall`]: the `enable_pre_call_checks` filter.
 //! - [`host`]: the `Host` boundary.
 
+pub mod access;
 pub mod cache;
 pub mod call;
 pub mod config;
@@ -85,6 +86,7 @@ pub mod precall;
 pub mod prerouting;
 pub mod ptu;
 pub mod registry;
+pub mod resolve;
 pub mod retry;
 pub mod routing_groups;
 pub mod routing_plugins;

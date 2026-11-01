@@ -67,6 +67,10 @@ enum ErrorKind {
     RoutingPluginsLeftNothing,
     #[strum(serialize = "routing_plugins_need_async")]
     RoutingPluginsNeedAsync,
+    #[strum(serialize = "multiple_teams")]
+    MultipleTeams,
+    #[strum(serialize = "reserved")]
+    Reserved,
     #[strum(serialize = "invalid_router_weights")]
     InvalidRouterWeights,
     #[strum(serialize = "non_numeric_weight")]
@@ -91,6 +95,8 @@ impl From<&Error> for ErrorKind {
             Error::UnsupportedParams { .. } => Self::UnsupportedParams,
             Error::RoutingPluginsLeftNothing { .. } => Self::RoutingPluginsLeftNothing,
             Error::RoutingPluginsNeedAsync => Self::RoutingPluginsNeedAsync,
+            Error::MultipleTeams { .. } => Self::MultipleTeams,
+            Error::Reserved { .. } => Self::Reserved,
             Error::InvalidRouterWeights => Self::InvalidRouterWeights,
             Error::NonNumericWeight { .. } => Self::NonNumericWeight,
         }
@@ -766,7 +772,9 @@ fn step_dict(py: Python<'_>, step: Step) -> PyResult<Bound<'_, PyDict>> {
             dict.set_item("error", Report::new(&error).to_string())?;
             dict.set_item("error_kind", <&'static str>::from(ErrorKind::from(&error)))?;
             match &error {
-                Error::OnlyMarkers { model } | Error::PtuReserved { model } => {
+                Error::OnlyMarkers { model }
+                | Error::PtuReserved { model }
+                | Error::MultipleTeams { model } => {
                     dict.set_item("error_model", model)?;
                 }
                 Error::ContextWindowExceeded { model, detail } => {
@@ -779,6 +787,14 @@ fn step_dict(py: Python<'_>, step: Step) -> PyResult<Bound<'_, PyDict>> {
                 }
                 Error::RoutingPluginsLeftNothing { models } => {
                     dict.set_item("error_params", PyList::new(dict.py(), models)?)?;
+                }
+                Error::Reserved {
+                    model,
+                    until,
+                    timezone,
+                } => {
+                    dict.set_item("error_model", model)?;
+                    dict.set_item("error_detail", format!("{until} {timezone}"))?;
                 }
                 Error::NonNumericWeight { metric } => {
                     dict.set_item("error_detail", metric)?;

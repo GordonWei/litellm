@@ -31,6 +31,14 @@ pub struct RouterRequest {
     pub body: Value,
     /// `user_api_key_team_id`.
     pub team_id: Option<String>,
+    /// The caller's `user_role` is `proxy_admin`.
+    pub proxy_admin: bool,
+    /// The caller's `models` plus `team_models` (`user_api_key_auth`), which narrow a caller
+    /// allowed only through access groups to those groups' deployments.
+    pub allowed_models: Vec<String>,
+    /// For a proxy admin, the model the request names (`model`, else the metadata
+    /// `model_group`), which keeps one team's deployments listed under it (`filter_team_based_models`).
+    pub admin_model: Option<String>,
     pub specific_deployment: bool,
     /// A per-request `num_retries`, which wins over the router's.
     pub num_retries: Option<u32>,

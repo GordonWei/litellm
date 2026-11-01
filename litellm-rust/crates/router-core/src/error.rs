@@ -59,6 +59,17 @@ pub enum Error {
     /// Every deployment `model` resolved to is split into PTU shares the caller holds none of.
     #[error("deployment `{model}` is reserved for the teams holding a PTU share of it")]
     PtuReserved { model: String },
+    /// A proxy admin without a team named a public model name several teams use.
+    #[error("model name `{model}` matches deployments from multiple teams")]
+    MultipleTeams { model: String },
+    /// Every deployment `model` resolved to is reserved for other teams by an active access
+    /// window, the first of which ends at `until` (`HH:MM`) in `timezone`.
+    #[error("deployment `{model}` is reserved for another team until {until} {timezone}")]
+    Reserved {
+        model: String,
+        until: String,
+        timezone: String,
+    },
     /// The pre-call checks found no deployment whose context window fits the prompt; `detail`
     /// names each one dropped for it.
     #[error("no deployment of `{model}` has a context window large enough for this call")]
@@ -95,6 +106,8 @@ impl Error {
             | Self::NoPassThroughDeployments { .. }
             | Self::OnlyMarkers { .. }
             | Self::PtuReserved { .. }
+            | Self::MultipleTeams { .. }
+            | Self::Reserved { .. }
             | Self::ContextWindowExceeded { .. }
             | Self::UnsupportedParams { .. }
             | Self::RoutingPluginsLeftNothing { .. }

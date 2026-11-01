@@ -19,7 +19,7 @@ use crate::{
     host::{Attempt, Blocked, Output, RetryCause, RouterEvent, RouterRequest},
     mock::MockFailure,
     prerouting::{PreRoute, PreRouted},
-    registry::{ResolveKind, ResolveScope},
+    registry::ResolveKind,
     retry::{RetryContext, resolve_retry_policy, should_retry},
     select::{Candidates, SelectInputs},
 };
@@ -354,7 +354,9 @@ impl Core {
             | Error::NotPassThrough { .. }
             | Error::NoPassThroughDeployments { .. }
             | Error::OnlyMarkers { .. }
-            | Error::PtuReserved { .. } => {
+            | Error::PtuReserved { .. }
+            | Error::MultipleTeams { .. }
+            | Error::Reserved { .. } => {
                 return None;
             }
         };
@@ -770,16 +772,21 @@ impl Core {
         // A name no deployment serves is routed to the first default fallback
         // (`_common_checks_available_deployment`), still stamped as the name.
         let defaulted = candidates.model_group != target.group
-            && snapshot
-                .registry
-                .resolve_for(
+            && matches!(
+                crate::resolve::resolve_request(
+                    &snapshot.registry,
                     &target.group,
-                    ResolveScope {
-                        specific_deployment: request.specific_deployment,
+                    request.specific_deployment,
+                    crate::resolve::Caller {
+                        team_id: request.team_id.as_deref(),
+                        proxy_admin: request.proxy_admin,
+                        allowed_models: &request.allowed_models,
                     },
-                    request.team_id.as_deref(),
-                )
-                .is_none();
+                    None,
+                    jiff::Timestamp::now(),
+                ),
+                Ok(None)
+            );
         let attempt = Attempt {
             op: op.clone(),
             request: request.clone(),
