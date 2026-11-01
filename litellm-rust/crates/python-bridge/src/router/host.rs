@@ -20,11 +20,11 @@ use std::{
 
 use async_trait::async_trait;
 use litellm_router_core::{
-    Attempt, AttemptError, Deployment, Error, Host, Output, Payload, PreRoute, PreRouted,
+    Attempt, AttemptError, Blocked, Deployment, Error, Host, Output, Payload, PreRoute, PreRouted,
     RouterCache, RouterEvent, RouterRequest, RouterResponse, RoutingContext, SelectStage,
     precall::PreCallFacts,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// The `kind` of a step dict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
@@ -131,6 +131,12 @@ pub(crate) enum Ask {
         fallback_depth: u32,
         fallback_level: u32,
         timeout: Option<f64>,
+        /// Request params the fallback walk's dict targets merged in.
+        params: Option<Box<Value>>,
+        /// The walk level whose request metadata the attempt carries.
+        scope: u32,
+        max_retries: u32,
+        model_group_size: usize,
     },
     Sleep {
         seconds: f64,
@@ -166,6 +172,8 @@ pub(crate) enum Ask {
         keys: Option<Vec<String>>,
         value: Option<Value>,
         ttl: Option<f64>,
+        /// The op reads or writes this worker's in-memory tier only (`local_only=True`).
+        local: bool,
     },
 }
 
@@ -187,6 +195,8 @@ impl Ask {
 pub(crate) enum Answer {
     /// The attempt's total tokens, or its failure.
     Attempt(Result<u64, AttemptError>),
+    /// A successful attempt whose response the provider blocked, with its tokens.
+    Blocked(u64, Blocked),
     Slept,
     AllowFallback(bool),
     /// The candidate ids that remain, pick first.
@@ -203,7 +213,7 @@ pub(crate) enum Answer {
 impl Answer {
     fn kind(&self) -> StepKind {
         match self {
-            Self::Attempt(_) => StepKind::Attempt,
+            Self::Attempt(_) | Self::Blocked(..) => StepKind::Attempt,
             Self::Slept => StepKind::Sleep,
             Self::AllowFallback(_) => StepKind::AllowFallback,
             Self::Select(_) | Self::PreCall(_) | Self::Models(_) => StepKind::Select,
@@ -260,6 +270,8 @@ pub(crate) enum Finish {
     },
     /// `report_failure`: whether the deployment was cooled down.
     Reported { cooled: bool },
+    /// `report_success` / `count_success`: the success counter's key, if one was counted.
+    Counted { key: Option<String> },
 }
 
 /// One step of a call: what it is blocked on, or how it ended.
@@ -384,12 +396,24 @@ async fn cache_step(
     value: Option<Value>,
     ttl: Option<Duration>,
 ) -> CacheOutcome {
+    ask_cache(op, key, keys, value, ttl, false).await
+}
+
+async fn ask_cache(
+    op: CacheOp,
+    key: Option<&str>,
+    keys: Option<&[String]>,
+    value: Option<Value>,
+    ttl: Option<Duration>,
+    local: bool,
+) -> CacheOutcome {
     let question = Ask::Cache {
         op,
         key: key.map(str::to_owned),
         keys: keys.map(<[String]>::to_vec),
         value,
         ttl: ttl_seconds(ttl),
+        local,
     };
     let Answer::Cache(outcome) = ask(question).await else {
         unreachable!("{CHECKED}");
@@ -449,6 +473,30 @@ impl RouterCache for StepCache {
         cache_step(CacheOp::Delete, Some(key), None, None, None).await;
         Ok(())
     }
+
+    async fn async_get_local(&self, key: &str) -> Result<Option<Value>, litellm_cache::Error> {
+        let CacheOutcome::Value(value) =
+            ask_cache(CacheOp::Get, Some(key), None, None, None, true).await
+        else {
+            unreachable!("{CHECKED}");
+        };
+        Ok(value)
+    }
+
+    async fn async_increment_local(
+        &self,
+        key: &str,
+        amount: f64,
+        ttl: Option<Duration>,
+    ) -> Result<f64, litellm_cache::Error> {
+        let value = Some(amount_value(amount));
+        let CacheOutcome::Number(next) =
+            ask_cache(CacheOp::Increment, Some(key), None, value, ttl, true).await
+        else {
+            unreachable!("{CHECKED}");
+        };
+        Ok(next)
+    }
 }
 
 /// A deployment as Python spells a `model_list` entry, with its id in `model_info`.
@@ -479,13 +527,23 @@ impl Host for StepHost {
             fallback_depth: attempt.fallback_depth,
             fallback_level: attempt.fallback_level,
             timeout: attempt.timeout.map(|timeout| timeout.as_secs_f64()),
+            params: attempt
+                .params
+                .as_ref()
+                .map(|params| Box::new(Value::Object(Map::clone(params)))),
+            scope: attempt.scope,
+            max_retries: attempt.max_retries,
+            model_group_size: attempt.model_group_size,
         };
-        let Answer::Attempt(result) = ask(question).await else {
-            unreachable!("{CHECKED}");
+        let (result, blocked) = match ask(question).await {
+            Answer::Attempt(result) => (result, None),
+            Answer::Blocked(total_tokens, blocked) => (Ok(total_tokens), Some(blocked)),
+            _ => unreachable!("{CHECKED}"),
         };
         result.map(|total_tokens| Output {
             value: Payload(Arc::new(())),
             total_tokens,
+            blocked,
         })
     }
 
@@ -599,7 +657,13 @@ impl Host for StepHost {
     fn observe(&self, event: &RouterEvent) {
         if !matches!(
             event,
-            RouterEvent::RetriesExhausted { .. } | RouterEvent::Fallback { .. }
+            RouterEvent::RetriesExhausted { .. }
+                | RouterEvent::Fallback { .. }
+                | RouterEvent::LevelFailed { .. }
+                | RouterEvent::MockFailed { .. }
+                | RouterEvent::RetryLogged { .. }
+                | RouterEvent::FallbackDone { .. }
+                | RouterEvent::Blocked { .. }
         ) {
             return;
         }
@@ -837,6 +901,7 @@ mod tests {
             keys: Some(keys),
             value: None,
             ttl: None,
+            local: false,
         }) = step
         else {
             panic!("the call should read cooldowns first, got {step:?}");

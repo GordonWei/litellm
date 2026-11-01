@@ -457,9 +457,20 @@ class RouterCoreHandle:
     def registry_version(self) -> int: ...
     # A failure the router did not see itself, driven like `start`: cache steps, then a
     # `_ReportedStep`.
-    def report_failure(self, id: str, failure: Mapping[str, object]) -> RouterCall: ...
-    # (successes, failures) recorded for the deployment this minute.
-    def outcomes_this_minute(self, id: str) -> tuple[int, int]: ...
+    def report_failure(
+        self,
+        id: str,
+        failure: Mapping[str, object],
+        deployment_cooldown: bool = False,
+        count_only: bool = False,
+        requested_group: str | None = None,
+        cooldown_time: float | None = None,
+        uncounted: bool = False,
+    ) -> RouterCall: ...
+    # A success a logging callback saw, driven like `report_failure`; `done` carries `key`.
+    def report_success(self, id: str, total_tokens: float, requests: float) -> RouterCall: ...
+    # Count a success against any id, driven like `report_failure`; `done` carries `key`.
+    def count_success(self, id: str) -> RouterCall: ...
     # [(id, tpm_key, rpm_key)] for this minute, or None for a group with no deployment.
     def usage_keys(self, model_group: str) -> list[tuple[str, str, str]] | None: ...
     # Every deployment as a `model_list` entry, in config order.
@@ -482,6 +493,10 @@ class RouterCoreHandle:
     def fallback_stream(
         self, op: str, request: _Document, origin: _Document, failure: Mapping[str, object]
     ) -> RouterCall: ...
+    def retry_policy_retries(self, failure: Mapping[str, object], model_group: str | None = None) -> int | None: ...
+    def should_retry(
+        self, failure: Mapping[str, object], counts: tuple[int, int], fallbacks: tuple[bool, bool, bool]
+    ) -> bool: ...
 
 @final
 class RouterCall:

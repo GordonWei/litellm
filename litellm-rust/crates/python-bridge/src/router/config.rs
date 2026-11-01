@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use litellm_router_core::select::PassThrough;
 use litellm_router_core::{
     ChangeSet, ConfigError, DeploymentSpec, RouterConfig, RouterDynamicConfig, RouterRequest,
+    config::{Fallbacks, RetryPolicy},
+    mock::MockFailure,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -21,6 +23,7 @@ const STATIC_KEYS: &[&str] = &[
     "disable_cooldowns",
     "allowed_fails_policy",
     "retry_policy",
+    "model_group_retry_policy",
     "retry_after",
     "timeout",
     "request_timeout",
@@ -165,7 +168,26 @@ struct RequestSpec {
     pre_routes: Option<bool>,
     has_image: Option<bool>,
     unrouted: Option<bool>,
+    model_group_retry_policy: Option<BTreeMap<String, RetryPolicy>>,
+    #[serde(default, deserialize_with = "present")]
+    fallbacks: Option<Option<Fallbacks>>,
+    #[serde(default, deserialize_with = "present")]
+    context_window_fallbacks: Option<Option<Fallbacks>>,
+    #[serde(default, deserialize_with = "present")]
+    content_policy_fallbacks: Option<Option<Fallbacks>>,
+    max_fallbacks: Option<u32>,
+    mock_failure: Option<MockFailure>,
+    cooldown_time: Option<f64>,
     body: Option<Value>,
+}
+
+/// A key the request passed, even as `None`: `Some(None)`.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// Read a request; `model` replaces the request's own when given.
@@ -197,6 +219,13 @@ pub(crate) fn request(value: Value, model: Option<&str>) -> Result<RouterRequest
         pre_routes: spec.pre_routes.unwrap_or(false),
         has_image: spec.has_image.unwrap_or(false),
         unrouted: spec.unrouted.unwrap_or(false),
+        model_group_retry_policy: spec.model_group_retry_policy,
+        fallbacks: spec.fallbacks,
+        context_window_fallbacks: spec.context_window_fallbacks,
+        content_policy_fallbacks: spec.content_policy_fallbacks,
+        max_fallbacks: spec.max_fallbacks,
+        mock_failure: spec.mock_failure,
+        cooldown_time: spec.cooldown_time,
         payload: None,
     })
 }

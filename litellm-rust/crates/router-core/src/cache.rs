@@ -36,6 +36,21 @@ pub trait RouterCache: Send + Sync {
     async fn async_batch_get_cache(&self, keys: &[String]) -> Result<Vec<Option<Value>>, Error>;
 
     async fn async_delete_cache(&self, key: &str) -> Result<(), Error>;
+
+    /// Read this worker's in-memory tier only (`local_only=True`).
+    async fn async_get_local(&self, key: &str) -> Result<Option<Value>, Error> {
+        self.async_get_cache(key).await
+    }
+
+    /// Add to a counter in this worker's in-memory tier only (`local_only=True`).
+    async fn async_increment_local(
+        &self,
+        key: &str,
+        amount: f64,
+        ttl: Option<Duration>,
+    ) -> Result<f64, Error> {
+        self.async_increment(key, amount, ttl).await
+    }
 }
 
 #[derive(Default)]

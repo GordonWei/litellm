@@ -5,6 +5,7 @@
 
 mod config;
 mod host;
+mod retries;
 mod stream;
 
 use std::{
@@ -15,8 +16,8 @@ use std::{
 use litellm_error::Report;
 use litellm_host_python::{from_py_argument, json_loads, to_py};
 use litellm_router_core::{
-    AttemptError, Deployment, DeploymentSpec, Error, FailureKind, Op, Outcome, PreRouted, Router,
-    RouterEvent,
+    AttemptError, Blocked, Deployment, DeploymentSpec, Error, FailureKind, FailureReport, Op,
+    PreRouted, RetryCause, Router, RouterEvent,
     health::{UsageMetric, current_minute, usage_key},
     registry::{DeploymentFilter, ResolveKind, ResolveScope},
     strategy::routing_context,
@@ -197,9 +198,21 @@ impl RouterCoreHandle {
         self.router.registry().version()
     }
 
-    /// Record a failure the router did not see itself (a health check, an interceptor), driven
-    /// like `start`: its steps are cache ops, and it ends with `done` (`cooled`).
-    fn report_failure(&self, id: &str, failure: &Bound<'_, PyDict>) -> PyResult<RouterCall> {
+    /// Record a failure the router did not see itself (a health check, an interceptor, a
+    /// logging callback), driven like `start`: its steps are cache ops, and it ends with `done`
+    /// (`cooled`).
+    #[pyo3(signature = (id, failure, deployment_cooldown=false, count_only=false, requested_group=None, cooldown_time=None, uncounted=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn report_failure(
+        &self,
+        id: &str,
+        failure: &Bound<'_, PyDict>,
+        deployment_cooldown: bool,
+        count_only: bool,
+        requested_group: Option<String>,
+        cooldown_time: Option<f64>,
+        uncounted: bool,
+    ) -> PyResult<RouterCall> {
         let failure = match attempt_outcome(failure)? {
             Err(failure) => failure,
             Ok(_) => {
@@ -210,17 +223,44 @@ impl RouterCoreHandle {
         };
         let router = self.router.clone();
         let id = id.to_owned();
+        let report = FailureReport {
+            deployment_cooldown,
+            cooldown_time,
+            count_only,
+            requested_group,
+            uncounted,
+        };
         Ok(RouterCall::new(async move {
             router
-                .report(&id, Outcome::Failure(failure))
+                .report_failure(&id, &failure, report)
                 .await
                 .map(|cooled| Finish::Reported { cooled })
         }))
     }
 
-    /// This worker's (successes, failures) against a deployment this minute.
-    fn outcomes_this_minute(&self, id: &str) -> (u64, u64) {
-        self.router.health().outcomes_this_minute(id)
+    /// Record a success a logging callback saw, driven like `report_failure`; it ends with
+    /// `done` (`key`: the success counter's key, or None for an unknown deployment).
+    fn report_success(&self, id: &str, total_tokens: f64, requests: f64) -> RouterCall {
+        let router = self.router.clone();
+        let id = id.to_owned();
+        RouterCall::new(async move {
+            router
+                .report_success(&id, total_tokens, requests)
+                .await
+                .map(|key| Finish::Counted { key })
+        })
+    }
+
+    /// Count a success against `id`, configured or not; ends with `done` (`key`).
+    fn count_success(&self, id: &str) -> RouterCall {
+        let router = self.router.clone();
+        let id = id.to_owned();
+        RouterCall::new(async move {
+            router
+                .count_success(&id)
+                .await
+                .map(|key| Finish::Counted { key: Some(key) })
+        })
     }
 
     /// The usage keys of this minute for every deployment of `model_group`:
@@ -371,6 +411,26 @@ impl RouterCoreHandle {
             failure,
         )
     }
+
+    /// `get_num_retries_from_retry_policy` for a failure shaped like an attempt outcome.
+    #[pyo3(signature = (failure, model_group=None))]
+    fn retry_policy_retries(
+        &self,
+        failure: &Bound<'_, PyDict>,
+        model_group: Option<&str>,
+    ) -> PyResult<Option<u32>> {
+        retries::policy_retries(&self.router, failure, model_group)
+    }
+
+    /// `should_retry_this_error` as a predicate, for a failure shaped like an attempt outcome.
+    fn should_retry(
+        &self,
+        failure: &Bound<'_, PyDict>,
+        counts: (usize, usize),
+        fallbacks: (bool, bool, bool),
+    ) -> PyResult<bool> {
+        retries::should_retry(failure, counts, fallbacks)
+    }
 }
 
 /// One router call, driven a step at a time by Python.
@@ -451,7 +511,22 @@ fn answer(ask: &Ask, outcome: Option<Bound<'_, PyAny>>) -> PyResult<Answer> {
         Ask::PreRoute { .. } => pre_route_outcome(outcome).map(Answer::PreRoute),
         Ask::Attempt { .. } => {
             let outcome = outcome.ok_or_else(missing)?;
-            attempt_outcome(outcome.cast::<PyDict>()?).map(Answer::Attempt)
+            let outcome = outcome.cast::<PyDict>()?;
+            let blocked = match outcome.get_item("blocked")? {
+                Some(value) if !value.is_none() => {
+                    let name: String = value.extract()?;
+                    Some(name.parse::<Blocked>().map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "`{name}` is not a way a response is blocked"
+                        ))
+                    })?)
+                }
+                Some(_) | None => None,
+            };
+            attempt_outcome(outcome).map(|result| match (result, blocked) {
+                (Ok(total_tokens), Some(blocked)) => Answer::Blocked(total_tokens, blocked),
+                (result, _) => Answer::Attempt(result),
+            })
         }
         Ask::Cache { op, .. } => cache_outcome(*op, outcome).map(Answer::Cache),
     }
@@ -512,7 +587,7 @@ fn cache_outcome(op: CacheOp, outcome: Option<Bound<'_, PyAny>>) -> PyResult<Cac
 
 /// `{"ok": True, "total_tokens": int}` or `{"ok": False, "kind": str, "status": int | None,
 /// "retry_after": float | None, "num_retries": int | None, "detail": str | None}`.
-fn attempt_outcome(outcome: &Bound<'_, PyDict>) -> PyResult<Result<u64, AttemptError>> {
+pub(crate) fn attempt_outcome(outcome: &Bound<'_, PyDict>) -> PyResult<Result<u64, AttemptError>> {
     fn item<'py, T: FromPyObjectOwned<'py>>(
         outcome: &Bound<'py, PyDict>,
         key: &str,
@@ -542,7 +617,12 @@ fn attempt_outcome(outcome: &Bound<'_, PyDict>) -> PyResult<Result<u64, AttemptE
     failure.retry_after = retry_after;
     failure.num_retries = item(outcome, "num_retries")?;
     failure.detail = item::<String>(outcome, "detail")?.map(Into::into);
-    failure.unrecorded = item(outcome, "unrecorded")?.unwrap_or(false);
+    failure.recorded = item::<bool>(outcome, "recorded")?.unwrap_or(false);
+    failure.classes = item::<Vec<String>>(outcome, "classes")?
+        .unwrap_or_default()
+        .into_iter()
+        .map(Into::into)
+        .collect();
     Ok(Err(failure))
 }
 
@@ -564,12 +644,94 @@ fn events_list(py: Python<'_>, events: Vec<RouterEvent>) -> PyResult<Bound<'_, P
                 dict.set_item("max", max)?;
             }
             RouterEvent::Fallback {
-                to, order, level, ..
+                from,
+                to,
+                order,
+                depth,
+                level,
+                scope,
+                parent,
+                max_fallbacks,
             } => {
                 dict.set_item("kind", "fallback")?;
+                dict.set_item("from", from)?;
                 dict.set_item("to", to)?;
                 dict.set_item("order", order)?;
+                dict.set_item("depth", depth)?;
                 dict.set_item("level", level)?;
+                dict.set_item("scope", scope)?;
+                dict.set_item("parent", parent)?;
+                dict.set_item("max_fallbacks", max_fallbacks)?;
+            }
+            RouterEvent::Blocked {
+                level,
+                model,
+                blocked,
+            } => {
+                dict.set_item("kind", "blocked")?;
+                dict.set_item("level", level)?;
+                dict.set_item("model", model)?;
+                dict.set_item("blocked", <&'static str>::from(blocked))?;
+            }
+            RouterEvent::FallbackDone {
+                from,
+                to,
+                level,
+                scope,
+                parent,
+                succeeded,
+            } => {
+                dict.set_item("kind", "fallback_done")?;
+                dict.set_item("from", from)?;
+                dict.set_item("to", to)?;
+                dict.set_item("level", level)?;
+                dict.set_item("scope", scope)?;
+                dict.set_item("parent", parent)?;
+                dict.set_item("succeeded", succeeded)?;
+            }
+            RouterEvent::RetryLogged {
+                scope,
+                level,
+                model,
+                attempted_retries,
+                cause,
+            } => {
+                dict.set_item("kind", "retry_logged")?;
+                dict.set_item("scope", scope)?;
+                dict.set_item("level", level)?;
+                dict.set_item("model", model)?;
+                dict.set_item("attempted_retries", attempted_retries)?;
+                match cause {
+                    RetryCause::Attempt => dict.set_item("cause", "attempt")?,
+                    RetryCause::Level => dict.set_item("cause", "level")?,
+                    RetryCause::NoDeployment { model, unknown } => {
+                        dict.set_item("cause", "no_deployment")?;
+                        dict.set_item("failed_model", model)?;
+                        dict.set_item("unknown", unknown)?;
+                    }
+                }
+            }
+            RouterEvent::LevelFailed {
+                level,
+                model,
+                unknown,
+            } => {
+                dict.set_item("kind", "level_failed")?;
+                dict.set_item("level", level)?;
+                dict.set_item("model", model)?;
+                dict.set_item("unknown", unknown)?;
+            }
+            RouterEvent::MockFailed {
+                mock,
+                level,
+                model,
+                num_retries,
+            } => {
+                dict.set_item("kind", "mock_failed")?;
+                dict.set_item("mock", <&'static str>::from(mock))?;
+                dict.set_item("level", level)?;
+                dict.set_item("model", model)?;
+                dict.set_item("num_retries", num_retries)?;
             }
             _ => continue,
         }
@@ -634,7 +796,14 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             fallback_depth,
             fallback_level,
             timeout,
+            params,
+            scope,
+            max_retries,
+            model_group_size,
         } => {
+            dict.set_item("scope", scope)?;
+            dict.set_item("max_retries", max_retries)?;
+            dict.set_item("model_group_size", model_group_size)?;
             dict.set_item("deployment_id", deployment_id)?;
             dict.set_item("deployment", to_py(py, &deployment)?)?;
             dict.set_item("model", model)?;
@@ -644,7 +813,8 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             dict.set_item("retry", retry)?;
             dict.set_item("fallback_depth", fallback_depth)?;
             dict.set_item("fallback_level", fallback_level)?;
-            dict.set_item("timeout", timeout)
+            dict.set_item("timeout", timeout)?;
+            dict.set_item("params", params.map(|p| to_py(py, &p)).transpose()?)
         }
         Ask::Sleep { seconds } => dict.set_item("seconds", seconds),
         Ask::AllowFallback { target } => dict.set_item("target", target),
@@ -692,12 +862,14 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             keys,
             value,
             ttl,
+            local,
         } => {
             dict.set_item("op", <&'static str>::from(op))?;
             dict.set_item("key", key)?;
             dict.set_item("keys", keys.map(|keys| PyList::new(py, keys)).transpose()?)?;
             dict.set_item("value", value.map(|value| to_py(py, &value)).transpose()?)?;
-            dict.set_item("ttl", ttl)
+            dict.set_item("ttl", ttl)?;
+            dict.set_item("local", local)
         }
     }
 }
@@ -722,6 +894,7 @@ fn done_items(dict: &Bound<'_, PyDict>, finish: Finish) -> PyResult<()> {
             dict.set_item("deployment", to_py(dict.py(), &deployment)?)
         }
         Finish::Reported { cooled } => dict.set_item("cooled", cooled),
+        Finish::Counted { key } => dict.set_item("key", key),
         Finish::Healthy {
             deployment_ids,
             deployments,
@@ -793,7 +966,7 @@ handle = native.RouterCoreHandle(config, {"num_retries": 1})
 picked = drive(handle.select("primary", {}), None)
 assert (picked["kind"], picked["deployment_id"], picked["model_group"]) == ("done", "a1", "primary"), picked
 assert [step["op"] for step in asked] == ["batch_get"]
-assert list(asked[0]) == ["kind", "op", "key", "keys", "value", "ttl", "events"], list(asked[0])
+assert list(asked[0]) == ["kind", "op", "key", "keys", "value", "ttl", "local", "events"], list(asked[0])
 call = handle.start("acompletion", '{"model": "primary"}')
 version = handle.registry_version()
 assert handle.apply({"delete": ["gone"]}) == version + 1

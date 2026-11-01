@@ -173,10 +173,14 @@ pub struct AttemptError {
     /// The provider's error text, kept only for the cooldown record Python writes
     /// (`exception_received`, masked past 50 characters).
     pub detail: Option<Arc<str>>,
+    /// The exception's class names, most specific first (its `__mro__`), for the rules Python
+    /// decides by `isinstance`. Empty when the host reports none; the kind then stands in.
+    pub classes: Vec<Arc<str>>,
+    /// The host already recorded what this failure does to the deployment's health (a routing
+    /// pre-call check's failure, which Python's attempt handles itself: a rate limit cools the
+    /// deployment down, anything else records nothing), so the core records nothing.
+    pub recorded: bool,
     pub payload: Option<Payload>,
-    /// The host refused the attempt before the deployment saw it in a way Python records no
-    /// outcome for (a sync `pre_call_check`): no cooldown or failure count is written.
-    pub unrecorded: bool,
 }
 
 impl AttemptError {
@@ -187,9 +191,23 @@ impl AttemptError {
             retry_after: None,
             num_retries: None,
             detail: None,
+            classes: Vec::new(),
+            recorded: false,
             payload: None,
-            unrecorded: false,
         }
+    }
+
+    /// The exception's class names, most specific first: the host's, else the kind's.
+    pub fn class_names(&self) -> Vec<&str> {
+        if self.classes.is_empty() {
+            return crate::retry::kind_classes(self.kind).to_vec();
+        }
+        self.classes.iter().map(AsRef::as_ref).collect()
+    }
+
+    /// `isinstance(error, <class named name>)`.
+    pub fn is_a(&self, name: &str) -> bool {
+        self.class_names().contains(&name)
     }
 
     #[must_use]

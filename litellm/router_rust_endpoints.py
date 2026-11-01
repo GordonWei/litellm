@@ -75,6 +75,15 @@ ROUTING_KEYS: Final = frozenset(
         "_retry_skipped_deployment_ids",
         "_target_order",
         "original_function",
+        # The walk's own settings, which `async_function_with_fallbacks` pops before the attempt.
+        "model_group_retry_policy",
+        "fallbacks",
+        "context_window_fallbacks",
+        "content_policy_fallbacks",
+        "mock_testing_fallbacks",
+        "mock_testing_context_fallbacks",
+        "mock_testing_content_policy_fallbacks",
+        "mock_testing_rate_limit_error",
     }
 )
 

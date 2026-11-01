@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, time::Duration};
 use serde::Deserialize;
 
 use crate::{
-    error::FailureKind,
+    error::AttemptError,
     registry::{DeploymentSpec, RoutingGroupSpec},
 };
 
@@ -130,30 +130,9 @@ pub struct RetryPolicy {
     pub RateLimitErrorRetries: Option<u32>,
     pub ContentPolicyViolationErrorRetries: Option<u32>,
     pub InternalServerErrorRetries: Option<u32>,
-}
-
-impl RetryPolicy {
-    pub fn retries_for(&self, kind: FailureKind) -> Option<u32> {
-        match kind {
-            FailureKind::BadRequest | FailureKind::ContextWindowExceeded => {
-                self.BadRequestErrorRetries
-            }
-            FailureKind::Authentication => self.AuthenticationErrorRetries,
-            FailureKind::Timeout => self.TimeoutErrorRetries,
-            FailureKind::RateLimit => self.RateLimitErrorRetries,
-            FailureKind::ContentPolicyViolation => self.ContentPolicyViolationErrorRetries,
-            FailureKind::InternalServer => self.InternalServerErrorRetries,
-            FailureKind::PermissionDenied
-            | FailureKind::NotFound
-            | FailureKind::ApiConnection
-            | FailureKind::ServiceUnavailable
-            | FailureKind::BadGateway
-            | FailureKind::GuardrailIntervention
-            | FailureKind::Declined
-            | FailureKind::CallerCredential
-            | FailureKind::Other => None,
-        }
-    }
+    pub ServiceUnavailableErrorRetries: Option<u32>,
+    pub NotFoundErrorRetries: Option<u32>,
+    pub DefaultRetries: Option<u32>,
 }
 
 /// `AllowedFailsPolicy` in `litellm/types/router.py`: allowed fails per minute per exception type.
@@ -168,124 +147,36 @@ pub struct AllowedFailsPolicy {
     pub InternalServerErrorAllowedFails: Option<u32>,
     pub ServiceUnavailableErrorAllowedFails: Option<u32>,
     pub BadGatewayErrorAllowedFails: Option<u32>,
+    pub NotFoundErrorAllowedFails: Option<u32>,
 }
 
 impl AllowedFailsPolicy {
-    pub fn allowed_fails_for(&self, kind: FailureKind) -> Option<u32> {
-        match kind {
-            FailureKind::BadRequest | FailureKind::ContextWindowExceeded => {
-                self.BadRequestErrorAllowedFails
-            }
-            FailureKind::Authentication => self.AuthenticationErrorAllowedFails,
-            FailureKind::Timeout => self.TimeoutErrorAllowedFails,
-            FailureKind::RateLimit => self.RateLimitErrorAllowedFails,
-            FailureKind::ContentPolicyViolation => self.ContentPolicyViolationErrorAllowedFails,
-            FailureKind::InternalServer => self.InternalServerErrorAllowedFails,
-            FailureKind::ServiceUnavailable => self.ServiceUnavailableErrorAllowedFails,
-            FailureKind::BadGateway => self.BadGatewayErrorAllowedFails,
-            FailureKind::PermissionDenied
-            | FailureKind::NotFound
-            | FailureKind::ApiConnection
-            | FailureKind::GuardrailIntervention
-            | FailureKind::Declined
-            | FailureKind::CallerCredential
-            | FailureKind::Other => None,
-        }
+    /// `_core_get_allowed_fails_from_policy`: the first set field whose exception class the
+    /// failure is an instance of, in Python's order.
+    pub fn allowed_fails_for(&self, failure: &AttemptError) -> Option<u32> {
+        [
+            ("AuthenticationError", self.AuthenticationErrorAllowedFails),
+            ("Timeout", self.TimeoutErrorAllowedFails),
+            ("RateLimitError", self.RateLimitErrorAllowedFails),
+            (
+                "ContentPolicyViolationError",
+                self.ContentPolicyViolationErrorAllowedFails,
+            ),
+            ("BadRequestError", self.BadRequestErrorAllowedFails),
+            ("InternalServerError", self.InternalServerErrorAllowedFails),
+            (
+                "ServiceUnavailableError",
+                self.ServiceUnavailableErrorAllowedFails,
+            ),
+            ("BadGatewayError", self.BadGatewayErrorAllowedFails),
+            ("NotFoundError", self.NotFoundErrorAllowedFails),
+        ]
+        .into_iter()
+        .find_map(|(class, allowed)| allowed.filter(|_| failure.is_a(class)))
     }
 }
 
-/// A fallback list as Python spells it, `[{"gpt-4": ["gpt-3.5"]}, {"*": ["default"]}]`, kept in
-/// order. `"*"` is the default entry.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-#[serde(from = "Vec<BTreeMap<String, Vec<String>>>")]
-pub struct Fallbacks(Vec<(String, Vec<String>)>);
-
-impl From<Vec<BTreeMap<String, Vec<String>>>> for Fallbacks {
-    fn from(entries: Vec<BTreeMap<String, Vec<String>>>) -> Self {
-        Self(entries.into_iter().flatten().collect())
-    }
-}
-
-impl Fallbacks {
-    pub fn new(entries: impl IntoIterator<Item = (String, Vec<String>)>) -> Self {
-        Self(entries.into_iter().collect())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// `_has_default_fallbacks`: whether any entry is keyed `"*"`.
-    pub fn has_default(&self) -> bool {
-        self.0.iter().any(|(key, _)| key == "*")
-    }
-
-    /// `_get_first_default_fallback`: the first target of the first `"*"` entry.
-    pub fn default_target(&self) -> Option<&str> {
-        self.0
-            .iter()
-            .find(|(key, targets)| key == "*" && !targets.is_empty())
-            .map(|(_, targets)| targets[0].as_str())
-    }
-
-    /// `get_fallback_model_group`: the group's own entry, else an entry keyed by a
-    /// provider-prefixed or provider-stripped spelling of it (the last such entry), else the
-    /// last `"*"` entry before the group's own. The flag says the targets came from `"*"`.
-    pub fn lookup(&self, group: &str, keys: &FallbackKeys) -> Option<(&[String], bool)> {
-        let prefixed = keys.provider_prefixed.get(group).map(String::as_str);
-        let mut spelled = None;
-        let mut generic = None;
-        for (key, targets) in &self.0 {
-            if key == group {
-                return Some((targets, false));
-            }
-            if Some(key.as_str()) == prefixed || keys.is_stripped(group, key) {
-                spelled = Some(targets.as_slice());
-            } else if key == "*" {
-                generic = Some(targets.as_slice());
-            }
-        }
-        spelled
-            .map(|targets| (targets, false))
-            .or_else(|| generic.map(|targets| (targets, true)))
-    }
-
-    /// `get_fallback_model_group_for_lookup_groups`: the first lookup group with its own
-    /// chain wins; `"*"` applies only after every group missed.
-    pub fn lookup_groups(&self, groups: &[&str], keys: &FallbackKeys) -> Option<Vec<String>> {
-        let results: Vec<_> = groups
-            .iter()
-            .map(|group| self.lookup(group, keys))
-            .collect();
-        results
-            .iter()
-            .flatten()
-            .find(|(_, generic)| !generic)
-            .or_else(|| results.iter().flatten().next())
-            .map(|(targets, _)| targets.to_vec())
-    }
-}
-
-/// What fallback keys match besides the exact group name: Python's `provider_list`, for
-/// `"openai/gpt-4o"` to use a `"gpt-4o"` entry, and the provider-prefixed spelling of each
-/// bare group name (`_provider_prefixed_model_group`), for `"gpt-4o"` to use an
-/// `"openai/gpt-4o"` entry.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct FallbackKeys {
-    pub providers: Vec<String>,
-    pub provider_prefixed: BTreeMap<String, String>,
-}
-
-impl FallbackKeys {
-    /// `_check_stripped_model_group`.
-    fn is_stripped(&self, group: &str, key: &str) -> bool {
-        self.providers.iter().any(|provider| {
-            let prefix = format!("{provider}/");
-            group.starts_with(&prefix) && group.replace(&prefix, "") == key
-        })
-    }
-}
+pub use crate::fallback::{FallbackKeys, Fallbacks};
 
 /// Static config, fixed for the router's life.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -300,6 +191,8 @@ pub struct RouterConfig {
     pub disable_cooldowns: bool,
     pub allowed_fails_policy: Option<AllowedFailsPolicy>,
     pub retry_policy: Option<RetryPolicy>,
+    /// `model_group_retry_policy`: a group's own policy, which wins over `retry_policy`.
+    pub model_group_retry_policy: BTreeMap<String, RetryPolicy>,
     /// `retry_after`: the minimum backoff between retries, in seconds.
     pub retry_after: f64,
     pub timeout: Option<f64>,
@@ -378,15 +271,16 @@ impl Default for RouterDynamicConfig {
 }
 
 impl RouterDynamicConfig {
-    /// The regular fallback targets for the lookup groups (`get_fallback_model_group_for_lookup_groups`
-    /// over `fallbacks`), then `default_fallbacks`, which Python folds into `fallbacks` as
-    /// `{"*": [...]}`.
+    /// The regular fallback targets for the lookup groups, then `default_fallbacks`, which
+    /// Python folds into `fallbacks` as `{"*": [...]}`: what `_has_fallback_group` reads.
     pub fn fallback_targets(&self, groups: &[&str]) -> Option<Vec<String>> {
-        self.fallbacks
-            .lookup_groups(groups, &self.fallback_keys)
-            .or_else(|| {
-                (!self.default_fallbacks.is_empty()).then(|| self.default_fallbacks.clone())
-            })
+        if groups
+            .iter()
+            .any(|group| self.fallbacks.has_keyed_chain(group, &self.fallback_keys))
+        {
+            return Some(Vec::new());
+        }
+        (!self.default_fallbacks.is_empty()).then(|| self.default_fallbacks.clone())
     }
 
     pub fn has_regular_fallbacks(&self) -> bool {
@@ -400,20 +294,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    #[rstest]
-    #[case::own_entry("gpt-4", Some(vec!["gpt-3.5".to_owned()]))]
-    #[case::star_entry("other", Some(vec!["default".to_owned()]))]
-    fn fallback_targets_prefer_the_groups_own_entry(
-        #[case] group: &str,
-        #[case] expected: Option<Vec<String>>,
-    ) {
-        let dynamic: RouterDynamicConfig = serde_json::from_value(serde_json::json!({
-            "fallbacks": [{"gpt-4": ["gpt-3.5"]}, {"*": ["default"]}]
-        }))
-        .unwrap();
-        assert_eq!(dynamic.fallback_targets(&[group]), expected);
-    }
 
     #[rstest]
     #[case::group_name(json!({"model_group_alias": {"gpt": "gpt-4"}}))]

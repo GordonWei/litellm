@@ -138,8 +138,13 @@ def read_settings_update(settings: Mapping[str, object]) -> SettingsUpdate:
 
 
 def initial_plain(config: "RouterConfig") -> dict[str, object]:  # mutable-ok: the core's own plain attributes
-    """The plain attributes as the constructor sets them."""
-    return {name: config.get(name, default) for name, default in PLAIN_DEFAULTS.items()}
+    """The plain attributes as the constructor sets them: a ``retry_policy`` dict is read into a
+    ``RetryPolicy`` and any other type but a policy is no policy."""
+    from litellm.router_rust_retries import resolved_retry_policy
+
+    plain: Final = {name: config.get(name, default) for name, default in PLAIN_DEFAULTS.items()}
+    plain["retry_policy"] = resolved_retry_policy(plain["retry_policy"])
+    return plain
 
 
 def settings_view(

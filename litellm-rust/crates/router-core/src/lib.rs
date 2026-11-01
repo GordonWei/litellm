@@ -77,12 +77,15 @@ pub mod cache;
 pub mod call;
 pub mod config;
 pub mod error;
+pub mod fallback;
 pub mod health;
 pub mod host;
+pub mod mock;
 pub mod precall;
 pub mod prerouting;
 pub mod ptu;
 pub mod registry;
+pub mod retry;
 pub mod routing_groups;
 pub mod routing_plugins;
 pub mod select;
@@ -103,7 +106,10 @@ pub use crate::{
     config::{Op, RouterConfig, RouterDynamicConfig, RoutingStrategy},
     error::{AttemptError, ConfigError, Error, FailureKind, Payload, Unsupported},
     health::{Clock, Health, Outcome, SystemClock},
-    host::{Attempt, Host, Output, RouterEvent, RouterRequest, RoutingContext, SelectStage},
+    host::{
+        Attempt, Blocked, Host, Output, RetryCause, RouterEvent, RouterRequest, RoutingContext,
+        SelectStage,
+    },
     prerouting::{PreRoute, PreRouted},
     registry::{ChangeSet, Deployment, DeploymentSpec, Registry, RegistryVersion},
     select::{Randomness, SeededRandomness, ThreadRandomness},
@@ -160,6 +166,23 @@ impl Core {
         }
         Ok(())
     }
+}
+
+/// How a reported failure is recorded.
+#[derive(Clone, Debug, Default)]
+pub struct FailureReport {
+    /// Cool down for the deployment's own `cooldown_time` (then the provider's retry-after),
+    /// as the failure callback does, rather than the router default.
+    pub deployment_cooldown: bool,
+    /// The `cooldown_time` the failed call's own params carried (`model_info`, then
+    /// `litellm_params`), which wins over the provider's retry-after for a callback report.
+    pub cooldown_time: Option<f64>,
+    /// Count the failure only: its status is one no cooldown rule reads (an empty status).
+    pub count_only: bool,
+    /// The model group the request was for, whose fallbacks keep a lone deployment cooling.
+    pub requested_group: Option<String>,
+    /// Cool down without counting the failure (`set_cooldown_deployments` alone).
+    pub uncounted: bool,
 }
 
 /// Builds a [`Router`], with test seams.
@@ -322,36 +345,92 @@ impl Router {
     /// Record an outcome the router did not see itself, such as a health check. Returns whether
     /// the deployment was cooled down.
     pub async fn report(&self, id: &str, outcome: Outcome) -> Result<bool, Error> {
+        match outcome {
+            Outcome::Success { total_tokens } => self
+                .report_success(id, total_tokens as f64, 1.0)
+                .await
+                .map(|_| false),
+            Outcome::Failure(failure) => {
+                self.report_failure(id, &failure, FailureReport::default())
+                    .await
+            }
+        }
+    }
+
+    /// A success a logging callback saw (`deployment_callback_on_success`): counted for a
+    /// configured deployment, with its tokens and requests when it tracks usage. Returns the
+    /// success counter's key, or `None` for an unknown deployment.
+    pub async fn report_success(
+        &self,
+        id: &str,
+        total_tokens: f64,
+        requests: f64,
+    ) -> Result<Option<String>, Error> {
+        let snapshot = self.core.snapshot.load_full();
+        let Some(deployment) = snapshot.registry.deployment(id) else {
+            return Ok(None);
+        };
+        let key = self.core.health.count_success(id).await?;
+        self.core
+            .health
+            .add_usage(&deployment, total_tokens, requests)
+            .await?;
+        Ok(Some(key))
+    }
+
+    /// `sync_deployment_callback_on_success`: count a success against `id`, configured or not,
+    /// and return the counter's key.
+    pub async fn count_success(&self, id: &str) -> Result<String, Error> {
+        self.core.health.count_success(id).await
+    }
+
+    /// A failure the router did not see itself: counted against `id` (known or not), then
+    /// cooled down by the rules (`record_failure`, `deployment_callback_on_failure`).
+    pub async fn report_failure(
+        &self,
+        id: &str,
+        failure: &AttemptError,
+        report: FailureReport,
+    ) -> Result<bool, Error> {
+        if !report.uncounted {
+            self.core.health.count_failure(id).await?;
+        }
         let snapshot = self.core.snapshot.load_full();
         let Some(deployment) = snapshot.registry.deployment(id) else {
             return Ok(false);
         };
-        match outcome {
-            Outcome::Success { total_tokens } => self
-                .core
-                .health
-                .record_success(&deployment, total_tokens)
-                .await
-                .map(|()| false),
-            Outcome::Failure(failure) => {
-                let shape = GroupShape {
-                    single_deployment: snapshot
-                        .registry
-                        .group(&deployment.model_name)
-                        .is_some_and(|group| group.len() == 1),
-                    has_fallback_group: snapshot
-                        .settings
-                        .dynamic
-                        .fallback_targets(&[deployment.model_name.as_str()])
-                        .is_some(),
-                };
-                self.core
-                    .health
-                    .record_failure(&snapshot.settings, &deployment, shape, &failure)
-                    .await
-                    .map(|cooldown| cooldown.is_some())
-            }
+        if report.count_only {
+            return Ok(false);
         }
+        let cooldown = if report.deployment_cooldown {
+            report
+                .cooldown_time
+                .filter(|seconds| *seconds >= 0.0)
+                .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
+                .or(failure.retry_after)
+                .unwrap_or(snapshot.settings.cooldown_time)
+        } else {
+            snapshot.settings.cooldown_time
+        };
+        let shape = GroupShape {
+            single_deployment: snapshot
+                .registry
+                .group(&deployment.model_name)
+                .is_some_and(|group| group.len() == 1),
+            has_fallback_group: snapshot
+                .settings
+                .dynamic
+                .fallback_targets(&[report
+                    .requested_group
+                    .as_deref()
+                    .unwrap_or(&deployment.model_name)])
+                .is_some(),
+        };
+        self.core
+            .health
+            .cool_down_after(&snapshot.settings, &deployment, shape, failure, cooldown)
+            .await
+            .map(|cooldown| cooldown.is_some())
     }
 
     /// Apply one change set atomically and return the new registry version.

@@ -5,15 +5,16 @@
 //! `_anthropic_messages_stream_can_retry`, `_stream_retry_budget`, `_astream_retry_same_group`,
 //! and the `async_function_with_fallbacks_common_utils` re-entry of the mid-stream fallback.
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
-use super::{Hop, Target};
+use super::{Hop, Target, Tried, Walk};
 use crate::{
     Router, Snapshot,
-    config::{Fallbacks, Op},
+    config::{Op, RouterDynamicConfig},
     error::{AttemptError, Error, FailureKind},
+    fallback::{FallbackTarget, Fallbacks},
     health::should_retry_status,
     host::RouterRequest,
     registry::ResolveKind,
@@ -58,6 +59,7 @@ impl StreamOrigin {
         Target {
             group: self.group.clone(),
             order: self.order,
+            params: None,
         }
     }
 
@@ -85,8 +87,29 @@ impl StreamOrigin {
     }
 }
 
+/// The group names a chain targets (a dict target counts by its `model`).
+fn names(chain: Option<Vec<FallbackTarget>>) -> Option<Vec<String>> {
+    chain.map(|targets| {
+        targets
+            .iter()
+            .filter_map(|target| target.model().map(str::to_owned))
+            .collect()
+    })
+}
+
+/// The regular fallback targets for the lookup groups, then `default_fallbacks`, which Python
+/// folds into `fallbacks` as `{"*": [...]}`.
+fn regular_targets(dynamic: &RouterDynamicConfig, lookup: &[&str]) -> Option<Vec<String>> {
+    names(
+        dynamic
+            .fallbacks
+            .lookup_groups(lookup, &dynamic.fallback_keys),
+    )
+    .or_else(|| (!dynamic.default_fallbacks.is_empty()).then(|| dynamic.default_fallbacks.clone()))
+}
+
 fn has_default_fallbacks(fallbacks: &Fallbacks, default_fallbacks: &[String]) -> bool {
-    fallbacks.has_default() || !default_fallbacks.is_empty()
+    fallbacks.has_star() || !default_fallbacks.is_empty()
 }
 
 impl Router {
@@ -120,12 +143,10 @@ impl Router {
         self.live()?;
         let snapshot = self.core.snapshot.load_full();
         let request = Arc::new(request);
-        let mut attempted = HashSet::new();
+        let mut walk = Walk::default();
         if request.model != origin.group {
-            attempted.insert(Target {
-                group: request.model.clone(),
-                order: None,
-            });
+            walk.attempted
+                .push(Tried::Target(FallbackTarget::Name(request.model.clone())));
         }
         self.core
             .with_fallbacks(
@@ -136,8 +157,9 @@ impl Router {
                 Hop {
                     depth: origin.depth,
                     level: origin.level,
+                    scope: 0,
                 },
-                &mut attempted,
+                &mut walk,
                 Some(Error::Attempt(failure)),
             )
             .await
@@ -159,6 +181,7 @@ impl Router {
         let at = Hop {
             depth: origin.depth,
             level: origin.level,
+            scope: 0,
         };
         let counting = SelectInputs {
             count_only: true,
@@ -179,16 +202,33 @@ impl Router {
         };
         let mut last = failure;
         for attempt in origin.attempted_retries..budget {
-            if !policy_applies && !self.core.should_retry(&snapshot, &last, healthy, all) {
+            if !policy_applies
+                && !self
+                    .core
+                    .should_retry(&snapshot, &request, &last, healthy, all)
+            {
                 break;
             }
-            let delay =
-                self.core
-                    .time_to_sleep(&snapshot, &last, budget - attempt, budget, healthy, all);
+            let delay = self.core.time_to_sleep(
+                &snapshot,
+                last.retry_after,
+                budget - attempt,
+                budget,
+                healthy,
+                all,
+            );
             self.core.host.sleep(delay).await;
             match self
                 .core
-                .attempt(&snapshot, &op, &request, &target, &inputs, attempt + 1, at)
+                .attempt(
+                    &snapshot,
+                    &op,
+                    &request,
+                    &target,
+                    &inputs,
+                    (attempt + 1, budget),
+                    (at, &[]),
+                )
                 .await
             {
                 Ok(mut response) => {
@@ -234,14 +274,27 @@ fn plain_retry_budget(snapshot: &Snapshot, request: &RouterRequest, origin: &Str
     configured.unwrap_or(snapshot.settings.num_retries)
 }
 
-/// The retry policy unless the request opted out with `num_retries=0`.
+/// The retry policy for the request's model group (`_anthropic_messages_resolved_retry_policy`),
+/// unless the request opted out with `num_retries=0`.
 fn retry_policy<'a>(
     snapshot: &'a Snapshot,
-    request: &RouterRequest,
+    request: &'a RouterRequest,
+    origin: &StreamOrigin,
 ) -> Option<&'a crate::config::RetryPolicy> {
-    (request.num_retries != Some(0))
-        .then_some(snapshot.settings.retry_policy.as_ref())
-        .flatten()
+    if request.num_retries == Some(0) {
+        return None;
+    }
+    let settings = &snapshot.settings;
+    crate::retry::resolve_retry_policy(
+        settings.retry_policy.as_ref(),
+        &origin.group,
+        Some(
+            request
+                .model_group_retry_policy
+                .as_ref()
+                .unwrap_or(&settings.model_group_retry_policy),
+        ),
+    )
 }
 
 fn stream_retry_budget(
@@ -250,7 +303,9 @@ fn stream_retry_budget(
     origin: &StreamOrigin,
     kind: FailureKind,
 ) -> (u32, bool) {
-    let policy_retries = retry_policy(snapshot, request).and_then(|p| p.retries_for(kind));
+    let failure = AttemptError::new(kind, None);
+    let policy_retries =
+        retry_policy(snapshot, request, origin).and_then(|p| p.retries_for(&failure));
     if origin.attempted_retries > 0
         && let Some(committed) = origin.committed_budget
     {
@@ -270,7 +325,8 @@ fn stream_can_retry(snapshot: &Snapshot, request: &RouterRequest, origin: &Strea
         return committed > attempted;
     }
     let plain = plain_retry_budget(snapshot, request, origin);
-    let ceiling = retry_policy(snapshot, request).map_or(plain, |policy| {
+    // `_retry_policy_ceiling`: every field the policy dumps.
+    let ceiling = retry_policy(snapshot, request, origin).map_or(plain, |policy| {
         let granted = [
             policy.BadRequestErrorRetries,
             policy.AuthenticationErrorRetries,
@@ -278,6 +334,9 @@ fn stream_can_retry(snapshot: &Snapshot, request: &RouterRequest, origin: &Strea
             policy.RateLimitErrorRetries,
             policy.ContentPolicyViolationErrorRetries,
             policy.InternalServerErrorRetries,
+            policy.ServiceUnavailableErrorRetries,
+            policy.NotFoundErrorRetries,
+            policy.DefaultRetries,
         ];
         plain.max(granted.into_iter().flatten().max().unwrap_or(0))
     });
@@ -313,7 +372,7 @@ fn stream_can_fall_back(
     if let Some(content_policy) = &dynamic.content_policy_fallbacks
         && origin.has_unattempted(
             request,
-            content_policy.lookup_groups(&lookup, &dynamic.fallback_keys),
+            names(content_policy.lookup_groups(&lookup, &dynamic.fallback_keys)),
         )
     {
         return true;
@@ -321,7 +380,7 @@ fn stream_can_fall_back(
     if !dynamic.has_regular_fallbacks() {
         return false;
     }
-    origin.has_unattempted(request, dynamic.fallback_targets(&lookup))
+    origin.has_unattempted(request, regular_targets(dynamic, &lookup))
 }
 
 fn refusal_fallback_available(
@@ -337,7 +396,7 @@ fn refusal_fallback_available(
     if let Some(content_policy) = &dynamic.content_policy_fallbacks {
         return origin.has_unattempted(
             request,
-            content_policy.lookup_groups(&lookup, &dynamic.fallback_keys),
+            names(content_policy.lookup_groups(&lookup, &dynamic.fallback_keys)),
         );
     }
     if has_default_fallbacks(&dynamic.fallbacks, &dynamic.default_fallbacks) {
@@ -346,5 +405,5 @@ fn refusal_fallback_available(
     if !dynamic.has_regular_fallbacks() {
         return false;
     }
-    origin.has_unattempted(request, dynamic.fallback_targets(&lookup))
+    origin.has_unattempted(request, regular_targets(dynamic, &lookup))
 }

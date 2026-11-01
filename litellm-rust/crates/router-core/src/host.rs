@@ -6,13 +6,15 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{
     cache::RouterCache,
-    config::{Op, RoutingStrategy},
+    config::{Op, RetryPolicy, RoutingStrategy},
     error::{AttemptError, Error, FailureKind, Payload},
+    fallback::Fallbacks,
     health::Health,
+    mock::MockFailure,
     precall::PreCallFacts,
     prerouting::{PreRoute, PreRouted},
     registry::{Deployment, Registry},
@@ -60,6 +62,20 @@ pub struct RouterRequest {
     /// attempt is handed to the host as is, and no outcome is recorded for a deployment
     /// (`_asearch_with_fallbacks`, whose helper picks among the router's search tools).
     pub unrouted: bool,
+    /// Fallback lists the request passed (`Some(None)` when it passed `None`), which replace
+    /// the router's.
+    pub fallbacks: Option<Option<Fallbacks>>,
+    pub context_window_fallbacks: Option<Option<Fallbacks>>,
+    pub content_policy_fallbacks: Option<Option<Fallbacks>>,
+    /// A per-request `max_fallbacks`, which replaces the router's.
+    pub max_fallbacks: Option<u32>,
+    /// A per-request `cooldown_time`: the call's own params carry it, so it cools a failed
+    /// deployment down for that long unless its `model_info` sets one.
+    pub cooldown_time: Option<f64>,
+    /// A `mock_testing_*` flag the request set.
+    pub mock_failure: Option<MockFailure>,
+    /// A per-request `model_group_retry_policy`, which replaces the router's.
+    pub model_group_retry_policy: Option<BTreeMap<String, RetryPolicy>>,
     /// What the host needs to run the call itself, such as the Python kwargs.
     pub payload: Option<Payload>,
 }
@@ -84,6 +100,14 @@ pub struct Attempt {
     /// How many fallbacks deep the walk is: 0 for the requested name.
     pub fallback_level: u32,
     pub timeout: Option<Duration>,
+    /// Request params the fallback walk's dict targets merged in (`kwargs.update(target)`).
+    pub params: Option<Arc<Map<String, Value>>>,
+    /// The walk level whose request metadata this attempt carries (see [`RouterEvent::Fallback`]).
+    pub scope: u32,
+    /// The retry budget the level's loop stamps on the request before this attempt.
+    pub max_retries: u32,
+    /// How many deployments `get_model_list` lists for the level's group (`model_group_size`).
+    pub model_group_size: usize,
 }
 
 /// What a successful attempt returns.
@@ -92,6 +116,18 @@ pub struct Output {
     pub value: Payload,
     /// Prompt plus completion tokens, counted against the deployment's per-minute usage.
     pub total_tokens: u64,
+    /// A response the provider blocked, which the router may raise to fall back.
+    pub blocked: Option<Blocked>,
+}
+
+/// How a provider blocked a response the call otherwise served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum Blocked {
+    /// A chat response whose first choice was content-filtered (or that has no choices).
+    ContentFilter,
+    /// An Anthropic /v1/messages safeguard refusal carrying `stop_details`.
+    Refusal,
 }
 
 /// What a plugin or strategy sees: never the router itself.
@@ -156,6 +192,55 @@ pub enum RouterEvent {
         depth: u32,
         /// The fallback level `to` is tried at: 1 for the request's own fallbacks.
         level: u32,
+        /// The new level's request metadata scope, copied from `parent`'s at the hop.
+        scope: u32,
+        parent: u32,
+        /// The `max_fallbacks` the walk reads, stamped on the hop's request.
+        max_fallbacks: u32,
+    },
+    /// A hop of the fallback walk returned: `log_success_fallback_event` or
+    /// `log_failure_fallback_event` for the level at `parent`.
+    FallbackDone {
+        from: String,
+        to: String,
+        level: u32,
+        scope: u32,
+        parent: u32,
+        succeeded: bool,
+    },
+    /// The router raised a `ContentPolicyViolationError` for a blocked response, since a
+    /// fallback would serve it (`_should_raise_content_policy_error`,
+    /// `_should_raise_anthropic_refusal_error`).
+    Blocked {
+        level: u32,
+        model: String,
+        blocked: Blocked,
+    },
+    /// `log_retry`: the router recorded a failure in `scope`'s request metadata
+    /// (`previous_models`, `request_retry_count`) before retrying or falling back.
+    RetryLogged {
+        scope: u32,
+        level: u32,
+        /// The group the failed level served (`kwargs["model"]`).
+        model: String,
+        /// The retry number stamped before the failed try; `None` keeps the scope's own.
+        attempted_retries: Option<u32>,
+        cause: RetryCause,
+    },
+    /// A level of the fallback walk ended on an error no attempt raised: the group had no
+    /// deployment for the caller (`unknown`) or none available. Python raises that error for
+    /// the level, whatever its earlier attempts raised.
+    LevelFailed {
+        level: u32,
+        model: String,
+        unknown: bool,
+    },
+    /// The router raised a `mock_testing_*` failure for `model` instead of calling it.
+    MockFailed {
+        mock: MockFailure,
+        level: u32,
+        model: String,
+        num_retries: Option<u32>,
     },
     /// A group's retry loop ran every retry and the last one failed: Python stamps
     /// `num_retries` and `max_retries` on that error.
@@ -164,6 +249,17 @@ pub enum RouterEvent {
         attempted: u32,
         max: u32,
     },
+}
+
+/// Which error a [`RouterEvent::RetryLogged`] records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetryCause {
+    /// The last attempt's failure.
+    Attempt,
+    /// The error the level ended on (`run_async_fallback`'s `original_exception`).
+    Level,
+    /// A retry found no deployment: the group was unknown or had none available.
+    NoDeployment { model: String, unknown: bool },
 }
 
 #[async_trait]
