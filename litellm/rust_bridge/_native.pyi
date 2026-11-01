@@ -467,6 +467,19 @@ class RouterCoreHandle:
     def deployment(self, id: str) -> dict[str, JsonValue] | None: ...
     def resolve(self, name: str, specific_deployment: bool = False) -> _Resolution | None: ...
     def retire(self) -> None: ...
+    # A stream that failed before content: what may still take over it, and the retry budget for
+    # a failure of `kind`: {"can_retry", "can_fall_back", "refusal_fallback": bool,
+    # "retry_budget": int | None, "policy_applies": bool}.
+    def stream_policy(
+        self, request: _Document, origin: _Document, kind: str | None = None
+    ) -> dict[str, bool | int | None]: ...
+    # The same-group retry and the fallback walk for such a stream, driven like `start`.
+    def retry_stream(
+        self, op: str, request: _Document, origin: _Document, failure: Mapping[str, object]
+    ) -> RouterCall: ...
+    def fallback_stream(
+        self, op: str, request: _Document, origin: _Document, failure: Mapping[str, object]
+    ) -> RouterCall: ...
 
 @final
 class RouterCall:

@@ -64,6 +64,12 @@ from litellm.router_attempt import (
 )
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_rust_streaming import (
+    StreamAttempt,
+    open_attempt_stream,
+    open_attempt_stream_sync,
+    shape_attempt_kwargs,
+)
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
 from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError
@@ -1111,6 +1117,15 @@ class RustCore(_SettingsSource):
 
     async def _drive(self, op: str, request: Mapping[str, object]) -> object:
         call, prepared = self._start(op, request)
+        driver, step = await self._run(op, call, prepared)
+        if step["kind"] == "failed":
+            raise driver.failed(step)
+        return await driver.finish_async(step)
+
+    async def _run(
+        self, op: str, call: "RouterCall", prepared: Mapping[str, object]
+    ) -> "tuple[_Driver, Mapping[str, object]]":
+        """Drive ``call`` to its ``done`` or ``failed`` step, answering every step on the host."""
         driver: Final = _Driver(self, op, prepared)
         outcome: object = None  # rebind-ok: the answer to the last step
         while True:
@@ -1128,20 +1143,25 @@ class RustCore(_SettingsSource):
                     outcome = await self._answer_cache(step)
                 case "select":
                     outcome = step["candidates"]
-                case "done":
-                    return await driver.finish_async(step)
-                case "failed":
-                    raise driver.failed(step)
+                case "done" | "failed":
+                    return driver, step
                 case other:
                     raise RuntimeError(f"router-core returned an unknown step {other!r}")
 
     def _call_sync(self, op: str, request: Mapping[str, object]) -> object:
-        async_op: Final = SYNC_OPS[op]
-        call, prepared = self._start(async_op, request)
+        call, prepared = self._start(SYNC_OPS[op], request)
+        driver, step = self._run_sync(op, call, prepared)
+        if step["kind"] == "failed":
+            raise driver.failed(step)
+        return driver.finish(step)
+
+    def _run_sync(
+        self, op: str, call: "RouterCall", prepared: Mapping[str, object]
+    ) -> "tuple[_Driver, Mapping[str, object]]":
         driver: Final = _Driver(self, op, prepared)
         outcome: object = None  # rebind-ok: the answer to the last step
         while True:
-            step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # see _drive
+            step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # see _run
             driver.take_events(step.get("events"))
             match step["kind"]:
                 case "attempt":
@@ -1156,12 +1176,88 @@ class RustCore(_SettingsSource):
                     outcome = self._answer_cache_sync(step)
                 case "select":
                     outcome = step["candidates"]
-                case "done":
-                    return driver.finish(step)
-                case "failed":
-                    raise driver.failed(step)
+                case "done" | "failed":
+                    return driver, step
                 case other:
                     raise RuntimeError(f"router-core returned an unknown step {other!r}")
+
+    # -- stream recovery (the host's stream wrappers, router_rust_streaming) ---------------------
+
+    def _recovery_call(
+        self,
+        recovery: str,
+        op: str,
+        request: Mapping[str, object],
+        origin: Mapping[str, object],
+        failure: BaseException,
+    ) -> "RouterCall":
+        start: Final = self._handle.retry_stream if recovery == "retry" else self._handle.fallback_stream
+        routing: Final = _document({"model": request.get("model"), **_start_fields(request)})
+        return start(SYNC_OPS.get(op, op), routing, _document(origin), attempt_failure(failure))
+
+    def stream_policy(
+        self, request: Mapping[str, object], origin: Mapping[str, object], trigger: BaseException | None
+    ) -> Mapping[str, object]:
+        routing: Final = _document({"model": request.get("model"), **_start_fields(request)})
+        kind: Final = None if trigger is None else str(attempt_failure(trigger)["kind"])
+        return self._handle.stream_policy(routing, _document(origin), kind)
+
+    async def recover_stream(
+        self,
+        recovery: str,
+        op: str,
+        request: Mapping[str, object],
+        origin: Mapping[str, object],
+        failure: BaseException,
+    ) -> object:
+        """The fallback walk for a stream that failed before content: the fallback's response with the
+        router's headers, or the error the walk ended on."""
+        call: Final = self._recovery_call(recovery, op, request, origin, failure)
+        driver, step = await self._run(op, call, request)
+        if step["kind"] == "failed":
+            raise driver.failed(step)
+        return await driver.finish_async(step)
+
+    def recover_stream_sync(
+        self,
+        recovery: str,
+        op: str,
+        request: Mapping[str, object],
+        origin: Mapping[str, object],
+        failure: BaseException,
+    ) -> object:
+        call: Final = self._recovery_call(recovery, op, request, origin, failure)
+        driver, step = self._run_sync(op, call, request)
+        if step["kind"] == "failed":
+            raise driver.failed(step)
+        return driver.finish(step)
+
+    async def retry_stream(
+        self, op: str, request: Mapping[str, object], origin: Mapping[str, object], failure: BaseException
+    ) -> "tuple[object, int, int] | BaseException":
+        """A same-group retry of a stream that failed before content: the retried response (without the
+        router's headers) with the retry count and budget, or the newest failure (``failure`` itself
+        when no retry ran)."""
+        call: Final = self._recovery_call("retry", op, request, origin, failure)
+        driver, step = await self._run(op, call, request)
+        if step["kind"] == "failed":
+            return driver.last_error if driver.last_error is not None else failure
+        attempted: Final = step.get("attempted_retries")
+        budget: Final = step.get("max_retries")
+        return (
+            driver.response,
+            attempted if isinstance(attempted, int) else 0,
+            budget if isinstance(budget, int) else 0,
+        )
+
+    def params_sent_to_deployment(self, request: Mapping[str, object], deployment_id: object) -> Mapping[str, object]:
+        """The request as a deployment received it: its params, the router defaults, its tool choice, then
+        the request (``_params_sent_to_deployment``)."""
+        record: Final = self._handle.deployment(deployment_id) if isinstance(deployment_id, str) else None
+        params: Final = as_str_mapping((as_str_mapping(record) or {}).get("litellm_params")) or {}
+        defaults: Final = {k: v for k, v in self._resolved.default_litellm_params.items() if v is not None}
+        tool_choice: Final = {"tool_choice": params["tool_choice"]} if params.get("tool_choice") is not None else {}
+        return MappingProxyType({**params, **defaults, **tool_choice, **request})
 
     def _drive_sync_steps(self, call: "RouterCall") -> Mapping[str, object]:
         """Drive a call whose only steps are cache ops (``report_failure``) to its end."""
@@ -1354,8 +1450,37 @@ class _Driver:
             default_litellm_params=resolved.default_litellm_params,
             timeout=resolved.timeout,
         )
-        self._served = (requested, kwargs)
-        return deployment, kwargs
+        shaped: Final = shape_attempt_kwargs(kwargs, deployment)
+        self._served = (requested, shaped)
+        return deployment, shaped
+
+    @property
+    def response(self) -> object:
+        return self._last_response
+
+    @property
+    def last_error(self) -> BaseException | None:
+        return self._last_error
+
+    def _stream_attempt(self, step: Mapping[str, object], kwargs: Mapping[str, object]) -> StreamAttempt:
+        def number(key: str) -> int:
+            value: Final = step.get(key)
+            return value if isinstance(value, int) else 0
+
+        order: Final = step.get("target_order")
+        deployment_id: Final = step.get("deployment_id")
+        return StreamAttempt(
+            core=self._core,
+            op=self._op,
+            request=self._request,
+            kwargs=kwargs,
+            group=str(step.get("model") or step.get("model_group")),
+            order=order if isinstance(order, int) else None,
+            depth=number("fallback_depth"),
+            level=number("fallback_level"),
+            deployment_id=deployment_id if isinstance(deployment_id, str) else None,
+            attempted_retries=number("retry"),
+        )
 
     def _failed(
         self, step: Mapping[str, object], deployment: Mapping[str, object], error: BaseException
@@ -1373,7 +1498,8 @@ class _Driver:
             endpoint: Final = host.invoke(_HOST_ENDPOINTS.get(self._op, self._op))
             # Every op the Rust core serves names an async endpoint, so the call returns an awaitable.
             pending: Final[object] = endpoint(**kwargs)
-            response: Final[object] = await pending if inspect.isawaitable(pending) else pending
+            answered: Final[object] = await pending if inspect.isawaitable(pending) else pending
+            response: Final = await open_attempt_stream(self._stream_attempt(step, kwargs), answered)
         except Exception as error:  # noqa: BLE001  # every attempt failure is classified and handed to the Rust call loop
             return self._failed(step, deployment, error)
         self._last_response = response
@@ -1382,11 +1508,16 @@ class _Driver:
     def attempt_sync(self, step: Mapping[str, object]) -> Mapping[str, object]:
         deployment, kwargs = self._kwargs(step)
         try:
-            response: Final = self._core._host.invoke(self._op)(**kwargs)  # pyright: ignore[reportPrivateUsage]  # a sync endpoint
+            answered: Final = self._core._host.invoke(self._op)(**kwargs)  # pyright: ignore[reportPrivateUsage]  # a sync endpoint
+            if inspect.isawaitable(answered):
+                raise TypeError(f"the host's {self._op} endpoint is not synchronous")
+            response: Final = open_attempt_stream_sync(self._stream_attempt(step, kwargs), answered)
+        except TypeError as error:
+            if "is not synchronous" in str(error):
+                raise
+            return self._failed(step, deployment, error)
         except Exception as error:  # noqa: BLE001  # see attempt
             return self._failed(step, deployment, error)
-        if inspect.isawaitable(response):
-            raise TypeError(f"the host's {self._op} endpoint is not synchronous")
         self._last_response = response
         return {"ok": True, "total_tokens": total_tokens(response)}
 

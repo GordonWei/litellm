@@ -18,6 +18,10 @@ use crate::{
     select::{Candidates, SelectInputs},
 };
 
+mod stream;
+
+pub use self::stream::{StreamOrigin, StreamPolicy};
+
 /// `INITIAL_RETRY_DELAY`, `MAX_RETRY_DELAY` and `JITTER` in `litellm/constants.py`.
 const INITIAL_RETRY_DELAY: f64 = 0.5;
 const MAX_RETRY_DELAY: f64 = 8.0;
@@ -117,12 +121,16 @@ impl Core {
             target,
             Hop::default(),
             &mut attempted,
+            None,
         )
         .await
     }
 
     /// One level of `async_function_with_fallbacks`: the target's retry loop, then its
     /// fallbacks. A level that fails raises its own error, whatever its fallbacks raised.
+    /// `resumed` is a failure the level already had (a stream that failed after its attempt
+    /// returned): its fallbacks run without the retry loop.
+    #[allow(clippy::too_many_arguments)]
     fn with_fallbacks<'a>(
         &'a self,
         snapshot: &'a Snapshot,
@@ -131,11 +139,15 @@ impl Core {
         target: Target,
         at: Hop,
         attempted: &'a mut HashSet<Target>,
+        resumed: Option<Error>,
     ) -> BoxFuture<'a, Result<RouterResponse, Error>> {
         Box::pin(async move {
-            let error = match self.with_retries(snapshot, op, request, &target, at).await {
-                Ok(response) => return Ok(response),
-                Err(error) => error,
+            let error = match resumed {
+                Some(error) => error,
+                None => match self.with_retries(snapshot, op, request, &target, at).await {
+                    Ok(response) => return Ok(response),
+                    Err(error) => error,
+                },
             };
             let Some(targets) = self.fallback_targets(snapshot, request, &target, &error) else {
                 return Err(error);
@@ -181,6 +193,7 @@ impl Core {
                             level: at.level + 1,
                         },
                         attempted,
+                        None,
                     )
                     .await
                 {

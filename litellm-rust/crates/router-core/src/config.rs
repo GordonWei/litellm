@@ -215,6 +215,11 @@ impl Fallbacks {
         self.0.is_empty()
     }
 
+    /// `_has_default_fallbacks`: whether any entry is keyed `"*"`.
+    pub fn has_default(&self) -> bool {
+        self.0.iter().any(|(key, _)| key == "*")
+    }
+
     /// `_get_first_default_fallback`: the first target of the first `"*"` entry.
     pub fn default_target(&self) -> Option<&str> {
         self.0
