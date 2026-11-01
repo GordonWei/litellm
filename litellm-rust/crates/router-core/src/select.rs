@@ -215,6 +215,12 @@ impl Core {
                 .await?;
         }
 
+        if let Some(pinned) = request.pinned_deployment_id.as_deref()
+            && healthy.iter().any(|d| d.id == pinned)
+        {
+            healthy.retain(|d| d.id == pinned);
+        }
+
         let order = inputs
             .target_order
             .or_else(|| healthy.iter().filter_map(|d| d.order()).min());

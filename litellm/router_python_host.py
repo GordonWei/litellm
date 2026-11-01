@@ -7,8 +7,10 @@ come from ``dynamic()`` (``litellm/router_config.py``). A Rust core gets the sam
 """
 
 import asyncio
+import importlib
 import time
-from collections.abc import Awaitable, Callable, Sequence
+import types
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import (
     TYPE_CHECKING,
     Final,
@@ -99,7 +101,7 @@ class PythonHost:
     def invoke(self, op: str) -> Endpoint: ...
     def invoke(self, op: str) -> Endpoint:
         """The litellm function named ``op`` (``acompletion``, ``get_model_info``, ...), looked up at call time."""
-        endpoint: Final[object] = getattr(litellm, op, None)
+        endpoint: Final[object] = getattr(litellm, op, None) if "." not in op else _dotted(op)
         if endpoint is None:
             raise AttributeError(f"litellm has no endpoint {op!r}")
         if not callable(endpoint):
@@ -184,3 +186,31 @@ def redis_cache_for(config: RouterConfig) -> "RedisCache | None":
 
 
 python_host: Final = PythonHost()
+
+
+def _dotted(op: str) -> object:
+    """``op`` named by its path under ``litellm`` (``vector_stores.main.asearch``), read at call time.
+
+    Each segment is a module attribute, a submodule, or a key of a mapping such as a module's
+    table of generated endpoints.
+    """
+    node: object = litellm  # rebind-ok: walks the path one segment at a time
+    path: str = "litellm"  # rebind-ok: the module path walked so far
+    for segment in op.split("."):
+        path = f"{path}.{segment}"
+        if isinstance(node, Mapping):
+            node = cast(Mapping[str, object], node).get(segment)  # cast-ok: endpoint tables are keyed by name
+        elif isinstance(node, types.ModuleType) and (submodule := _submodule(path)) is not None:
+            node = submodule
+        else:
+            node = cast(object, getattr(node, segment, None))  # cast-ok: any attribute
+        if node is None:
+            return None
+    return node
+
+
+def _submodule(path: str) -> types.ModuleType | None:
+    try:
+        return importlib.import_module(path)
+    except ModuleNotFoundError:
+        return None

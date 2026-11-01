@@ -1530,7 +1530,7 @@ async def open_attempt_stream(attempt: StreamAttempt, response: object) -> objec
         return response
     if attempt.op == "aresponses" and isinstance(response, BaseResponsesAPIStreamingIterator):
         return wrap_responses_stream(attempt, response)
-    if attempt.op == "aanthropic_messages" and hasattr(response, "__aiter__"):
+    if attempt.op in ("aanthropic_messages", "anthropic_messages") and hasattr(response, "__aiter__"):
         return wrap_anthropic_stream(attempt, cast("AsyncIterator[bytes]", response))  # cast-ok: a byte stream
     return response
 
