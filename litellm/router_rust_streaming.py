@@ -59,7 +59,9 @@ from litellm.types.utils import ModelResponseStream, Usage
 
 if TYPE_CHECKING:
     from litellm.responses.streaming_iterator import BaseResponsesAPIStreamingIterator
+    from litellm.router_python_host import PythonHost
     from litellm.router_rust_core import RustCore
+    from litellm.router_utils.pre_call_checks.continuation_prefill_check import ContinuationOutput, ContinuedPartial
     from litellm.types.llms.openai import ResponseAPIUsage, ResponseIncompleteEvent
 
 # A stream that never emits content or an error could grow a held-frame buffer without bound, so
@@ -327,6 +329,258 @@ def _combine_fallback_usage(fallback_item: ModelResponseStream, complete_respons
     fallback_item.usage = BaseTokenUsageProcessor.combine_usage_objects(usage_objects=usage_objects)  # pyright: ignore[reportAttributeAccessIssue]  # usage is not a declared chunk field  # rebind-ok: the Python router rewrites the chunk's usage in place
 
 
+# --- mid-stream continuation --------------------------------------------------------------------
+
+CONTINUATION_FLAG: Final = "enable_mid_stream_fallback_continuation"
+NO_FLAG: Final = object()
+# The routing-body key naming the deployments a continuation may not land on (``continuation_deployments``).
+CONTINUATION_EXCLUDED_IDS: Final = "continuation_excluded_ids"
+
+
+def continuation_flag(value: object) -> bool:
+    """``_is_flag_enabled``: True, or a string ``str_to_bool`` reads as True."""
+    from litellm.secret_managers.main import str_to_bool
+
+    return value is True or (isinstance(value, str) and str_to_bool(value) is True)
+
+
+def register_continuation_prefill_check(host: "PythonHost") -> None:
+    """``_register_continuation_prefill_check``: process-global on purpose, as in the Python router."""
+    from litellm.router_utils.pre_call_checks.continuation_prefill_check import ContinuationPrefillDeploymentCheck
+
+    host.callbacks.add_litellm_callback(ContinuationPrefillDeploymentCheck())
+
+
+def continuation_routing(core: "RustCore", request: Mapping[str, object]) -> Mapping[str, object]:
+    """The routing fields of a continuation request: the deployments that cannot continue it, which the
+    core leaves out of selection the way ``continuation_deployments`` filters the healthy list."""
+    from litellm.litellm_core_utils.routing_common_utils import MID_STREAM_CONTINUATION_KWARG
+    from litellm.router_utils.pre_call_checks.continuation_prefill_check import (
+        MID_STREAM_CONTINUATION_MARKER,
+        deployment_can_continue,
+    )
+
+    if request.get(MID_STREAM_CONTINUATION_KWARG) is not MID_STREAM_CONTINUATION_MARKER:
+        return {}
+    registry: Final = core.registry()
+    excluded: Final = [
+        deployment.model_info.id
+        for record in registry.all()
+        if (deployment := registry.deployment(str(_record_id(record)))) is not None
+        and not deployment_can_continue(deployment.model_dump(exclude_none=True))
+    ]
+    return {"body": {CONTINUATION_EXCLUDED_IDS: excluded}}
+
+
+def _record_id(record: Mapping[str, object]) -> object:
+    model_info: Final = record.get("model_info")
+    return model_info.get("id") if isinstance(model_info, Mapping) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # a plain record
+
+
+def _names_deployment_that_cannot_continue(core: "RustCore", target: object) -> bool:
+    from litellm.router_utils.fallback_event_handlers import fallback_target_name
+    from litellm.router_utils.pre_call_checks.continuation_prefill_check import deployment_can_continue
+
+    name: Final = fallback_target_name(target)
+    registry: Final = core.registry()
+    model_names: Final = {record.get("model_name") for record in registry.all()}
+    if name is None or name in model_names or not registry.has_deployment(name):
+        return False
+    deployment: Final = registry.deployment(name)
+    return deployment is not None and not deployment_can_continue(deployment.model_dump(exclude_none=True))
+
+
+def _mid_stream_continuation_eligible(
+    attempt: StreamAttempt, e: MidStreamFallbackError, cut_deployment_id: object
+) -> bool:
+    """``_mid_stream_continuation_eligible``: whether a stream that broke after plain assistant text may
+    continue via prefill."""
+    from litellm.integrations.custom_guardrail import CustomGuardrail
+    from litellm.router_utils.fallback_event_handlers import (
+        continuation_fallback_targets,
+        fallback_lookup_groups,
+        fallback_target_overrides_request_params,
+    )
+    from litellm.router_utils.pre_call_checks.continuation_prefill_check import constrains_continuation
+    from litellm.types.guardrails import GuardrailEventHooks
+
+    core: Final = attempt.core
+    if not core.enable_mid_stream_fallback_continuation:
+        return False
+    if not e.generated_content or e.emitted_disqualifying_content:
+        return False
+    if isinstance(e.original_exception, litellm_exceptions.ContentPolicyViolationError):
+        return False
+    if isinstance(cut_deployment_id, str) and not core.registry().has_deployment(cut_deployment_id):
+        return False
+    if constrains_continuation(_params_sent_to_deployment(attempt, cut_deployment_id)):
+        return False
+    request: Final = attempt.request
+    requested_group: Final = request.get("model")
+    lookup_groups: Final = fallback_lookup_groups(
+        request, requested_group if isinstance(requested_group, str) else None
+    )
+    targets: Final = continuation_fallback_targets(core.settings().fallbacks, lookup_groups)  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # fallbacks as Python spells them
+    if any(fallback_target_overrides_request_params(target) for target in targets):
+        return False
+    if any(_names_deployment_that_cannot_continue(core, target) for target in targets):
+        return False
+    return not any(
+        isinstance(callback, CustomGuardrail)
+        and callback._event_hook_is_event_type(  # pyright: ignore[reportPrivateUsage]  # the only check of a guardrail's hooks
+            GuardrailEventHooks.post_call
+        )
+        for callback in core._host.callback_list("callbacks")  # pyright: ignore[reportPrivateUsage, reportArgumentType]  # the core's own host; read as getattr(litellm, name)
+    )
+
+
+def _extend_trailing_text_block(blocks: Sequence[Mapping[str, object]], text: str) -> Sequence[Mapping[str, object]]:
+    """Continue the last text block in place so the prefill reads as the text the caller already received."""
+    last: Final = blocks[-1] if blocks else None
+    if last is not None and last.get("type") == "text" and isinstance(last_text := last.get("text"), str):
+        return [*blocks[:-1], {**last, "text": f"{last_text}{text}"}]
+    return [*blocks, {"type": "text", "text": text}]
+
+
+def _build_completion_continuation_input(
+    messages: Sequence[Mapping[str, object]], generated_content: str
+) -> Sequence[Mapping[str, object]] | None:
+    """The partial output as an assistant prefill, or a trailing ``prefix: True`` assistant turn extended in
+    place. None when the request ends in a plain assistant turn, in a prefill turn whose content this cannot
+    extend, or when the cut came mid-echo of the prefill."""
+    from pydantic import TypeAdapter, ValidationError
+
+    from litellm.router_utils.pre_call_checks.continuation_prefill_check import continued_text
+
+    last: Final = messages[-1] if messages else None
+    if last is None or last.get("role") != "assistant":
+        return [*messages, {"role": "assistant", "content": generated_content, "prefix": True}]
+    if last.get("prefix") is not True:
+        return None
+    new_text: Final = continued_text(last, generated_content)
+    if new_text is None:
+        return None
+    content: Final = last.get("content")
+    if content is None or isinstance(content, str):
+        return [*messages[:-1], {**last, "content": f"{content or ''}{new_text}", "prefix": True}]
+    try:
+        blocks: Final = TypeAdapter(list[dict[str, object]]).validate_python(content)
+    except ValidationError:
+        return None
+    return [*messages[:-1], {**last, "content": _extend_trailing_text_block(blocks, new_text), "prefix": True}]
+
+
+def _price_cut_partial(cut_stream: CustomStreamWrapper, partial_response: object) -> "ContinuedPartial | None":
+    """Price the cut stream's partial, plus any partial it inherited, before a fallback can reuse its logging."""
+    from litellm.cost_calculator import BaseTokenUsageProcessor
+    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
+    from litellm.router_utils.pre_call_checks.continuation_prefill_check import ContinuedPartial
+
+    cut_logging: Final = cut_stream.logging_obj
+    partial_usage: Final = getattr(partial_response, "usage", None)
+    if partial_response is None or not isinstance(partial_usage, Usage):
+        return None
+    details: Final = cut_logging.model_call_details
+    inherited_usage: Final = details.get("continued_partial_usage")
+    inherited_cost: Final = details.get("continued_partial_cost")
+    inherited_id: Final = details.get("continued_response_id")
+    priced_partial: Final = partial_response.model_copy(  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownVariableType]  # a ModelResponse
+        update={"model": cut_stream.model} if cut_stream.model else {}  # pyright: ignore[reportUnknownMemberType]  # untyped attribute
+    )
+    priced_partial._hidden_params = {  # pyright: ignore[reportUnknownMemberType]  # no public accessor
+        key: value for key, value in get_hidden_params_dict(partial_response).items() if key != "response_cost"
+    }
+    if LiteLLMLogging.usage_capture_callback is not None:
+        from litellm._internal_context import internal_sub_call
+
+        with internal_sub_call(cut_logging.litellm_call_id):
+            cut_logging.capture_usage_before_logging(priced_partial)  # pyright: ignore[reportUnknownArgumentType]  # a ModelResponse
+    return ContinuedPartial(
+        usage=BaseTokenUsageProcessor.combine_usage_objects(
+            usage_objects=[partial_usage, inherited_usage] if isinstance(inherited_usage, Usage) else [partial_usage]
+        ),
+        response_cost=(cut_logging.response_cost_calculator(result=priced_partial) or 0.0)  # pyright: ignore[reportUnknownArgumentType]  # a ModelResponse
+        + (inherited_cost if isinstance(inherited_cost, float) else 0.0),
+        response_id=inherited_id if isinstance(inherited_id, str) else str(getattr(partial_response, "id", "")),
+    )
+
+
+def _carry_partial_spend_to_fallback(fallback_response: object, cut_partial: "ContinuedPartial | None") -> None:
+    """Bill what the cut legs consumed on the continuation's success log."""
+    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
+
+    fallback_logging: Final = getattr(fallback_response, "logging_obj", None)
+    if cut_partial is None or not isinstance(fallback_logging, LiteLLMLogging):
+        return
+    fallback_logging.record_continued_partial(
+        usage=cut_partial.usage,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # a Usage
+        response_cost=cut_partial.response_cost,
+        response_id=cut_partial.response_id,
+    )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Continuation:
+    """What a chat continuation sends the fallback and splices back."""
+
+    request: Mapping[str, object]
+    output: "ContinuationOutput"
+    partial: "ContinuedPartial | None"
+    usage: Usage | None
+
+
+async def _chat_continuation(
+    attempt: StreamAttempt, e: MidStreamFallbackError, model_response: CustomStreamWrapper
+) -> _Continuation:
+    """The request a fallback continues a chat stream from, once it broke after content. Raises the
+    provider's error when the continuation is declined or the output ceiling is spent."""
+    from litellm.constants import MID_STREAM_FAILURE_LOG_WAIT_SECONDS
+    from litellm.litellm_core_utils.routing_common_utils import MID_STREAM_CONTINUATION_KWARG
+    from litellm.main import (
+        stream_chunk_builder,  # pyright: ignore[reportUnknownVariableType]  # untyped chunk list argument
+    )
+    from litellm.router_utils.pre_call_checks.continuation_prefill_check import (
+        MID_STREAM_CONTINUATION_MARKER,
+        ContinuationOutput,
+        continuation_output_ceilings,
+    )
+
+    request: Final = attempt.request
+    raw_messages: Final = request.get("messages")
+    messages: Final = cast("list[Mapping[str, object]]", raw_messages or [])  # cast-ok: chat messages
+    complete: Final = stream_chunk_builder(chunks=model_response.chunks, messages=messages)  # pyright: ignore[reportUnknownArgumentType]  # provider chunk list
+    usage: Final = cast("Usage | None", getattr(complete, "usage", None))  # cast-ok: a built response's usage
+    continuation_messages: Final = _build_completion_continuation_input(messages, e.generated_content)
+    output: Final = (
+        ContinuationOutput(
+            e.generated_content,
+            continuation_messages[-1],
+            str(request.get("model") or ""),
+            complete,
+            checks_post_call_rules=request.get(MID_STREAM_CONTINUATION_KWARG) is not MID_STREAM_CONTINUATION_MARKER,
+        )
+        if continuation_messages is not None
+        else None
+    )
+    partial: Final = _price_cut_partial(model_response, complete) if output is not None else None
+    emitted_tokens: Final = int(getattr(usage, "completion_tokens", 0) or 0)
+    reduced: Final = continuation_output_ceilings(request, emitted_tokens)
+    if reduced is None or continuation_messages is None or output is None:
+        _raise_original_mid_stream_error(e)
+    await model_response.wait_for_failure_logging(timeout=MID_STREAM_FAILURE_LOG_WAIT_SECONDS)
+    return _Continuation(
+        request={
+            **request,
+            **reduced,
+            "messages": continuation_messages,
+            MID_STREAM_CONTINUATION_KWARG: MID_STREAM_CONTINUATION_MARKER,
+        },
+        output=output,
+        partial=partial,
+        usage=usage,
+    )
+
+
 # --- chat completions ---------------------------------------------------------------------------
 
 
@@ -451,15 +705,25 @@ def wrap_chat_stream(  # noqa: C901  # one function per Python wrapper it ports
                 not e.is_pre_first_chunk
                 and (e.generated_content or _stream_chunks_have_generated_content(model_response.chunks))
             )
-            if committed:
+            cut_deployment_id: Final = (get_hidden_params(model_response) or {}).get("model_id")
+            if committed and not _mid_stream_continuation_eligible(attempt, e, cut_deployment_id):
                 _raise_original_mid_stream_error(e)
             trigger: Final = _fallback_trigger(e, (litellm_exceptions.ContextWindowExceededError,))
             try:
-                fallback_response = await attempt.fallback(trigger)  # rebind-ok: rebound as the stream advances
+                continuation: Final = await _chat_continuation(attempt, e, model_response) if committed else None
+                fallback_response = await attempt.fallback(  # rebind-ok: rebound as the stream advances
+                    trigger, continuation.request if continuation is not None else None
+                )
                 if hasattr(fallback_response, "__aiter__"):
+                    if continuation is not None:
+                        _carry_partial_spend_to_fallback(fallback_response, continuation.partial)
                     prepared = _adopt_fallback_response_headers(wrapper_ref, fallback_response)  # rebind-ok: re-adopted
                     settled = False  # rebind-ok: rebound as the stream advances
-                    async for fallback_item in cast("AsyncIterable[object]", fallback_response):  # cast-ok: checked
+                    fallback_stream: Final = cast("AsyncIterable[object]", fallback_response)  # cast-ok: checked
+                    fallback_items: Final = (
+                        continuation.output.splice(fallback_stream) if continuation is not None else fallback_stream
+                    )
+                    async for fallback_item in fallback_items:
                         if not settled:
                             settled = True
                             # a fallback that failed over again only repoints itself once it yields
@@ -470,7 +734,10 @@ def wrap_chat_stream(  # noqa: C901  # one function per Python wrapper it ports
                             and isinstance(fallback_item, ModelResponseStream)
                             and hasattr(fallback_item, "usage")
                         ):
-                            _combine_fallback_usage(fallback_item, None)
+                            _combine_fallback_usage(
+                                fallback_item,
+                                continuation.usage if continuation is not None else None,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # a Usage
+                            )
                         yield fallback_item
                 else:
                     # A fallback that answers without a stream yields None (an oddity kept as is).

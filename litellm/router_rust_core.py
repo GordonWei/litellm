@@ -65,9 +65,14 @@ from litellm.router_attempt import (
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
 from litellm.router_rust_streaming import (
+    CONTINUATION_FLAG,
+    NO_FLAG,
     StreamAttempt,
+    continuation_flag,
+    continuation_routing,
     open_attempt_stream,
     open_attempt_stream_sync,
+    register_continuation_prefill_check,
     shape_attempt_kwargs,
 )
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
@@ -155,6 +160,7 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "default_litellm_params",
         "fallback_access_check",
         "fallback_budget_check",
+        "enable_mid_stream_fallback_continuation",
         "redis_url",
         "redis_host",
         "redis_port",
@@ -311,6 +317,7 @@ class Resolved:
     default_litellm_params: Mapping[str, object]
     fallback_access_check: object
     fallback_budget_check: object
+    enable_mid_stream_fallback_continuation: bool = False
     assigned: frozenset[str] = frozenset()
 
     @classmethod
@@ -359,6 +366,7 @@ class Resolved:
             default_litellm_params=MappingProxyType(dict(as_str_mapping(get("default_litellm_params")) or {})),
             fallback_access_check=get("fallback_access_check"),
             fallback_budget_check=get("fallback_budget_check"),
+            enable_mid_stream_fallback_continuation=continuation_flag(get("enable_mid_stream_fallback_continuation")),
         )
 
     def changed(self, values: Mapping[str, object]) -> "Resolved":
@@ -806,6 +814,8 @@ class RustCore(_SettingsSource):
         self._retired: bool = False
         self._settings: RustSettings | None = None
         self._handle: RouterCoreHandle = self._new_handle(list(_as_list(config.get("model_list"))))
+        if resolved.enable_mid_stream_fallback_continuation:
+            register_continuation_prefill_check(host)
 
     @classmethod
     def build(cls, config: RouterConfig, host: PythonHost) -> "RustCore":
@@ -815,6 +825,17 @@ class RustCore(_SettingsSource):
         if extra:
             raise RustBridgeDeclined(f"router arguments not served by the Rust core: {sorted(extra)}")
         return cls(config, host, Resolved.of(config, host.dynamic()))
+
+    @property
+    def enable_mid_stream_fallback_continuation(self) -> bool:
+        return self._resolved.enable_mid_stream_fallback_continuation
+
+    def _set_continuation(self, enabled: bool) -> None:
+        """``_set_mid_stream_fallback_continuation``: an enabled flag registers the process-wide prefill check."""
+        self._resolved = dataclasses.replace(self._resolved, enable_mid_stream_fallback_continuation=enabled)
+        self._settings = None
+        if enabled:
+            register_continuation_prefill_check(self._host)
 
     def __getattr__(self, name: str) -> object:
         # Only reached for members this class does not define: never forwarded anywhere.
@@ -902,6 +923,7 @@ class RustCore(_SettingsSource):
             "fallbacks": r.fallbacks,
             "context_window_fallbacks": r.context_window_fallbacks,
             "model_group_alias": dict(r.model_group_alias),
+            "enable_mid_stream_fallback_continuation": r.enable_mid_stream_fallback_continuation,
             "routing_groups": [],
         }
 
@@ -927,7 +949,11 @@ class RustCore(_SettingsSource):
     def apply(self, changes: ChangeSet) -> ApplyResult:
         if changes.redis_cache is not None or changes.refresh_model_info:
             raise RustCoreUnsupported("apply(redis_cache / refresh_model_info) is not served by the Rust router core")
-        values: Final = {**changes.assign, **changes.settings}
+        # `update_settings` reads the flag itself; it is not a settings field a changeset assigns.
+        flag: Final = changes.settings.get(CONTINUATION_FLAG, NO_FLAG)
+        if flag is not NO_FLAG:
+            self._set_continuation(continuation_flag(flag))
+        values: Final = {**changes.assign, **{k: v for k, v in changes.settings.items() if k != CONTINUATION_FLAG}}
         if values:
             resolved: Final = self._resolved.changed(values)
             static_changed: Final = bool(_STATIC_SETTINGS & set(values))
@@ -1192,7 +1218,9 @@ class RustCore(_SettingsSource):
         failure: BaseException,
     ) -> "RouterCall":
         start: Final = self._handle.retry_stream if recovery == "retry" else self._handle.fallback_stream
-        routing: Final = _document({"model": request.get("model"), **_start_fields(request)})
+        routing: Final = _document(
+            {"model": request.get("model"), **_start_fields(request), **continuation_routing(self, request)}
+        )
         return start(SYNC_OPS.get(op, op), routing, _document(origin), attempt_failure(failure))
 
     def stream_policy(

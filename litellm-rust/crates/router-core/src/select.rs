@@ -189,6 +189,15 @@ impl Core {
             healthy = all.clone();
         }
         healthy.retain(|d| !d.model_info.blocked);
+        // `continuation_deployments`: a mid-stream continuation never lands on a deployment the host
+        // named as unable to take its prefill.
+        if let Some(excluded) = request
+            .body
+            .get("continuation_excluded_ids")
+            .and_then(serde_json::Value::as_array)
+        {
+            healthy.retain(|d| !excluded.iter().any(|id| id.as_str() == Some(d.id.as_str())));
+        }
         if inputs.count_only {
             return Ok(Candidates {
                 model_group: resolution.group,
