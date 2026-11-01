@@ -438,7 +438,7 @@ def generic_plan(endpoint: str) -> Plan | None:
 # --- preparing the request -------------------------------------------------------------------
 
 
-def prepare(
+def prepare_request(
     plan: Plan, request: Mapping[str, object], model: str, aliases: Mapping[str, object]
 ) -> dict[str, object]:  # mutable-ok: the call's kwargs
     """What the router adds once before the first attempt (`_update_kwargs_before_fallbacks`): a
@@ -687,7 +687,7 @@ def _resolved_credentials(core: "RustCore", deployment: Mapping[str, object], re
     """`get_deployment_credentials_with_provider` for the picked deployment (`_acancel_batch`)."""
     registry: Final = core.registry()
     model_id: Final = as_dict(deployment.get("model_info")).get("id")
-    resolved: Final = registry.credentials(str(model_id or requested), with_provider=True)  # pyright: ignore[reportCallIssue, reportUnknownMemberType, reportUnknownVariableType]  # the registry view
+    resolved: Final = registry.credentials(str(model_id or requested), form="with_provider")
     return as_dict(resolved)  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
 
 
@@ -954,7 +954,7 @@ class RustEndpoints:
     def prepare(
         self, plan: Plan, request: Mapping[str, object], model: str
     ) -> dict[str, object]:  # mutable-ok: the call's kwargs
-        return prepare(plan, request, model, self._core._resolved.model_group_alias)  # pyright: ignore[reportPrivateUsage]  # the endpoints serve their own core
+        return prepare_request(plan, request, model, self._core._resolved.model_group_alias)  # pyright: ignore[reportPrivateUsage]  # the endpoints serve their own core
 
     # -- host and registry ---------------------------------------------------------------------
 
@@ -1511,7 +1511,7 @@ class RustEndpoints:
         model: Final = kwargs.get("model", "")
         if model and isinstance(model, str) and self._is_model_group(model):
             return await self._core._drive(plan, kwargs, _SINGLE_ATTEMPT)  # pyright: ignore[reportPrivateUsage]  # see above
-        prepared: Final = prepare(plan, kwargs, str(model), self._core._resolved.model_group_alias)  # pyright: ignore[reportPrivateUsage]  # see above
+        prepared: Final = prepare_request(plan, kwargs, str(model), self._core._resolved.model_group_alias)  # pyright: ignore[reportPrivateUsage]  # see above
         return await self._direct("amoderation", prepared)
 
     def text_completion(self, request: Mapping[str, object]) -> object:
@@ -1879,6 +1879,6 @@ __all__ = [
     "generic_plan",
     "pinned_video_deployment",
     "plan_for",
-    "prepare",
+    "prepare_request",
     "stamp_error",
 ]

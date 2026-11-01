@@ -190,6 +190,9 @@ pub(crate) fn request(value: Value, model: Option<&str>) -> Result<RouterRequest
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChangesSpec {
+    /// Every deployment, replacing the current list before the upserts and deletes.
+    #[serde(default)]
+    replace: Option<Vec<DeploymentSpec>>,
     #[serde(default)]
     upsert: Vec<DeploymentSpec>,
     #[serde(default)]
@@ -202,6 +205,7 @@ struct ChangesSpec {
 pub(crate) fn changes(value: Value) -> Result<ChangeSet, Error> {
     let spec: ChangesSpec = shaped(Document::Changes, object(Document::Changes, value)?)?;
     Ok(ChangeSet {
+        replace: spec.replace,
         upserts: spec.upsert,
         deletes: spec.delete,
         settings: spec.settings.map(dynamic_config).transpose()?,
