@@ -14,6 +14,7 @@ use crate::{
     error::{AttemptError, ConfigError, Error, FailureKind, Unsupported},
     health::{GroupShape, should_retry_status},
     host::{Attempt, Output, RouterEvent, RouterRequest},
+    prerouting::{PreRoute, PreRouted},
     registry::ResolveKind,
     select::{Candidates, SelectInputs},
 };
@@ -464,16 +465,41 @@ impl Core {
         retry: u32,
         at: Hop,
     ) -> Result<RouterResponse, Failed> {
-        let candidates = self
-            .candidates(snapshot, op, request, &target.group, inputs)
+        let routed = self
+            .pre_routed(PreRoute {
+                op,
+                request,
+                name: &target.group,
+                fallback_depth: at.depth,
+                retry,
+            })
             .await?;
-        if candidates.healthy.is_empty() {
-            return Err(Error::NoHealthyDeployments {
-                model: candidates.model_group,
+        let (deployment, candidates) = match routed {
+            PreRouted::Model(name) => {
+                let candidates = self
+                    .candidates(snapshot, op, request, &name, inputs)
+                    .await?;
+                if candidates.healthy.is_empty() {
+                    return Err(Error::NoHealthyDeployments {
+                        model: candidates.model_group,
+                    }
+                    .into());
+                }
+                let deployment = self.pick(snapshot, op, request, &candidates).await?;
+                (deployment, candidates)
             }
-            .into());
-        }
-        let deployment = self.pick(snapshot, op, request, &candidates).await?;
+            // A custom strategy's pick is served as is, for the requested name.
+            PreRouted::Deployment(deployment) => {
+                let candidates = Candidates {
+                    name: target.group.clone(),
+                    model_group: target.group.clone(),
+                    kind: ResolveKind::Group,
+                    all: vec![deployment.clone()],
+                    healthy: vec![deployment.clone()],
+                };
+                (deployment, candidates)
+            }
+        };
         self.host.observe(&RouterEvent::Selected {
             model_group: candidates.model_group.clone(),
             deployment_id: deployment.id.clone(),

@@ -13,6 +13,7 @@ use crate::{
     config::{Op, RoutingStrategy},
     error::{AttemptError, Error, FailureKind, Payload},
     health::Health,
+    prerouting::{PreRoute, PreRouted},
     registry::{Deployment, Registry},
     settings::Settings,
     strategy::StrategyScope,
@@ -49,8 +50,7 @@ pub struct RouterRequest {
     pub excluded_ids: Vec<String>,
     /// `_retry_skipped_deployment_ids`: skipped unless that leaves nothing.
     pub retry_skipped_ids: Vec<String>,
-    /// The async pick, whose pre-routing hook (not ported yet) runs before strategy markers are
-    /// dropped: markers of a group name stay candidates until pre-routing is served.
+    /// An async pick: the host's pre-routing step runs before each pick resolves its name.
     pub pre_routes: bool,
     /// What the host needs to run the call itself, such as the Python kwargs.
     pub payload: Option<Payload>,
@@ -169,6 +169,14 @@ pub trait Host: Send + Sync {
         ctx: &RoutingContext<'_>,
         candidates: Vec<Arc<Deployment>>,
     ) -> Result<Vec<Arc<Deployment>>, Error>;
+
+    /// Pre-routing before a pick resolves `ask.name`: the model group to resolve instead, a
+    /// custom strategy's deployment to serve, or `None` to resolve the name itself. Asked only
+    /// for picks that pre-route (`pre_routes`).
+    async fn pre_route(&self, ask: &PreRoute<'_>) -> Result<Option<PreRouted>, Error> {
+        let _ = ask;
+        Ok(None)
+    }
 
     /// Access and budget checks before a cross-group fallback target.
     async fn allow_fallback(&self, request: &RouterRequest, target: &str) -> bool;
