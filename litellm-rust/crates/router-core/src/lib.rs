@@ -76,6 +76,7 @@ pub mod cache;
 pub mod call;
 pub mod config;
 pub mod error;
+pub mod fallback;
 pub mod health;
 pub mod host;
 pub mod registry;

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use litellm_router_core::{
     ChangeSet, ConfigError, DeploymentSpec, RouterConfig, RouterDynamicConfig, RouterRequest,
-    config::RetryPolicy,
+    config::{Fallbacks, RetryPolicy},
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -166,7 +166,23 @@ struct RequestSpec {
     disable_fallbacks: Option<bool>,
     router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
     model_group_retry_policy: Option<BTreeMap<String, RetryPolicy>>,
+    #[serde(default, deserialize_with = "present")]
+    fallbacks: Option<Option<Fallbacks>>,
+    #[serde(default, deserialize_with = "present")]
+    context_window_fallbacks: Option<Option<Fallbacks>>,
+    #[serde(default, deserialize_with = "present")]
+    content_policy_fallbacks: Option<Option<Fallbacks>>,
+    max_fallbacks: Option<u32>,
     body: Option<Value>,
+}
+
+/// A key the request passed, even as `None`: `Some(None)`.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// Read a request; `model` replaces the request's own when given.
@@ -185,6 +201,10 @@ pub(crate) fn request(value: Value, model: Option<&str>) -> Result<RouterRequest
         disable_fallbacks: spec.disable_fallbacks.unwrap_or(false),
         router_weights: spec.router_weights,
         model_group_retry_policy: spec.model_group_retry_policy,
+        fallbacks: spec.fallbacks,
+        context_window_fallbacks: spec.context_window_fallbacks,
+        content_policy_fallbacks: spec.content_policy_fallbacks,
+        max_fallbacks: spec.max_fallbacks,
         payload: None,
     })
 }

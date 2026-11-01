@@ -6,12 +6,13 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::{
     cache::RouterCache,
     config::{Op, RetryPolicy, RoutingStrategy},
     error::{AttemptError, Error, FailureKind, Payload},
+    fallback::Fallbacks,
     health::Health,
     registry::{Deployment, Registry},
     settings::Settings,
@@ -32,6 +33,13 @@ pub struct RouterRequest {
     pub disable_fallbacks: bool,
     /// `_router_weights`: model group to deployment id to weight.
     pub router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
+    /// Fallback lists the request passed (`Some(None)` when it passed `None`), which replace
+    /// the router's.
+    pub fallbacks: Option<Option<Fallbacks>>,
+    pub context_window_fallbacks: Option<Option<Fallbacks>>,
+    pub content_policy_fallbacks: Option<Option<Fallbacks>>,
+    /// A per-request `max_fallbacks`, which replaces the router's.
+    pub max_fallbacks: Option<u32>,
     /// A per-request `model_group_retry_policy`, which replaces the router's.
     pub model_group_retry_policy: Option<BTreeMap<String, RetryPolicy>>,
     /// What the host needs to run the call itself, such as the Python kwargs.
@@ -58,6 +66,8 @@ pub struct Attempt {
     /// How many fallbacks deep the walk is: 0 for the requested name.
     pub fallback_level: u32,
     pub timeout: Option<Duration>,
+    /// Request params the fallback walk's dict targets merged in (`kwargs.update(target)`).
+    pub params: Option<Arc<Map<String, Value>>>,
 }
 
 /// What a successful attempt returns.

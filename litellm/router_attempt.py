@@ -29,6 +29,9 @@ ROUTING_KEYS: Final = frozenset(
         "_retry_skipped_deployment_ids",
         "_target_order",
         "model_group_retry_policy",
+        "fallbacks",
+        "context_window_fallbacks",
+        "content_policy_fallbacks",
     }
 )
 
@@ -117,7 +120,7 @@ def attempt_kwargs(
     """The keyword arguments for ``litellm.<op>`` against one deployment
     (``_update_kwargs_with_deployment`` and the call sites that merge ``litellm_params``)."""
     params: Final = _as_mapping(deployment.get("litellm_params"))
-    model_info: Final = dict(_as_mapping(deployment.get("model_info")))
+    model_info: Final = _model_info_for(request, deployment, model_group)
     field: Final = metadata_field(op)
     metadata: Final = dict(_as_mapping(request.get(field)))
     metadata.update(
@@ -145,6 +148,29 @@ def attempt_kwargs(
         if chosen is not None:
             call["timeout"] = chosen
     return without_router_only_kwargs({**params, **call, "model": params.get("model")})
+
+
+def _model_info_for(
+    request: Mapping[str, object], deployment: Mapping[str, object], model_group: str
+) -> dict[str, object]:  # mutable-ok: a fresh dict for the call
+    """The deployment's ``model_info``, or, for a request carrying its own credentials, the
+    request-scoped deployment's (``_handle_clientside_credential``): its own stable id, and the
+    configured deployment's id as ``original_model_id``."""
+    from litellm.litellm_core_utils import clientside_credential_handler as clientside
+    from litellm.router_api import deployment_id
+
+    model_info: Final = dict(_as_mapping(deployment.get("model_info")))
+    if not clientside.is_clientside_credential(request_kwargs=dict(request)):  # pyright: ignore[reportUnknownMemberType]  # an untyped helper
+        return model_info
+    dynamic: Final = _as_mapping(
+        clientside.get_dynamic_litellm_params(  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # an untyped helper
+            litellm_params=dict(_as_mapping(deployment.get("litellm_params"))), request_kwargs=dict(request)
+        )
+    )
+    original: Final = model_info.get("id")
+    model_info["id"] = deployment_id(model_group, dynamic)
+    model_info["original_model_id"] = original
+    return model_info
 
 
 def stamp_attempt_error(error: BaseException, deployment: Mapping[str, object]) -> None:

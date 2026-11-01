@@ -23,7 +23,7 @@ use litellm_router_core::{
     Attempt, AttemptError, Deployment, Error, Host, Output, Payload, RouterCache, RouterEvent,
     RouterRequest, RouterResponse, RoutingContext, SelectStage,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// The `kind` of a step dict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::IntoStaticStr)]
@@ -120,6 +120,8 @@ pub(crate) enum Ask {
         fallback_depth: u32,
         fallback_level: u32,
         timeout: Option<f64>,
+        /// Request params the fallback walk's dict targets merged in.
+        params: Option<Value>,
     },
     Sleep {
         seconds: f64,
@@ -441,6 +443,10 @@ impl Host for StepHost {
             fallback_depth: attempt.fallback_depth,
             fallback_level: attempt.fallback_level,
             timeout: attempt.timeout.map(|timeout| timeout.as_secs_f64()),
+            params: attempt
+                .params
+                .as_ref()
+                .map(|params| Value::Object(Map::clone(params))),
         };
         let Answer::Attempt(result) = ask(question).await else {
             unreachable!("{CHECKED}");

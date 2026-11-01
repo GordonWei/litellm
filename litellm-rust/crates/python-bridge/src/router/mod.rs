@@ -502,6 +502,7 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             fallback_depth,
             fallback_level,
             timeout,
+            params,
         } => {
             dict.set_item("deployment_id", deployment_id)?;
             dict.set_item("deployment", to_py(py, &deployment)?)?;
@@ -512,7 +513,8 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             dict.set_item("retry", retry)?;
             dict.set_item("fallback_depth", fallback_depth)?;
             dict.set_item("fallback_level", fallback_level)?;
-            dict.set_item("timeout", timeout)
+            dict.set_item("timeout", timeout)?;
+            dict.set_item("params", params.map(|p| to_py(py, &p)).transpose()?)
         }
         Ask::Sleep { seconds } => dict.set_item("seconds", seconds),
         Ask::AllowFallback { target } => dict.set_item("target", target),

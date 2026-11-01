@@ -64,6 +64,7 @@ from litellm.router_attempt import (
 )
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_rust_fallbacks import RustFallbacks, rejected_fallback_target, validate_fallbacks
 from litellm.router_rust_retries import RustRetries, refuse_unserved_retry_policies, resolved_retry_policy
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
@@ -178,11 +179,7 @@ _UNSET_DEFAULTS: Final[Mapping[str, object]] = MappingProxyType(
 # rerouted to another core.
 _UNSERVED_REQUEST_KEYS: Final = frozenset(
     {
-        "fallbacks",
-        "context_window_fallbacks",
-        "content_policy_fallbacks",
         "default_fallbacks",
-        "max_fallbacks",
         "retry_policy",
     }
 )
@@ -315,17 +312,26 @@ class Resolved:
     @classmethod
     def of(cls, config: RouterConfig, dynamic: RouterDynamicConfig) -> "Resolved":
         get: Final = config.get
-        configured: Final[Sequence[object] | None] = list(_as_list(get("fallbacks"))) or (
-            list(dynamic.fallbacks) if dynamic.fallbacks else None
+        # The process list is the router's own, as in the Python router: default_fallbacks are
+        # appended to it in place.
+        configured: Final[list[object] | None] = (  # mutable-ok: the router's live list, as Python keeps it
+            list(_as_list(get("fallbacks"))) or (dynamic.fallbacks if dynamic.fallbacks else None)  # pyright: ignore[reportAssignmentType]  # the process list as given
         )
+        validate_fallbacks(configured)
         default_fallbacks: Final = get("default_fallbacks") or dynamic.default_fallbacks
         if isinstance(default_fallbacks, str):
             raise TypeError(
                 f"default_fallbacks must be a list of model names, got '{default_fallbacks}'. Use ['{default_fallbacks}']"
             )
-        fallbacks: Final[Sequence[object] | None] = (
-            configured if default_fallbacks is None else [*(configured or ()), {"*": list(_as_list(default_fallbacks))}]
+        if default_fallbacks is not None and configured is not None:
+            configured.append({"*": default_fallbacks})
+        fallbacks: Final[list[object] | None] = (  # mutable-ok: see above
+            [{"*": default_fallbacks}] if default_fallbacks is not None and configured is None else configured
         )
+        content_policy: Final = list(_as_list(get("content_policy_fallbacks"))) or (
+            list(dynamic.content_policy_fallbacks) if dynamic.content_policy_fallbacks else None
+        )
+        validate_fallbacks(content_policy)
         num_retries: Final = get("num_retries")
         max_fallbacks: Final = get("max_fallbacks")
         allowed_fails: Final = get("allowed_fails")
@@ -352,8 +358,7 @@ class Resolved:
             fallbacks=fallbacks,
             context_window_fallbacks=list(_as_list(get("context_window_fallbacks")))
             or (list(dynamic.context_window_fallbacks) if dynamic.context_window_fallbacks else None),
-            content_policy_fallbacks=list(_as_list(get("content_policy_fallbacks")))
-            or (list(dynamic.content_policy_fallbacks) if dynamic.content_policy_fallbacks else None),
+            content_policy_fallbacks=content_policy,
             model_group_alias=MappingProxyType(dict(as_str_mapping(get("model_group_alias")) or {})),
             default_litellm_params=MappingProxyType(dict(as_str_mapping(get("default_litellm_params")) or {})),
             fallback_access_check=get("fallback_access_check"),
@@ -450,7 +455,13 @@ class Resolved:
         prefixed: Final = {
             name: spelled for name in names if (spelled := _provider_prefixed_model_group(name, keys)) is not None
         }
-        return {"providers": _PROVIDERS, "provider_prefixed": prefixed}
+        from litellm.types.router import LiteLLMParamsTypedDict
+
+        return {
+            "providers": _PROVIDERS,
+            "provider_prefixed": prefixed,
+            "param_keys": list(LiteLLMParamsTypedDict.__annotations__),
+        }
 
 
 def _optional_bool(value: object) -> bool | None:
@@ -504,6 +515,10 @@ def _refuse_unserved_deployments(model_list: Sequence[object]) -> None:
             )
 
 
+# Request fallback settings, which replace the router's for the call.
+_REQUEST_FALLBACK_KEYS: Final = ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks", "max_fallbacks")
+
+
 def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
     """The request fields the Rust core routes on."""
     fields: Final = {
@@ -512,12 +527,14 @@ def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
         if request.get(key) is not None
     }
     group_policies: Final = request.get("model_group_retry_policy")
+    lists: Final = {key: _plain(request[key]) for key in _REQUEST_FALLBACK_KEYS if key in request}
     weights: Final = request.get("_router_weights")
     team_id: Final = _team_id(request)
     return {
         **fields,
         **({"router_weights": weights} if weights is not None else {}),
         **({"model_group_retry_policy": _plain(group_policies)} if group_policies is not None else {}),
+        **lists,
         **({"team_id": team_id} if team_id else {}),
     }
 
@@ -796,7 +813,7 @@ def _limit(params: Sequence[Mapping[str, object]], key: str) -> int | None:
 _EndpointImpl: TypeAlias = Callable[..., Awaitable[object]]
 
 
-class RustCore(_SettingsSource, RustRetries):
+class RustCore(_SettingsSource, RustRetries, RustFallbacks):
     """A ``RouterCore`` served by the Rust router core over a ``PythonHost``. It holds no Python core."""
 
     def __init__(self, config: RouterConfig, host: PythonHost, resolved: Resolved) -> None:
@@ -1119,7 +1136,10 @@ class RustCore(_SettingsSource, RustRetries):
             raise TypeError(f"{field} must be a mapping")
         aliases: Final = self._resolved.model_group_alias
         prepared: Final = prepare_call(op, request, model if model in aliases else None)
-        return self._handle.start(op, _document({"model": model, **_start_fields(request)})), prepared
+        fields: Final = dict(_start_fields(request))
+        if rejected_fallback_target(request) is not None:
+            fields["fallbacks"] = []  # every target of the walk is refused
+        return self._handle.start(op, _document({"model": model, **fields})), prepared
 
     async def _drive(self, op: str, request: Mapping[str, object]) -> object:
         call, prepared = self._start(op, request)
@@ -1365,9 +1385,10 @@ class _Driver:
         deployment: Final = for_requested_model(as_str_mapping(step.get("deployment")) or {}, requested)
         resolved: Final = self._core._resolved  # pyright: ignore[reportPrivateUsage]  # see above
         group: Final = str(step["model_group"])
+        params: Final = as_str_mapping(step.get("params"))
         kwargs: Final = attempt_kwargs(
             self._op,
-            self._request,
+            self._request if params is None else {**self._request, **params},
             deployment,
             model_group=requested if requested is not None and "*" in group else group,
             default_litellm_params=resolved.default_litellm_params,
@@ -1464,29 +1485,40 @@ class _Driver:
         """What ``_async_function_with_fallbacks_common_utils`` appends to the error it re-raises
         under ``expose_router_debug_in_errors``, from the resolved settings and what the call did."""
         import litellm.exceptions as litellm_exceptions
-        from litellm.router_utils.fallback_event_handlers import get_fallback_model_group_for_lookup_groups
+        from litellm.router_utils.fallback_event_handlers import (
+            check_non_standard_fallback_format,
+            get_fallback_model_group_for_lookup_groups,
+        )
 
         resolved: Final = self._core._resolved  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+        request: Final = self._request
+        # The request's own lists replace the router's (`kwargs.get("fallbacks", router)`).
+        fallbacks: Final = request.get("fallbacks", resolved.fallbacks)
+        window_list: Final = request.get("context_window_fallbacks", resolved.context_window_fallbacks)
+        policy_list: Final = request.get("content_policy_fallbacks", resolved.content_policy_fallbacks)
         lookup: Final = (model,)
+        if check_non_standard_fallback_format(fallbacks=_as_list(fallbacks)):
+            chain_list: Final = _as_list(fallbacks)
+            rejected: Final = rejected_fallback_target(request)
+            detail: Final = (
+                truncate_fallback_error_detail(redact_string(str(rejected)))
+                if rejected is not None
+                else self._fallback_detail(chain_list)
+            )
+            return format_fallback_outcome_message(model, chain_list, detail)
         context_window: Final = isinstance(primary, litellm_exceptions.ContextWindowExceededError)
         content_policy: Final = isinstance(primary, litellm_exceptions.ContentPolicyViolationError)
         # The error kind's own list when it is set, else the generic one with a hint to set it.
-        own: Final = (
-            resolved.context_window_fallbacks
-            if context_window
-            else resolved.content_policy_fallbacks
-            if content_policy
-            else None
-        )
+        own: Final = window_list if context_window else policy_list if content_policy else None
         hint: Final = (
-            f"\nmodel={model}. context_window_fallbacks=None. fallbacks={resolved.fallbacks}.\n\n"
+            f"\nmodel={model}. context_window_fallbacks=None. fallbacks={fallbacks}.\n\n"
             "Set 'context_window_fallback' - https://docs.litellm.ai/docs/routing#fallbacks"
             if context_window and own is None
-            else "\n" + format_content_policy_fallback_hint(model, None, resolved.fallbacks)
+            else "\n" + format_content_policy_fallback_hint(model, None, fallbacks)  # pyright: ignore[reportArgumentType]  # the list as configured
             if content_policy and own is None
             else ""
         )
-        source: Final = own if own is not None else resolved.fallbacks
+        source: Final = own if own is not None else fallbacks
         entries: Final = [dict(m) for entry in _as_list(source) if (m := as_str_mapping(entry))]
         found, generic = (
             get_fallback_model_group_for_lookup_groups(entries, lookup)  # pyright: ignore[reportArgumentType]  # the fallbacks config shape

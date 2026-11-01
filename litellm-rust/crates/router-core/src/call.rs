@@ -4,7 +4,9 @@
 //! `should_retry_this_error` and `_time_to_sleep_before_retry` in `litellm/router.py`, and
 //! `run_async_fallback` in `router_utils/fallback_event_handlers.py`.
 
-use std::{collections::HashSet, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+
+use serde_json::{Map, Value};
 
 use tracing::warn;
 
@@ -12,6 +14,7 @@ use crate::{
     Core, Snapshot,
     config::Op,
     error::{AttemptError, ConfigError, Error, FailureKind, Unsupported},
+    fallback::{FallbackKeys, FallbackTarget, Fallbacks},
     health::{GroupShape, should_retry_status},
     host::{Attempt, Output, RouterEvent, RouterRequest},
     registry::ResolveKind,
@@ -61,11 +64,61 @@ struct Hop {
     level: u32,
 }
 
-/// A fallback target: a group, or the same group at a later `order`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// What one level of the walk serves: a group, or the same group at a later `order`, with the
+/// request params the walk's dict targets merged so far (`kwargs.update(target)`).
+#[derive(Clone, Debug)]
 struct Target {
     group: String,
     order: Option<i64>,
+    params: Option<Arc<Map<String, Value>>>,
+}
+
+/// A step of a level's fallback chain: a configured target, or an order level of the group.
+#[derive(Clone, Debug)]
+enum Next {
+    Fallback(FallbackTarget),
+    Order(String, i64),
+}
+
+/// An attempt the walk already made (`fallback_attempt_key`).
+#[derive(Clone, Debug, PartialEq)]
+enum Tried {
+    Target(FallbackTarget),
+    Order(String, i64),
+}
+
+/// The fallback lists a call reads: the request's own where it passed them, else the router's.
+struct Lists<'a> {
+    fallbacks: Option<&'a Fallbacks>,
+    context_window: Option<&'a Fallbacks>,
+    content_policy: Option<&'a Fallbacks>,
+    keys: &'a FallbackKeys,
+}
+
+impl<'a> Lists<'a> {
+    fn of(snapshot: &'a Snapshot, request: &'a RouterRequest) -> Self {
+        let dynamic = &snapshot.settings.dynamic;
+        let pick = |own: &'a Option<Option<Fallbacks>>, router: Option<&'a Fallbacks>| match own {
+            Some(own) => own.as_ref(),
+            None => router,
+        };
+        Self {
+            fallbacks: pick(&request.fallbacks, Some(&dynamic.fallbacks)),
+            context_window: pick(
+                &request.context_window_fallbacks,
+                dynamic.context_window_fallbacks.as_ref(),
+            ),
+            content_policy: pick(
+                &request.content_policy_fallbacks,
+                dynamic.content_policy_fallbacks.as_ref(),
+            ),
+            keys: &dynamic.fallback_keys,
+        }
+    }
+
+    fn has_regular(&self) -> bool {
+        self.fallbacks.is_some_and(|list| !list.is_empty())
+    }
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -77,10 +130,11 @@ impl Core {
         request: Arc<RouterRequest>,
     ) -> Result<RouterResponse, Error> {
         let snapshot = self.snapshot.load_full();
-        let mut attempted = HashSet::new();
+        let mut attempted = Vec::new();
         let target = Target {
             group: request.model.clone(),
             order: None,
+            params: None,
         };
         self.with_fallbacks(
             &snapshot,
@@ -102,7 +156,7 @@ impl Core {
         request: &'a Arc<RouterRequest>,
         target: Target,
         at: Hop,
-        attempted: &'a mut HashSet<Target>,
+        attempted: &'a mut Vec<Tried>,
     ) -> BoxFuture<'a, Result<RouterResponse, Error>> {
         Box::pin(async move {
             let error = match self.with_retries(snapshot, op, request, &target, at).await {
@@ -121,46 +175,67 @@ impl Core {
             };
             // `run_async_fallback`: the depth is checked once on entry, then every target
             // tried at this level counts one more.
-            if at.depth >= snapshot.settings.max_fallbacks {
+            let max_fallbacks = request
+                .max_fallbacks
+                .unwrap_or(snapshot.settings.max_fallbacks);
+            if at.depth >= max_fallbacks {
                 return Err(error);
             }
-            attempted.insert(Target {
-                group: target.group.clone(),
-                order: None,
-            });
+            let failed = Tried::Target(FallbackTarget::Name(target.group.clone()));
+            if !attempted.contains(&failed) {
+                attempted.push(failed);
+            }
+            let mut params = target.params.clone();
             let mut hop = at.depth;
             for next in targets {
-                if next.order.is_none() && next.group == target.group {
+                let (tried, group, order) = match &next {
+                    Next::Order(group, order) => (
+                        Tried::Order(group.clone(), *order),
+                        group.clone(),
+                        Some(*order),
+                    ),
+                    Next::Fallback(FallbackTarget::Name(name)) if *name == target.group => continue,
+                    Next::Fallback(fallback) => {
+                        if let Some(model) = fallback.model()
+                            && model != target.group
+                            && !self.host.allow_fallback(request, model).await
+                        {
+                            continue;
+                        }
+                        let group = fallback.model().unwrap_or(&target.group).to_owned();
+                        (Tried::Target(fallback.identity()), group, None)
+                    }
+                };
+                if attempted.contains(&tried) {
                     continue;
                 }
-                if next.group != target.group
-                    && !self.host.allow_fallback(request, &next.group).await
+                attempted.push(tried);
+                if let Next::Fallback(fallback) = &next
+                    && let Some(merged) = fallback.params()
                 {
-                    continue;
-                }
-                if !attempted.insert(next.clone()) {
-                    continue;
+                    let mut combined = params.as_deref().cloned().unwrap_or_default();
+                    combined.extend(merged.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    params = Some(Arc::new(combined));
                 }
                 hop += 1;
                 self.host.observe(&RouterEvent::Fallback {
                     from: target.group.clone(),
-                    to: next.group.clone(),
-                    order: next.order,
+                    to: group.clone(),
+                    order,
                     depth: hop,
                     level: at.level + 1,
                 });
+                let next = Target {
+                    group,
+                    order,
+                    params: params.clone(),
+                };
+                let at = Hop {
+                    depth: hop,
+                    level: at.level + 1,
+                };
                 if let Ok(mut response) = self
-                    .with_fallbacks(
-                        snapshot,
-                        op,
-                        request,
-                        next,
-                        Hop {
-                            depth: hop,
-                            level: at.level + 1,
-                        },
-                        attempted,
-                    )
+                    .with_fallbacks(snapshot, op, request, next, at, attempted)
                     .await
                 {
                     response.attempted_fallbacks = hop;
@@ -179,36 +254,38 @@ impl Core {
         request: &RouterRequest,
         target: &Target,
         error: &Error,
-    ) -> Option<Vec<Target>> {
+    ) -> Option<Vec<Next>> {
         if request.disable_fallbacks {
             return None;
         }
-        let kind = match error {
-            Error::Attempt(failure) => failure.kind,
-            Error::NoHealthyDeployments { .. } => FailureKind::RateLimit,
+        let failure = match error {
+            Error::Attempt(failure) => Some(failure),
+            Error::NoHealthyDeployments { .. } => None,
             Error::Config(_) | Error::UnknownModel { .. } | Error::Cache(_) | Error::Retired => {
                 return None;
             }
         };
-        if kind == FailureKind::GuardrailIntervention {
+        if failure.is_some_and(|f| f.kind == FailureKind::GuardrailIntervention) {
             return None;
         }
-        let dynamic = &snapshot.settings.dynamic;
+        let is_a = |name: &str| failure.is_some_and(|f| f.is_a(name));
+        let lists = Lists::of(snapshot, request);
         // `fallback_lookup_groups`: the group being served, then the group the request was for.
         let mut lookup = vec![target.group.as_str()];
         if request.model != target.group {
             lookup.push(request.model.as_str());
         }
-        let groups = |names: Vec<String>| {
-            names
-                .into_iter()
-                .map(|group| Target { group, order: None })
-                .collect::<Vec<_>>()
+        let chain = |list: &Fallbacks| {
+            if list.is_client_side(lists.keys) {
+                Some(list.as_chain())
+            } else {
+                list.lookup_groups(&lookup, lists.keys)
+            }
         };
-        let skip_order = matches!(
-            kind,
-            FailureKind::ContextWindowExceeded | FailureKind::ContentPolicyViolation
-        );
+        let fallbacks_of = |targets: Vec<FallbackTarget>| {
+            targets.into_iter().map(Next::Fallback).collect::<Vec<_>>()
+        };
+        let skip_order = is_a("ContextWindowExceededError") || is_a("ContentPolicyViolationError");
         if !skip_order {
             let mut orders: Vec<i64> = snapshot
                 .registry
@@ -222,36 +299,38 @@ impl Core {
             orders.dedup();
             if orders.len() > 1 {
                 let current = target.order.unwrap_or(orders[0]);
-                let mut targets: Vec<Target> = orders
+                let mut targets: Vec<Next> = orders
                     .into_iter()
                     .filter(|order| *order > current)
-                    .map(|order| Target {
-                        group: target.group.clone(),
-                        order: Some(order),
-                    })
+                    .map(|order| Next::Order(target.group.clone(), order))
                     .collect();
-                targets.extend(groups(
-                    dynamic
-                        .fallbacks
-                        .lookup_groups(&lookup, &dynamic.fallback_keys)
-                        .unwrap_or_default(),
-                ));
+                if let Some(list) = lists.fallbacks {
+                    targets.extend(fallbacks_of(chain(list).unwrap_or_default()));
+                }
                 if !targets.is_empty() {
                     return Some(targets);
                 }
             }
         }
-        let specific = match kind {
-            FailureKind::ContextWindowExceeded => dynamic.context_window_fallbacks.as_ref(),
-            FailureKind::ContentPolicyViolation => dynamic.content_policy_fallbacks.as_ref(),
-            _ => None,
-        };
-        if let Some(fallbacks) = specific {
-            return fallbacks
-                .lookup_groups(&lookup, &dynamic.fallback_keys)
-                .map(groups);
+        if let Some(list) = lists.fallbacks
+            && list.is_client_side(lists.keys)
+        {
+            return Some(fallbacks_of(list.as_chain()));
         }
-        dynamic.fallback_targets(&lookup).map(groups)
+        let specific = if is_a("ContextWindowExceededError") {
+            lists.context_window
+        } else if is_a("ContentPolicyViolationError") {
+            lists.content_policy
+        } else {
+            None
+        };
+        if let Some(list) = specific {
+            return list.lookup_groups(&lookup, lists.keys).map(fallbacks_of);
+        }
+        lists
+            .fallbacks
+            .and_then(|list| list.lookup_groups(&lookup, lists.keys))
+            .map(fallbacks_of)
     }
 
     async fn with_retries(
@@ -328,7 +407,7 @@ impl Core {
             };
             if let Some(failure) = failure
                 && !policy_applies
-                && !self.should_retry(snapshot, failure, healthy, all)
+                && !self.should_retry(snapshot, request, failure, healthy, all)
             {
                 return Err(failed.error);
             }
@@ -382,19 +461,20 @@ impl Core {
     fn should_retry(
         &self,
         snapshot: &Snapshot,
+        request: &RouterRequest,
         failure: &AttemptError,
         healthy: usize,
         all: usize,
     ) -> bool {
-        let dynamic = &snapshot.settings.dynamic;
+        let lists = Lists::of(snapshot, request);
         should_retry(
             failure,
             RetryContext {
                 healthy,
                 all,
-                has_context_window_fallbacks: dynamic.context_window_fallbacks.is_some(),
-                has_content_policy_fallbacks: dynamic.content_policy_fallbacks.is_some(),
-                has_regular_fallbacks: dynamic.has_regular_fallbacks(),
+                has_context_window_fallbacks: lists.context_window.is_some(),
+                has_content_policy_fallbacks: lists.content_policy.is_some(),
+                has_regular_fallbacks: lists.has_regular(),
             },
         )
     }
@@ -471,6 +551,7 @@ impl Core {
             fallback_depth: at.depth,
             fallback_level: at.level,
             timeout: snapshot.settings.timeout,
+            params: target.params.clone(),
         };
         // Every attempt runs through the host; the core records every outcome itself.
         match self.host.invoke(&attempt).await {
