@@ -67,6 +67,15 @@ class RustRegistryMembers:
         _note("generate_model_id", "litellm.router_api.deployment_id(model_group, litellm_params)")
         return deployment_id(model_group, litellm_params)
 
+    async def set_response_headers(
+        self, response: object, model_group: str | None = None, request_kwargs: Mapping[str, object] | None = None
+    ) -> object:
+        """Stamp the group's remaining usage and the model id on a response (``set_response_headers``)."""
+        headed: Final[object] = await self._registry_state.set_response_headers(  # pyright: ignore[reportAny]  # the response as the core hands it back
+            response, model_group, None if request_kwargs is None else dict(request_kwargs)
+        )
+        return headed
+
     def replay_model_cost_registrations(self) -> None:
         """Re-register the served deployments' cost-map entries (``replay_model_cost_registrations``)."""
         self._registry_state.replay_model_cost_registrations()
