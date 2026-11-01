@@ -5,6 +5,7 @@ could not walk the way the Python router would, before the core is built.
 """
 
 from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from typing import Final
 
 from litellm.router_utils.fallback_event_handlers import check_non_standard_fallback_format
@@ -52,6 +53,68 @@ def rejected_fallback_target(request: Mapping[str, object]) -> Exception | None:
     return None
 
 
+# The `mock_testing_*` flags the router reads, and the mock failure each asks router-core for.
+MOCK_FLAGS: Final = MappingProxyType(
+    {
+        "mock_testing_fallbacks": "fallbacks",
+        "mock_testing_context_fallbacks": "context_window",
+        "mock_testing_content_policy_fallbacks": "content_policy",
+        "mock_testing_rate_limit_error": "rate_limit",
+    }
+)
+
+
+def mock_failure(request: Mapping[str, object]) -> str | None:
+    """The mock failure a request asks for (``MockRouterTestingParams.from_kwargs``, then
+    ``_handle_mock_testing_rate_limit_error``): the first fallback flag that is ``True`` (a string
+    is read as a bool), else the rate limit flag when it is ``True`` itself."""
+    from litellm.secret_managers.main import str_to_bool
+
+    for flag in ("mock_testing_fallbacks", "mock_testing_context_fallbacks", "mock_testing_content_policy_fallbacks"):
+        value = request.get(flag)
+        if (str_to_bool(value) if isinstance(value, str) else value) is True:
+            return MOCK_FLAGS[flag]
+    return "rate_limit" if request.get("mock_testing_rate_limit_error") is True else None
+
+
+def mock_error(
+    mock: str, model: str, num_retries: object, request: Mapping[str, object], configured: Mapping[str, object]
+) -> Exception:
+    """The exception the Python router raises for a mock failure; ``configured`` holds the
+    router's fallback lists, which the request's own replace."""
+    import litellm.exceptions as litellm_exceptions
+
+    def listed(name: str) -> object:
+        return request.get(name, configured.get(name))
+
+    if mock == "rate_limit":
+        return litellm_exceptions.RateLimitError(
+            model=model,
+            llm_provider="",
+            message=f"This is a mock exception for model={model}, to trigger a rate limit error.",
+            num_retries=num_retries if isinstance(num_retries, int) else None,
+        )
+    if mock == "context_window":
+        return litellm_exceptions.ContextWindowExceededError(
+            model=model,
+            llm_provider="",
+            message=f"This is a mock exception for model={model}, to trigger a fallback. \
+                    Context_Window_Fallbacks={listed('context_window_fallbacks')}",
+        )
+    if mock == "content_policy":
+        return litellm_exceptions.ContentPolicyViolationError(
+            model=model,
+            llm_provider="",
+            message=f"This is a mock exception for model={model}, to trigger a fallback. \
+                    Context_Policy_Fallbacks={listed('content_policy_fallbacks')}",
+        )
+    return litellm_exceptions.InternalServerError(
+        model=model,
+        llm_provider="",
+        message=f"This is a mock exception for model={model}, to trigger a fallback. Fallbacks={listed('fallbacks')}",
+    )
+
+
 class RustFallbacks:
     """Fallback members served on the host."""
 
@@ -59,4 +122,11 @@ class RustFallbacks:
         validate_fallbacks(fallback_param)
 
 
-__all__ = ["RustFallbacks", "rejected_fallback_target", "validate_fallbacks"]
+__all__ = [
+    "MOCK_FLAGS",
+    "RustFallbacks",
+    "mock_error",
+    "mock_failure",
+    "rejected_fallback_target",
+    "validate_fallbacks",
+]

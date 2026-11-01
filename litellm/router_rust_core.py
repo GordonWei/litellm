@@ -64,7 +64,14 @@ from litellm.router_attempt import (
 )
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
-from litellm.router_rust_fallbacks import RustFallbacks, rejected_fallback_target, validate_fallbacks
+from litellm.router_rust_fallbacks import (
+    MOCK_FLAGS,
+    RustFallbacks,
+    mock_error,
+    mock_failure,
+    rejected_fallback_target,
+    validate_fallbacks,
+)
 from litellm.router_rust_retries import RustRetries, refuse_unserved_retry_policies, resolved_retry_policy
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
@@ -1123,7 +1130,9 @@ class RustCore(_SettingsSource, RustRetries, RustFallbacks):
         if self._retired:
             raise RuntimeError("this router core was retired")
         unserved: Final = sorted(
-            key for key in request if key in _UNSERVED_REQUEST_KEYS or key.startswith("mock_testing_")
+            key
+            for key in request
+            if key in _UNSERVED_REQUEST_KEYS or (key.startswith("mock_testing_") and key not in MOCK_FLAGS)
         )
         if unserved:
             raise RustCoreUnsupported(f"request keys not served by the Rust router core yet: {unserved}")
@@ -1137,6 +1146,9 @@ class RustCore(_SettingsSource, RustRetries, RustFallbacks):
         aliases: Final = self._resolved.model_group_alias
         prepared: Final = prepare_call(op, request, model if model in aliases else None)
         fields: Final = dict(_start_fields(request))
+        mock: Final = mock_failure(request)
+        if mock is not None:
+            fields["mock_failure"] = mock
         if rejected_fallback_target(request) is not None:
             fields["fallbacks"] = []  # every target of the walk is refused
         return self._handle.start(op, _document({"model": model, **fields})), prepared
@@ -1363,6 +1375,23 @@ class _Driver:
         for raw_event in _as_list(events):
             event = as_str_mapping(raw_event)
             if event is None:
+                continue
+            if event.get("kind") == "mock_failed":
+                resolved = self._core._resolved  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+                mocked = mock_error(
+                    str(event.get("mock")),
+                    str(event.get("model")),
+                    event.get("num_retries"),
+                    self._request,
+                    {
+                        "fallbacks": resolved.fallbacks,
+                        "context_window_fallbacks": resolved.context_window_fallbacks,
+                        "content_policy_fallbacks": resolved.content_policy_fallbacks,
+                    },
+                )
+                level = event.get("level")
+                self._last_error = mocked
+                self._level_errors[level if isinstance(level, int) else 0] = mocked
                 continue
             if event.get("kind") == "level_failed":
                 kind = "unknown_model" if event.get("unknown") else "no_healthy_deployments"

@@ -509,6 +509,7 @@ impl Host for StepHost {
             RouterEvent::RetriesExhausted { .. }
                 | RouterEvent::Fallback { .. }
                 | RouterEvent::LevelFailed { .. }
+                | RouterEvent::MockFailed { .. }
         ) {
             return;
         }

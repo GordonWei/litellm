@@ -14,6 +14,7 @@ use crate::{
     error::{AttemptError, Error, FailureKind, Payload},
     fallback::Fallbacks,
     health::Health,
+    mock::MockFailure,
     registry::{Deployment, Registry},
     settings::Settings,
 };
@@ -40,6 +41,8 @@ pub struct RouterRequest {
     pub content_policy_fallbacks: Option<Option<Fallbacks>>,
     /// A per-request `max_fallbacks`, which replaces the router's.
     pub max_fallbacks: Option<u32>,
+    /// A `mock_testing_*` flag the request set.
+    pub mock_failure: Option<MockFailure>,
     /// A per-request `model_group_retry_policy`, which replaces the router's.
     pub model_group_retry_policy: Option<BTreeMap<String, RetryPolicy>>,
     /// What the host needs to run the call itself, such as the Python kwargs.
@@ -137,6 +140,13 @@ pub enum RouterEvent {
         level: u32,
         model: String,
         unknown: bool,
+    },
+    /// The router raised a `mock_testing_*` failure for `model` instead of calling it.
+    MockFailed {
+        mock: MockFailure,
+        level: u32,
+        model: String,
+        num_retries: Option<u32>,
     },
     /// A group's retry loop ran every retry and the last one failed: Python stamps
     /// `num_retries` and `max_retries` on that error.

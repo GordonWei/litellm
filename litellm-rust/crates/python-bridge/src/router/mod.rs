@@ -456,6 +456,18 @@ fn events_list(py: Python<'_>, events: Vec<RouterEvent>) -> PyResult<Bound<'_, P
                 dict.set_item("model", model)?;
                 dict.set_item("unknown", unknown)?;
             }
+            RouterEvent::MockFailed {
+                mock,
+                level,
+                model,
+                num_retries,
+            } => {
+                dict.set_item("kind", "mock_failed")?;
+                dict.set_item("mock", <&'static str>::from(mock))?;
+                dict.set_item("level", level)?;
+                dict.set_item("model", model)?;
+                dict.set_item("num_retries", num_retries)?;
+            }
             _ => continue,
         }
         list.append(dict)?;

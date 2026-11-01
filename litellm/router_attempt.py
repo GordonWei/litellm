@@ -32,6 +32,10 @@ ROUTING_KEYS: Final = frozenset(
         "fallbacks",
         "context_window_fallbacks",
         "content_policy_fallbacks",
+        "mock_testing_fallbacks",
+        "mock_testing_context_fallbacks",
+        "mock_testing_content_policy_fallbacks",
+        "mock_testing_rate_limit_error",
     }
 )
 

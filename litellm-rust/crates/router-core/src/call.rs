@@ -17,6 +17,7 @@ use crate::{
     fallback::{FallbackKeys, FallbackTarget, Fallbacks},
     health::{GroupShape, should_retry_status},
     host::{Attempt, Output, RouterEvent, RouterRequest},
+    mock::MockFailure,
     registry::ResolveKind,
     retry::{RetryContext, resolve_retry_policy, should_retry},
     select::{Candidates, SelectInputs},
@@ -159,9 +160,15 @@ impl Core {
         attempted: &'a mut Vec<Tried>,
     ) -> BoxFuture<'a, Result<RouterResponse, Error>> {
         Box::pin(async move {
-            let error = match self.with_retries(snapshot, op, request, &target, at).await {
-                Ok(response) => return Ok(response),
-                Err(error) => error,
+            let mock = request
+                .mock_failure
+                .filter(|mock| mock.before_retries() && at.level == 0);
+            let error = match mock {
+                Some(mock) => self.mock_failed(mock, &target, at, None),
+                None => match self.with_retries(snapshot, op, request, &target, at).await {
+                    Ok(response) => return Ok(response),
+                    Err(error) => error,
+                },
             };
             if let Error::NoHealthyDeployments { model } | Error::UnknownModel { model } = &error {
                 self.host.observe(&RouterEvent::LevelFailed {
@@ -349,9 +356,25 @@ impl Core {
             count_only: true,
             ..SelectInputs::default()
         };
-        let first = self
-            .attempt(snapshot, op, request, target, &inputs, 0, at)
-            .await;
+        let first = match request.mock_failure {
+            Some(MockFailure::RateLimit) => {
+                // `_handle_mock_testing_rate_limit_error`: a lone deployment's `num_retries`
+                // rides on the mock error, as on a real one.
+                let lone = snapshot
+                    .registry
+                    .group(&target.group)
+                    .filter(|group| group.len() == 1)
+                    .and_then(|group| group[0].raw_params.get("num_retries")?.as_u64())
+                    .and_then(|retries| u32::try_from(retries).ok());
+                Err(self
+                    .mock_failed(MockFailure::RateLimit, target, at, lone)
+                    .into())
+            }
+            _ => {
+                self.attempt(snapshot, op, request, target, &inputs, 0, at)
+                    .await
+            }
+        };
         let mut failed = match first {
             Ok(response) => return Ok(response),
             Err(failed) => failed,
@@ -456,6 +479,24 @@ impl Core {
             }
         }
         Err(failed.error)
+    }
+
+    /// A `mock_testing_*` failure for the level's group, reported to the host, which raises
+    /// the matching exception.
+    fn mock_failed(
+        &self,
+        mock: MockFailure,
+        target: &Target,
+        at: Hop,
+        num_retries: Option<u32>,
+    ) -> Error {
+        self.host.observe(&RouterEvent::MockFailed {
+            mock,
+            level: at.level,
+            model: target.group.clone(),
+            num_retries,
+        });
+        Error::Attempt(mock.failure(num_retries))
     }
 
     fn should_retry(
