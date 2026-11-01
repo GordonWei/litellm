@@ -17,8 +17,11 @@ import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
+from pydantic import TypeAdapter, ValidationError
+
+from litellm._logging import verbose_router_logger
 from litellm.litellm_core_utils.batch_utils import get_router_metadata_variable_name
 from litellm.litellm_core_utils.routing_common_utils import without_router_only_kwargs
 from litellm.responses.retrieve_stream_query import without_retrieve_stream_defaults
@@ -135,6 +138,14 @@ def _generic(endpoint: str, host_op: str | None = None, *, sync: bool = False) -
 
 def _handler_name(host_op: str) -> str:
     return host_op.rsplit(".", 1)[-1]
+
+
+def invoked_handler_name(core: "RustCore", plan: Plan) -> str | None:
+    """The generic handler's ``__name__`` (`original_generic_function.__name__`): the function the
+    host serves for the op, which decides the stream-timeout split and the responses socket."""
+    function: Final[object] = core._host.invoke(plan.host_op)  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]  # the core's host
+    name: Final[object] = getattr(function, "__name__", None)
+    return name if isinstance(name, str) else None
 
 
 PLANS: Final[Mapping[str, Plan]] = MappingProxyType(
@@ -537,9 +548,9 @@ def attempt_call(
                 deployment_params_with_request_reasoning_override(data, kwargs)
             )
             silent_model = params.pop("silent_model", None)  # rebind-ok: rebound as the Python router rebinds it
+            start_silent_experiments(core, plan, silent_model, named.get("messages"), kwargs)
             if "messages" in named:
                 kwargs.setdefault("messages", named["messages"])
-            start_silent_experiments(core, plan, silent_model, named.get("messages"), kwargs)
             update_kwargs_with_deployment(shaping, deployment, kwargs, cache=cache, splits_stream_timeout=True)
             kwargs.pop("silent_model", None)
             final = without_router_only_kwargs(  # rebind-ok: rebound as the Python router rebinds it
@@ -590,7 +601,7 @@ def attempt_call(
                 kwargs,
                 cache=cache,
                 function_name="generic_api_call",
-                splits_stream_timeout=plan.splits_stream_timeout,
+                splits_stream_timeout=invoked_handler_name(core, plan) in STREAM_TIMEOUT_AWARE_GENERIC_HANDLERS,
             )
             endpoint = kwargs.get("endpoint")  # rebind-ok: rebound as the Python router rebinds it
             if endpoint and isinstance(endpoint, str):
@@ -626,14 +637,14 @@ def _generic_attempt(
     """`_ageneric_api_call_with_fallbacks_helper` for one deployment."""
     from litellm.llms.base_llm.passthrough.transformation import replace_path_segment
 
-    handler: Final = _handler_name(plan.host_op)
+    handler: Final = invoked_handler_name(core, plan)
     update_kwargs_with_deployment(
         core._shaping,  # pyright: ignore[reportPrivateUsage]  # the core's own settings
         deployment,
         kwargs,
         cache=core._cache,  # pyright: ignore[reportPrivateUsage]  # the core's routing cache
         function_name="_ageneric_api_call_with_fallbacks",
-        splits_stream_timeout=plan.splits_stream_timeout,
+        splits_stream_timeout=handler in STREAM_TIMEOUT_AWARE_GENERIC_HANDLERS,
         opens_responses_socket=handler == "_aresponses_websocket",
     )
     model_name: Final = str(data.get("model"))
@@ -728,12 +739,25 @@ def stamp_error(
 # --- silent experiments ---------------------------------------------------------------------
 
 
+_SilentModel: TypeAlias = str | list[str]
+_SILENT_MODEL_ADAPTER: Final[TypeAdapter[_SilentModel]] = TypeAdapter(_SilentModel)
+
+
 def _silent_targets(silent_model: object) -> tuple[str, ...]:
-    if isinstance(silent_model, str):
-        return (silent_model,)
-    if isinstance(silent_model, list) and all(isinstance(item, str) for item in silent_model):  # pyright: ignore[reportUnknownVariableType]  # checked item by item
-        return tuple(str(item) for item in silent_model)  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]  # same
-    return ()
+    """`_silent_experiment_targets`: none inside a mirrored call or for a malformed value."""
+    from litellm._internal_context import in_mirrored_call
+
+    if silent_model is None or in_mirrored_call():
+        return ()
+    try:
+        targets: Final = _SILENT_MODEL_ADAPTER.validate_python(silent_model)
+    except ValidationError:
+        verbose_router_logger.warning(
+            "silent_model must be a model name or a list of model names, got %r; skipping shadow traffic",
+            silent_model,
+        )
+        return ()
+    return (targets,) if isinstance(targets, str) else tuple(targets)
 
 
 def _silent_kwargs(kwargs: Mapping[str, object]) -> dict[str, object]:  # mutable-ok: the experiment's own kwargs
@@ -1395,6 +1419,18 @@ class RustEndpoints:
         kwargs: Final = {**request, "stream": request.get("stream", False)}
         plan: Final = PLANS["acompletion"]
         priority, rest = self._split_priority(model, kwargs)
+        from litellm.router_rust_prompt_management import is_prompt_management_model, prompt_management_acompletion
+
+        if is_prompt_management_model(self._core, model):
+            prepared: Final = self.prepare(plan, rest, model)
+            messages: Final = rest.get("messages")
+
+            def factory() -> Awaitable[object]:
+                return prompt_management_acompletion(self._core, model, messages, prepared)
+
+            if priority is None:
+                return await factory()
+            return await self._schedule(model, priority, factory, prepared)
         if priority is None:
             return await self._core._drive(plan, rest)  # pyright: ignore[reportPrivateUsage]  # see above
         return await self._schedule(model, priority, lambda: self._core._drive(plan, rest), rest)  # pyright: ignore[reportPrivateUsage]  # see above

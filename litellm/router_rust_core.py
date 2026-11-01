@@ -1193,7 +1193,12 @@ class RustCore(_SettingsSource, RustRegistryMembers):
     # -- driving a call --------------------------------------------------------------------------
 
     def _start(
-        self, plan: Plan, request: Mapping[str, object], overrides: Mapping[str, object] | None = None
+        self,
+        plan: Plan,
+        request: Mapping[str, object],
+        overrides: Mapping[str, object] | None = None,
+        *,
+        prepared_already: bool = False,
     ) -> "tuple[RouterCall, Mapping[str, object]]":
         if self._retired:
             raise RuntimeError("this router core was retired")
@@ -1208,7 +1213,7 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         field: Final = plan.prepare_field or "metadata"
         if request.get(field) is not None and not isinstance(request.get(field), Mapping):
             raise TypeError(f"{field} must be a mapping")
-        prepared: Final = self._endpoints.prepare(plan, request, model)
+        prepared: Final = dict(request) if prepared_already else self._endpoints.prepare(plan, request, model)
         fields: Final = {
             **self._routing_fields(prepared),
             **pinned_video_deployment(plan, request),
@@ -1249,8 +1254,9 @@ class RustCore(_SettingsSource, RustRegistryMembers):
         overrides: Mapping[str, object] | None = None,
         *,
         passthrough: "Callable[[Mapping[str, object]], Awaitable[object]] | None" = None,
+        prepared_already: bool = False,
     ) -> object:
-        call, prepared = self._start(plan, request, overrides)
+        call, prepared = self._start(plan, request, overrides, prepared_already=prepared_already)
         driver, step = await self._run(plan, call, prepared)
         if step["kind"] == "failed":
             if passthrough is not None and driver.attempted == 0:
