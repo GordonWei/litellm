@@ -495,6 +495,22 @@ fn events_list(py: Python<'_>, events: Vec<RouterEvent>) -> PyResult<Bound<'_, P
                 dict.set_item("parent", parent)?;
                 dict.set_item("max_fallbacks", max_fallbacks)?;
             }
+            RouterEvent::FallbackDone {
+                from,
+                to,
+                level,
+                scope,
+                parent,
+                succeeded,
+            } => {
+                dict.set_item("kind", "fallback_done")?;
+                dict.set_item("from", from)?;
+                dict.set_item("to", to)?;
+                dict.set_item("level", level)?;
+                dict.set_item("scope", scope)?;
+                dict.set_item("parent", parent)?;
+                dict.set_item("succeeded", succeeded)?;
+            }
             RouterEvent::RetryLogged {
                 scope,
                 level,

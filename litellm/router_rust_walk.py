@@ -10,7 +10,7 @@ its parent's (``run_async_fallback``'s ``_hop_metadata``), so a hop's breadcrumb
 its parent. Each scope here is one such dict.
 """
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from typing import TYPE_CHECKING, Final
 
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
@@ -133,6 +133,12 @@ class WalkMetadata:
         if isinstance(scope, int):
             self._scopes[scope] = _Scope(metadata, kwargs)
 
+    def hop_kwargs(self, event: Mapping[str, object]) -> dict[str, object]:  # mutable-ok: a fresh dict for the loggers
+        """The kwargs the level held after a hop (``kwargs["model"] = target``), as the
+        fallback loggers see them."""
+        scope: Final = self._scope(event.get("scope"))
+        return {**self._request, **scope.kwargs, "model": event.get("to"), self._field: dict(scope.metadata)}
+
     def log_retry(self, event: Mapping[str, object], error: BaseException | None) -> None:
         """A ``retry_logged`` event: the failure joins the scope's ``previous_models``."""
         scope: Final = self._scope(event.get("scope"))
@@ -162,4 +168,73 @@ class WalkMetadata:
         return {**kwargs, **{key: scope.kwargs[key] for key in _HOP_KWARGS if key in scope.kwargs}, self._field: served}
 
 
-__all__ = ["RETRY_BREADCRUMB_LIMIT", "WalkMetadata"]
+class FallbackOutcomes:
+    """What ``run_async_fallback`` does when a hop returns: it logs the hop to the process's
+    custom loggers and, under ``include_fallback_errors``, lists the level's errors (its own
+    first, then each hop that failed) in the response's ``x-litellm-fallback-errors``."""
+
+    __slots__ = ("_failed", "_header_errors", "_include", "_pending")
+
+    def __init__(self, request: Mapping[str, object]) -> None:
+        self._include: Final = request.get("include_fallback_errors", False) is True
+        self._failed: Final[dict[object, list[object]]] = {}  # mutable-ok: each level's failed hops, in order
+        self._header_errors: Final[list[list[object]]] = []  # mutable-ok: each successful hop's errors, innermost first
+        self._pending: Final[list[Coroutine[object, object, None]]] = []  # mutable-ok: logger calls not yet awaited
+
+    def done(
+        self,
+        event: Mapping[str, object],
+        level_error: BaseException | None,
+        hop_error: BaseException | None,
+        kwargs: Mapping[str, object],
+    ) -> None:
+        from litellm.litellm_core_utils.add_retry_fallback_headers import get_fallback_error_info
+        from litellm.router_utils import fallback_event_handlers as handlers
+
+        if level_error is None or not isinstance(level_error, Exception):
+            return
+        parent: Final = event.get("parent")
+        failed: Final = self._failed.setdefault(parent, [])
+        original: Final = str(event.get("from"))
+        if event.get("succeeded") is True:
+            if self._include:
+                self._header_errors.append([get_fallback_error_info(level_error), *failed])
+            self._pending.append(
+                handlers.log_success_fallback_event(  # pyright: ignore[reportUnknownMemberType]  # takes the kwargs as an untyped dict
+                    original_model_group=original, kwargs=dict(kwargs), original_exception=level_error
+                )
+            )
+            return
+        if isinstance(hop_error, Exception):
+            failed.append(get_fallback_error_info(hop_error))
+        self._pending.append(
+            handlers.log_failure_fallback_event(  # pyright: ignore[reportUnknownMemberType]  # see above
+                original_model_group=original, kwargs=dict(kwargs), original_exception=level_error
+            )
+        )
+
+    def take_pending(self) -> tuple[Coroutine[object, object, None], ...]:
+        pending: Final = tuple(self._pending)
+        self._pending.clear()
+        return pending
+
+    def add_headers(self, response: object, attempted_fallbacks: int) -> object:
+        """``add_fallback_headers_to_response`` for each successful hop, innermost first."""
+        from litellm.litellm_core_utils.add_retry_fallback_headers import add_fallback_headers_to_response
+
+        headed: object = response  # rebind-ok: gains each level's errors
+        for errors in self._header_errors:
+            headed = add_fallback_headers_to_response(
+                response=headed,
+                attempted_fallbacks=attempted_fallbacks,
+                fallback_errors=errors,  # pyright: ignore[reportArgumentType]  # FallbackErrorInfo dicts
+            )
+        return headed
+
+
+async def await_all(pending: Sequence[Coroutine[object, object, None]]) -> None:
+    for call in pending:
+        await call
+
+
+__all__ = ["RETRY_BREADCRUMB_LIMIT", "FallbackOutcomes", "WalkMetadata", "await_all"]

@@ -246,19 +246,28 @@ impl Core {
                     max_fallbacks,
                 });
                 let next = Target {
-                    group,
+                    group: group.clone(),
                     order,
                     params: params.clone(),
                 };
+                let parent = at;
                 let at = Hop {
                     depth: hop,
                     level: at.level + 1,
                     scope: walk.scopes,
                 };
-                if let Ok(mut response) = self
+                let result = self
                     .with_fallbacks(snapshot, op, request, next, at, walk)
-                    .await
-                {
+                    .await;
+                self.host.observe(&RouterEvent::FallbackDone {
+                    from: target.group.clone(),
+                    to: group,
+                    level: parent.level,
+                    scope: at.scope,
+                    parent: parent.scope,
+                    succeeded: result.is_ok(),
+                });
+                if let Ok(mut response) = result {
                     response.attempted_fallbacks = hop;
                     return Ok(response);
                 }

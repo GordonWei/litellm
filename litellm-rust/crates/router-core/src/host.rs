@@ -147,6 +147,16 @@ pub enum RouterEvent {
         /// The `max_fallbacks` the walk reads, stamped on the hop's request.
         max_fallbacks: u32,
     },
+    /// A hop of the fallback walk returned: `log_success_fallback_event` or
+    /// `log_failure_fallback_event` for the level at `parent`.
+    FallbackDone {
+        from: String,
+        to: String,
+        level: u32,
+        scope: u32,
+        parent: u32,
+        succeeded: bool,
+    },
     /// `log_retry`: the router recorded a failure in `scope`'s request metadata
     /// (`previous_models`, `request_retry_count`) before retrying or falling back.
     RetryLogged {

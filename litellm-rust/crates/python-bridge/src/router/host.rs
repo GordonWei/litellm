@@ -558,6 +558,7 @@ impl Host for StepHost {
                 | RouterEvent::LevelFailed { .. }
                 | RouterEvent::MockFailed { .. }
                 | RouterEvent::RetryLogged { .. }
+                | RouterEvent::FallbackDone { .. }
         ) {
             return;
         }

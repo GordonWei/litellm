@@ -74,7 +74,7 @@ from litellm.router_rust_fallbacks import (
 )
 from litellm.router_rust_health import RustHealthCallbacks, failure_status
 from litellm.router_rust_retries import RustRetries, refuse_unserved_retry_policies, resolved_retry_policy
-from litellm.router_rust_walk import WalkMetadata
+from litellm.router_rust_walk import FallbackOutcomes, WalkMetadata, await_all
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
 from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError
@@ -1161,6 +1161,7 @@ class RustCore(_SettingsSource, RustRetries, RustFallbacks, RustHealthCallbacks)
         while True:
             step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # Rust validates each outcome against the step it answers
             driver.take_events(step.get("events"))
+            await await_all(driver.outcomes.take_pending())
             match step["kind"]:
                 case "attempt":
                     outcome = await driver.attempt(step)
@@ -1188,6 +1189,10 @@ class RustCore(_SettingsSource, RustRetries, RustFallbacks, RustHealthCallbacks)
         while True:
             step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # see _drive
             driver.take_events(step.get("events"))
+            if pending := driver.outcomes.take_pending():
+                from litellm.litellm_core_utils import asyncify
+
+                asyncify.run_async_function(await_all, pending)  # pyright: ignore[reportUnknownMemberType]  # the untyped sync bridge
             match step["kind"]:
                 case "attempt":
                     outcome = driver.attempt_sync(step)
@@ -1389,6 +1394,7 @@ class _Driver:
         self._level_errors: Final[dict[int, BaseException]] = {}  # mutable-ok: filled as the call runs
         self._served: tuple[str | None, Mapping[str, object]] = (None, MappingProxyType({}))
         self._walk: Final = WalkMetadata(request, metadata_field(op), self._params_base_model)
+        self.outcomes: Final = FallbackOutcomes(request)
 
     def _params_base_model(self, deployment_id: str) -> str | None:
         """``_deployment_params_base_model``: the ``base_model`` under the deployment's ``litellm_params``."""
@@ -1439,6 +1445,16 @@ class _Driver:
                 continue
             if event.get("kind") == "fallback":
                 self._walk.hop(event)
+                continue
+            if event.get("kind") == "fallback_done":
+                level = event.get("level")
+                at = level if isinstance(level, int) else 0
+                self.outcomes.done(
+                    event,
+                    self._level_errors.get(at, self._last_error),
+                    self._level_errors.get(at + 1),
+                    self._walk.hop_kwargs(event),
+                )
                 continue
             if event.get("kind") == "retry_logged":
                 self._walk.log_retry(event, self._logged_error(event))
@@ -1532,8 +1548,9 @@ class _Driver:
                 max_retries=max_retries if isinstance(max_retries, int) and retries > 0 else None,
             )
         fallbacks: Final = step.get("attempted_fallbacks")
+        attempted: Final = fallbacks if isinstance(fallbacks, int) else 0
         return add_fallback_headers_to_response(
-            response=response, attempted_fallbacks=fallbacks if isinstance(fallbacks, int) else 0
+            response=self.outcomes.add_headers(response, attempted), attempted_fallbacks=attempted
         )
 
     async def finish_async(self, step: Mapping[str, object]) -> object:
