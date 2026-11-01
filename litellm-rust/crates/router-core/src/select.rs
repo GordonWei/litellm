@@ -14,6 +14,7 @@ use crate::{
     error::Error,
     host::{RouterRequest, RoutingContext, SelectStage},
     registry::{Deployment, ResolveKind, ResolveScope},
+    strategy::{StrategyScope, routing_context},
 };
 
 /// Randomness for the shuffle and retry jitter, injectable so tests are deterministic.
@@ -47,6 +48,8 @@ impl Randomness for SeededRandomness {
 /// A group's deployments before and after filtering.
 #[derive(Clone, Debug)]
 pub struct Candidates {
+    /// The name that was resolved (Python's `model`).
+    pub name: String,
     pub model_group: String,
     pub kind: ResolveKind,
     /// Every deployment the caller may use (after the team filter).
@@ -123,6 +126,8 @@ impl Core {
         op: &'a Op,
         request: &'a RouterRequest,
         model_group: &'a str,
+        name: &'a str,
+        scope: StrategyScope,
     ) -> RoutingContext<'a> {
         RoutingContext {
             registry: &snapshot.registry,
@@ -131,6 +136,8 @@ impl Core {
             request,
             op,
             model_group,
+            name,
+            scope,
         }
     }
 
@@ -191,6 +198,7 @@ impl Core {
         healthy.retain(|d| !d.model_info.blocked);
         if inputs.count_only {
             return Ok(Candidates {
+                name: name.to_owned(),
                 model_group: resolution.group,
                 kind: resolution.kind,
                 all,
@@ -199,7 +207,14 @@ impl Core {
         }
 
         if !settings.plugins.is_empty() && !healthy.is_empty() {
-            let ctx = self.context(snapshot, op, request, &resolution.group);
+            let ctx = self.context(
+                snapshot,
+                op,
+                request,
+                &resolution.group,
+                name,
+                StrategyScope::Default,
+            );
             healthy = self
                 .host
                 .select(&SelectStage::Plugins, &ctx, healthy)
@@ -225,6 +240,7 @@ impl Core {
         }
 
         Ok(Candidates {
+            name: name.to_owned(),
             model_group: resolution.group,
             kind: resolution.kind,
             all,
@@ -243,17 +259,21 @@ impl Core {
         let no_deployment = || Error::NoHealthyDeployments {
             model: candidates.model_group.clone(),
         };
-        let strategy = match candidates.kind {
-            ResolveKind::RoutingGroup => snapshot
-                .registry
-                .resolve_routing_group_strategy(&candidates.model_group),
-            ResolveKind::SpecificDeployment
-            | ResolveKind::Id
-            | ResolveKind::Alias
-            | ResolveKind::Group
-            | ResolveKind::Wildcard => None,
+        // A deployment named by its id is returned as is, before any strategy runs.
+        if candidates.kind == ResolveKind::Id {
+            return candidates
+                .healthy
+                .first()
+                .cloned()
+                .ok_or_else(no_deployment);
         }
-        .unwrap_or_else(|| snapshot.settings.routing_strategy.clone());
+        let (strategy, scope) = routing_context(
+            &snapshot.registry,
+            &snapshot.settings.routing_strategy,
+            request.routing_strategy.as_deref(),
+            &candidates.kind,
+            &candidates.model_group,
+        );
         if strategy == RoutingStrategy::SimpleShuffle {
             return simple_shuffle(
                 &candidates.healthy,
@@ -263,7 +283,14 @@ impl Core {
             )
             .ok_or_else(no_deployment);
         }
-        let ctx = self.context(snapshot, op, request, &candidates.model_group);
+        let ctx = self.context(
+            snapshot,
+            op,
+            request,
+            &candidates.model_group,
+            &candidates.name,
+            scope,
+        );
         self.host
             .select(
                 &SelectStage::Strategy(strategy),

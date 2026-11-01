@@ -483,6 +483,9 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
         Ask::Select {
             stage,
             model_group,
+            name,
+            scope,
+            group,
             candidates,
         } => {
             let (stage, strategy) = match stage {
@@ -492,6 +495,9 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             dict.set_item("stage", stage)?;
             dict.set_item("strategy", strategy)?;
             dict.set_item("model_group", model_group)?;
+            dict.set_item("model", name)?;
+            dict.set_item("scope", scope)?;
+            dict.set_item("group", group)?;
             dict.set_item("candidates", PyList::new(py, candidates)?)
         }
         Ask::Cache {

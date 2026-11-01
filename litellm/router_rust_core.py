@@ -44,6 +44,7 @@ from litellm.litellm_core_utils.routing_common_utils import (
     format_no_fallback_group_message,
     truncate_fallback_error_detail,
 )
+from litellm.litellm_core_utils.routing_groups import validate_routing_strategy
 from litellm.litellm_core_utils.secret_redaction import redact_string
 from litellm.router_api import (
     ApplyResult,
@@ -64,9 +65,19 @@ from litellm.router_attempt import (
 )
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_rust_selection import (
+    SELECTOR_ATTRIBUTES,
+    StrategySelectors,
+    normalize_strategy,
+    pick_async,
+    pick_sync,
+    picked_id,
+    routing_pre_call_checks,
+    routing_pre_call_checks_sync,
+)
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
-from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError
+from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError, RoutingStrategy
 from litellm.types.utils import LlmProviders
 
 if TYPE_CHECKING:
@@ -133,6 +144,7 @@ _SERVED_ARGUMENTS: Final = frozenset(
     {
         "model_list",
         "routing_strategy",
+        "routing_strategy_args",
         "model_group_alias",
         "fallbacks",
         "default_fallbacks",
@@ -164,7 +176,6 @@ _UNSET_DEFAULTS: Final[Mapping[str, object]] = MappingProxyType(
     {
         "client_ttl": 3600,
         "cache_responses": False,
-        "routing_strategy_args": {},
         "enable_pre_call_checks": False,
         "enable_tag_filtering": False,
         "retry_policy": None,
@@ -201,6 +212,7 @@ _DYNAMIC_SETTINGS: Final = frozenset(
         "default_litellm_params",
         "fallback_access_check",
         "fallback_budget_check",
+        "routing_strategy_args",
     }
 )
 
@@ -289,6 +301,7 @@ class Resolved:
     Python router's constructor resolves them. Replaced, never changed, by ``apply``."""
 
     routing_strategy: str
+    routing_strategy_args: Mapping[str, object]
     num_retries: int
     max_fallbacks: int
     allowed_fails: int
@@ -325,8 +338,11 @@ class Resolved:
         max_fallbacks: Final = get("max_fallbacks")
         allowed_fails: Final = get("allowed_fails")
         timeout: Final = get("timeout")
+        strategy: Final = get("routing_strategy")
+        validate_routing_strategy(strategy)  # pyright: ignore[reportArgumentType]  # validated as given
         return cls(
-            routing_strategy=str(get("routing_strategy") or "simple-shuffle"),
+            routing_strategy=normalize_strategy(strategy) or "simple-shuffle",
+            routing_strategy_args=MappingProxyType(dict(as_str_mapping(get("routing_strategy_args")) or {})),
             num_retries=int(str(num_retries))
             if num_retries is not None
             else dynamic.num_retries
@@ -355,10 +371,17 @@ class Resolved:
             fallback_budget_check=get("fallback_budget_check"),
         )
 
-    def changed(self, values: Mapping[str, object]) -> "Resolved":
+    def changed(self, values: Mapping[str, object], updated: frozenset[str] = frozenset()) -> "Resolved":
+        """``values`` applied; ``updated`` names those passed as ``ChangeSet.settings`` (which go
+        through ``update_settings``: only they may name ``routing_strategy_args``, and only they
+        validate a strategy)."""
         from litellm.router_api import ASSIGNABLE_ALIASES, PLAIN_SETTING_ATTRIBUTES, SETTING_FIELDS
 
-        unknown: Final = sorted(set(values) - {*SETTING_FIELDS, *PLAIN_SETTING_ATTRIBUTES, *ASSIGNABLE_ALIASES})
+        unknown: Final = sorted(
+            set(values)
+            - {*SETTING_FIELDS, *PLAIN_SETTING_ATTRIBUTES, *ASSIGNABLE_ALIASES}
+            - (updated & {"routing_strategy_args"})
+        )
         if unknown:
             raise ValueError(f"not assignable router settings: {unknown}")
         unserved: Final = sorted(set(values) - _STATIC_SETTINGS - _DYNAMIC_SETTINGS)
@@ -379,7 +402,12 @@ class Resolved:
             elif name == "timeout":
                 updates[name] = float(str(value)) if value is not None else None
             elif name == "routing_strategy":
-                updates[name] = str(value)
+                normalized = normalize_strategy(value) or "simple-shuffle"
+                if name in updated and normalized != self.routing_strategy:
+                    validate_routing_strategy(value)  # pyright: ignore[reportArgumentType]  # validated as given
+                updates[name] = normalized
+            elif name == "routing_strategy_args":
+                updates[name] = MappingProxyType(dict(as_str_mapping(value) or {}))
             elif name == "disable_cooldowns":
                 updates[name] = _optional_bool(value)
             elif name in ("fallbacks", "context_window_fallbacks", "content_policy_fallbacks"):
@@ -455,7 +483,7 @@ def unsupported_arguments(config: RouterConfig) -> frozenset[str]:
         for name, value in config.arguments.items()
         if name not in _SERVED_ARGUMENTS and value not in (None, _UNSET_DEFAULTS.get(name))
     )
-    strategy: Final = config.get("routing_strategy") or "simple-shuffle"
+    strategy: Final = normalize_strategy(config.get("routing_strategy")) or "simple-shuffle"
     # `simple_shuffle` raises on a non-numeric weight when it picks; only the Python core keeps that.
     odd_weight: Final = any(
         (params := as_str_mapping((as_str_mapping(deployment) or {}).get("litellm_params"))) is not None
@@ -465,7 +493,8 @@ def unsupported_arguments(config: RouterConfig) -> frozenset[str]:
     )
     return (
         unserved
-        | ({"routing_strategy"} if strategy != "simple-shuffle" else frozenset[str]())
+        # lar1 routes through a custom strategy (`apply_lar1_routing_strategy`), not served yet.
+        | ({"routing_strategy"} if strategy == "lar1" else frozenset[str]())
         | ({"model_list"} if odd_weight else frozenset[str]())
     )
 
@@ -504,8 +533,11 @@ def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
     }
     weights: Final = request.get("_router_weights")
     team_id: Final = _team_id(request)
+    strategy: Final = request.get("routing_strategy")
+    override: Final = normalize_strategy(strategy) if isinstance(strategy, str | RoutingStrategy) else None
     return {
         **fields,
+        **({"routing_strategy": override} if override is not None else {}),
         **({"router_weights": weights} if weights is not None else {}),
         **({"team_id": team_id} if team_id else {}),
     }
@@ -783,6 +815,8 @@ def _limit(params: Sequence[Mapping[str, object]], key: str) -> int | None:
 
 
 _EndpointImpl: TypeAlias = Callable[..., Awaitable[object]]
+# A strategy select step's strategy, selector, keyed name and candidate deployments.
+_StrategyInputs: TypeAlias = tuple[str, object, str, list[dict[str, object]]]
 
 
 class RustCore(_SettingsSource):
@@ -799,6 +833,8 @@ class RustCore(_SettingsSource):
         self._version: int = 1
         self._retired: bool = False
         self._settings: RustSettings | None = None
+        self._selectors: Final = StrategySelectors(host, self._cache)
+        self._selectors.init_default(resolved.routing_strategy, resolved.routing_strategy_args)
         self._handle: RouterCoreHandle = self._new_handle(list(_as_list(config.get("model_list"))))
 
     @classmethod
@@ -811,6 +847,8 @@ class RustCore(_SettingsSource):
         return cls(config, host, Resolved.of(config, host.dynamic()))
 
     def __getattr__(self, name: str) -> object:
+        if name in SELECTOR_ATTRIBUTES.values():
+            return self._selectors.attribute(name)
         # Only reached for members this class does not define: never forwarded anywhere.
         raise RustCoreUnsupported(f"'{name}' is not served by the Rust router core", name=name, obj=self)
 
@@ -885,8 +923,11 @@ class RustCore(_SettingsSource):
 
     def settings_dict(self) -> Mapping[str, object]:
         r: Final = self._resolved
+        latency: Final = self._selectors.latency_args() if r.routing_strategy == "latency-based-routing" else None
+        # `get_settings` reports the latency selector's full routing args.
+        args: Final = latency if latency is not None else dict(r.routing_strategy_args)
         return {
-            "routing_strategy_args": {},
+            "routing_strategy_args": args,
             "routing_strategy": r.routing_strategy,
             "allowed_fails": r.allowed_fails,
             "cooldown_time": r.cooldown_time,
@@ -902,7 +943,7 @@ class RustCore(_SettingsSource):
     def health(self) -> RustHealth:
         return RustHealth(self)
 
-    def observe(self) -> RoutingObservers:
+    def observe(self, **_: object) -> RoutingObservers:  # kwargs-ok: the RouterCore observe options
         raise RustCoreUnsupported("observe() is not served by the Rust router core yet", name="observe", obj=self)
 
     def register_plugin(self, plugin: "CustomRoutingStrategyBase") -> None:
@@ -916,6 +957,7 @@ class RustCore(_SettingsSource):
 
     def retire(self) -> None:
         self._retired = True
+        self._selectors.retire()
         self._handle.retire()
 
     def apply(self, changes: ChangeSet) -> ApplyResult:
@@ -923,9 +965,11 @@ class RustCore(_SettingsSource):
             raise RustCoreUnsupported("apply(redis_cache / refresh_model_info) is not served by the Rust router core")
         values: Final = {**changes.assign, **changes.settings}
         if values:
-            resolved: Final = self._resolved.changed(values)
+            previous: Final = self._resolved
+            resolved: Final = previous.changed(values, frozenset(changes.settings))
             static_changed: Final = bool(_STATIC_SETTINGS & set(values))
             self._resolved = resolved
+            self._apply_strategy(previous, resolved, changes.settings)
             self._settings = None
             if "cooldown_time" in values:
                 from litellm.router_utils.cooldown_cache import CooldownCache
@@ -972,6 +1016,16 @@ class RustCore(_SettingsSource):
             self._version += 1
         return ApplyResult(version=self._version, upserted=upserted, deleted=deleted)
 
+    def _apply_strategy(self, previous: Resolved, resolved: Resolved, values: Mapping[str, object]) -> None:
+        """``_core_update_settings``: a changed strategy re-inits the selectors with the args passed
+        alongside it (or none); changed args alone rebuild the default selector."""
+        if "routing_strategy" in values and resolved.routing_strategy != previous.routing_strategy:
+            self._selectors.init_default(
+                resolved.routing_strategy, as_str_mapping(values.get("routing_strategy_args")) or {}
+            )
+        elif "routing_strategy_args" in values and resolved.routing_strategy_args != previous.routing_strategy_args:
+            self._selectors.rebuild_default(resolved.routing_strategy_args)
+
     def upsert_deployment(self, deployment: Deployment) -> Deployment | None:
         from litellm.router_deprecated import (
             _note,  # pyright: ignore[reportPrivateUsage]  # the router's deprecation notice
@@ -1004,13 +1058,16 @@ class RustCore(_SettingsSource):
         *,
         kind: str = "pick",
         specific_deployment: bool | None = None,
+        messages: object = None,
+        input: object = None,
         **_: object,  # kwargs-ok: the RouterCore select options this core ignores
     ) -> Mapping[str, object] | Sequence[Mapping[str, object]]:
         """Pick a deployment for ``model`` without calling it (``pick``), or list the deployments
         a pick would choose among (``healthy``)."""
         if kind not in ("pick", "healthy"):
             raise RustCoreUnsupported(f"select(kind={kind!r}) is not served by the Rust router core")
-        fields: Final = dict(_start_fields(request_kwargs or {}))
+        request: Final = request_kwargs if request_kwargs is not None else {}
+        fields: Final = dict(_start_fields(request))
         if specific_deployment:
             fields["specific_deployment"] = True
         call: Final = (self._handle.select if kind == "pick" else self._handle.healthy)(model, _document(fields))
@@ -1022,7 +1079,7 @@ class RustCore(_SettingsSource):
                 case "cache":
                     outcome = await self._answer_cache(step)
                 case "select":
-                    outcome = step["candidates"]
+                    outcome = await self._answer_select(step, request, messages, input)
                 case "done" if kind == "healthy":
                     records = (self._handle.deployment(str(i)) for i in _as_list(step.get("deployment_ids")))
                     return [for_requested_model(as_str_mapping(record) or {}, model) for record in records]
@@ -1127,7 +1184,7 @@ class RustCore(_SettingsSource):
                 case "cache":
                     outcome = await self._answer_cache(step)
                 case "select":
-                    outcome = step["candidates"]
+                    outcome = await driver.select(step)
                 case "done":
                     return await driver.finish_async(step)
                 case "failed":
@@ -1155,7 +1212,7 @@ class RustCore(_SettingsSource):
                 case "cache":
                     outcome = self._answer_cache_sync(step)
                 case "select":
-                    outcome = step["candidates"]
+                    outcome = driver.select_sync(step)
                 case "done":
                     return driver.finish(step)
                 case "failed":
@@ -1177,6 +1234,69 @@ class RustCore(_SettingsSource):
                     raise RuntimeError(f"router-core ({step.get('error_kind')}): {step.get('error')}")
                 case other:
                     raise RuntimeError(f"router-core asked for {other!r} while recording an outcome")
+
+    # -- select steps ----------------------------------------------------------------------------
+
+    def _strategy_inputs(self, step: Mapping[str, object], request: Mapping[str, object]) -> "_StrategyInputs | None":
+        """The strategy, its selector, the name it keys state by and the candidate deployments of a
+        ``strategy`` select step; ``None`` for a stage the host passes through."""
+        if step.get("stage") != "strategy":
+            return None
+        strategy: Final = str(step.get("strategy"))
+        group: Final = step.get("group")
+        selector: Final = self._selectors.selector_for(
+            strategy, str(step.get("scope")), str(group) if group is not None else None, request
+        )
+        candidates: Final = [
+            dict(as_str_mapping(self._handle.deployment(str(id))) or {}) for id in _as_list(step.get("candidates"))
+        ]
+        return strategy, selector, str(step.get("model")), candidates
+
+    async def _answer_select(
+        self, step: Mapping[str, object], request: Mapping[str, object], messages: object, input: object
+    ) -> object:
+        inputs: Final = self._strategy_inputs(step, request)
+        if inputs is None:
+            return step["candidates"]
+        strategy, selector, model, candidates = inputs
+        if selector is None:
+            return []
+        picked: Final = await pick_async(
+            strategy,
+            selector,  # pyright: ignore[reportArgumentType]  # a selector from selector_for
+            model,
+            candidates,
+            messages,
+            input,
+            dict(request),
+        )
+        if picked is not None and self._selectors.is_override(strategy, selector):
+            await selector.async_pre_call_check(dict(as_str_mapping(picked) or {}), None)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # every selector is a CustomLogger
+        found: Final = picked_id(picked)
+        return [found] if found is not None else []
+
+    def _answer_select_sync(
+        self, step: Mapping[str, object], request: Mapping[str, object], messages: object, input: object
+    ) -> object:
+        inputs: Final = self._strategy_inputs(step, request)
+        if inputs is None:
+            return step["candidates"]
+        strategy, selector, model, candidates = inputs
+        if selector is None:
+            return []
+        picked: Final = pick_sync(
+            strategy,
+            selector,  # pyright: ignore[reportArgumentType]  # a selector from selector_for
+            model,
+            candidates,
+            messages,
+            input,
+            dict(request),
+        )
+        if picked is not None and self._selectors.is_override(strategy, selector):
+            selector.pre_call_check(dict(as_str_mapping(picked) or {}))  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # see above
+        found: Final = picked_id(picked)
+        return [found] if found is not None else []
 
     # -- cache steps -----------------------------------------------------------------------------
 
@@ -1275,7 +1395,7 @@ class RustCore(_SettingsSource):
             cooling: Final = [id for id, _ in active]
             min_cooldown: Final = min(
                 (_seconds(entry.get("cooldown_time"), self._resolved.cooldown_time) for _, entry in active),
-                default=self._resolved.cooldown_time,
+                default=_seconds(None, self._resolved.cooldown_time),
             )
             return RouterRateLimitError(
                 model=model,
@@ -1370,6 +1490,7 @@ class _Driver:
         deployment, kwargs = self._kwargs(step)
         try:
             host: Final = self._core._host  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+            await routing_pre_call_checks(host, as_str_mapping(step.get("deployment")) or {})
             endpoint: Final = host.invoke(_HOST_ENDPOINTS.get(self._op, self._op))
             # Every op the Rust core serves names an async endpoint, so the call returns an awaitable.
             pending: Final[object] = endpoint(**kwargs)
@@ -1382,6 +1503,7 @@ class _Driver:
     def attempt_sync(self, step: Mapping[str, object]) -> Mapping[str, object]:
         deployment, kwargs = self._kwargs(step)
         try:
+            routing_pre_call_checks_sync(self._core._host, as_str_mapping(step.get("deployment")) or {})  # pyright: ignore[reportPrivateUsage]  # see attempt
             response: Final = self._core._host.invoke(self._op)(**kwargs)  # pyright: ignore[reportPrivateUsage]  # a sync endpoint
         except Exception as error:  # noqa: BLE001  # see attempt
             return self._failed(step, deployment, error)
@@ -1389,6 +1511,14 @@ class _Driver:
             raise TypeError(f"the host's {self._op} endpoint is not synchronous")
         self._last_response = response
         return {"ok": True, "total_tokens": total_tokens(response)}
+
+    async def select(self, step: Mapping[str, object]) -> object:
+        request: Final = self._request
+        return await self._core._answer_select(step, request, request.get("messages"), request.get("input"))  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+
+    def select_sync(self, step: Mapping[str, object]) -> object:
+        request: Final = self._request
+        return self._core._answer_select_sync(step, request, request.get("messages"), request.get("input"))  # pyright: ignore[reportPrivateUsage]  # see above
 
     async def allow_fallback(self, target: str) -> bool:
         """`_is_fallback_target_authorized`, then `_is_fallback_target_within_budget`."""

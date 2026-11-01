@@ -15,6 +15,7 @@ use crate::{
     health::Health,
     registry::{Deployment, Registry},
     settings::Settings,
+    strategy::StrategyScope,
 };
 
 /// One call into the router.
@@ -32,6 +33,8 @@ pub struct RouterRequest {
     pub disable_fallbacks: bool,
     /// `_router_weights`: model group to deployment id to weight.
     pub router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
+    /// A per-request `routing_strategy` override, as Python normalizes it.
+    pub routing_strategy: Option<String>,
     /// What the host needs to run the call itself, such as the Python kwargs.
     pub payload: Option<Payload>,
 }
@@ -74,6 +77,10 @@ pub struct RoutingContext<'a> {
     pub request: &'a RouterRequest,
     pub op: &'a Op,
     pub model_group: &'a str,
+    /// The name the request resolved from (Python's `model`), which strategies key state by.
+    pub name: &'a str,
+    /// Whose selector a strategy stage reads.
+    pub scope: StrategyScope,
 }
 
 /// Which selection step the host is asked to run.

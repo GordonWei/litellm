@@ -81,6 +81,7 @@ pub mod host;
 pub mod registry;
 pub mod select;
 pub mod settings;
+pub mod strategy;
 
 use std::sync::{
     Arc,

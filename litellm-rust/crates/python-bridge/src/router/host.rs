@@ -130,6 +130,11 @@ pub(crate) enum Ask {
     Select {
         stage: Stage,
         model_group: String,
+        /// The name the request resolved from, which strategies key their state by.
+        name: String,
+        /// Whose selector a strategy reads: `default`, `group` (with `group`) or `override`.
+        scope: &'static str,
+        group: Option<String>,
         candidates: Vec<String>,
     },
     /// One [`RouterCache`] op against the host's cache. `key` is set for every op but
@@ -457,12 +462,16 @@ impl Host for StepHost {
         ctx: &RoutingContext<'_>,
         candidates: Vec<Arc<Deployment>>,
     ) -> Result<Vec<Arc<Deployment>>, Error> {
+        let (scope, group) = ctx.scope.wire();
         let question = Ask::Select {
             stage: match stage {
                 SelectStage::Plugins => Stage::Plugins,
                 SelectStage::Strategy(strategy) => Stage::Strategy(strategy.to_string()),
             },
             model_group: ctx.model_group.to_owned(),
+            name: ctx.name.to_owned(),
+            scope,
+            group: group.map(str::to_owned),
             candidates: candidates.iter().map(|d| d.id.clone()).collect(),
         };
         let Answer::Select(ids) = ask(question).await else {
