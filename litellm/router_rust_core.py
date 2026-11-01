@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
 from pydantic import TypeAdapter
 
+from litellm._internal_context import service_target
 from litellm.integrations.custom_guardrail import is_guardrail_intervention
 from litellm.litellm_core_utils.add_retry_fallback_headers import (
     add_fallback_headers_to_response,
@@ -63,6 +64,8 @@ from litellm.router_attempt import (
 )
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
+from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
 from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError
 from litellm.types.utils import LlmProviders
 
@@ -204,6 +207,11 @@ _DYNAMIC_SETTINGS: Final = frozenset(
 
 class RustCoreUnsupported(AttributeError):
     """A member or request the Rust core does not serve. It is never forwarded to a Python core."""
+
+
+def _cache_target(key: str) -> str:
+    """The service target a routing cache read or write is attributed to, as the Python core's."""
+    return ROUTER_COOLDOWNS_TARGET if key.endswith(":cooldown") else ROUTER_USAGE_TARGET
 
 
 # --- failures -----------------------------------------------------------------------------------
@@ -730,9 +738,10 @@ class RustHealth(RouterHealth):
             if kind == "current":
                 return None, None
             return {}
-        values: Final = await self.store.async_batch_get_cache(  # pyright: ignore[reportUnknownMemberType]  # DualCache's reads are untyped
-            keys=[tpm for _, tpm, _ in keys] + [rpm for _, _, rpm in keys]
-        )
+        with service_target(ROUTER_USAGE_TARGET):
+            values: Final = await self.store.async_batch_get_cache(  # pyright: ignore[reportUnknownMemberType]  # DualCache's reads are untyped
+                keys=[tpm for _, tpm, _ in keys] + [rpm for _, _, rpm in keys]
+            )
         if kind == "current":
             tpm_values: Final = (values or [])[: len(keys)]
             rpm_values: Final = (values or [])[len(keys) :]
@@ -1176,6 +1185,10 @@ class RustCore(_SettingsSource):
         return self._cooldowns.cooldown_store if key.endswith(":cooldown") else self._cache
 
     async def _answer_cache(self, step: Mapping[str, object]) -> object:
+        with service_target(_cache_target(str(step.get("key")))):
+            return await self._answer_cache_in_target(step)
+
+    async def _answer_cache_in_target(self, step: Mapping[str, object]) -> object:
         key: Final = str(step.get("key"))
         ttl: Final = _ttl(step)
         match step.get("op"):
@@ -1208,6 +1221,10 @@ class RustCore(_SettingsSource):
                 raise RuntimeError(f"router-core asked for an unknown cache op {other!r}")
 
     def _answer_cache_sync(self, step: Mapping[str, object]) -> object:
+        with service_target(_cache_target(str(step.get("key")))):
+            return self._answer_cache_sync_in_target(step)
+
+    def _answer_cache_sync_in_target(self, step: Mapping[str, object]) -> object:
         key: Final = str(step.get("key"))
         ttl: Final = _ttl(step)
         match step.get("op"):
