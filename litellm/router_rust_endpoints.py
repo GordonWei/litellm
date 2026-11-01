@@ -1030,11 +1030,17 @@ class RustEndpoints:
         self._default_priority: Final = None if isinstance(parsed, InvalidPriority) else parsed
         self._polling_interval: Final = config.get("polling_interval")
         self._caching_groups: Final = config.get("caching_groups")
+        self._default_max_parallel_requests: Final = config.get("default_max_parallel_requests")
         self._scheduler: object = None
 
     @property
     def cache_responses(self) -> bool:
         return self._cache_responses
+
+    @property
+    def default_max_parallel_requests(self) -> int | None:
+        value: Final = self._default_max_parallel_requests
+        return value if isinstance(value, int) else None
 
     @property
     def search_tools(self) -> list[object]:  # mutable-ok: the router's live list, as the Python router reports it
@@ -1893,16 +1899,19 @@ class RustEndpoints:
                 )
             if "gcs_bucket_name" in data:
                 metadata_bucket(kwargs_copy, "litellm_metadata")["gcs_bucket_name"] = data["gcs_bucket_name"]  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
-            response: Final = await self._direct(
-                "acreate_file",
-                {
-                    **data,
-                    "custom_llm_provider": provider,
-                    "caching": self._cache_responses,
-                    "client": model_client(self._core, PLANS["acreate_file"], deployment, kwargs_copy),  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
-                    **kwargs_copy,
-                },  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
-            )
+            from litellm.router_rust_slots import deployment_slot
+
+            with deployment_slot(self._core, deployment, kwargs_copy):  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
+                response: Final = await self._direct(
+                    "acreate_file",
+                    {
+                        **data,
+                        "custom_llm_provider": provider,
+                        "caching": self._cache_responses,
+                        "client": model_client(self._core, PLANS["acreate_file"], deployment, kwargs_copy),  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
+                        **kwargs_copy,
+                    },  # pyright: ignore[reportUnknownArgumentType]  # litellm's untyped helpers and request values
+                )
             self.counters.success_calls[model_name] += 1
             return response
 
