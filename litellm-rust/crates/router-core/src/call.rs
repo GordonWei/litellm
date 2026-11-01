@@ -451,11 +451,15 @@ impl Core {
             if retry > 0 {
                 self.log_retry(target, at, retry, &failed.error);
             }
-            let healthy = self
+            let healthy_ids: Vec<String> = self
                 .candidates(snapshot, op, request, &target.group, &counting)
                 .await
-                .map(|c| counted(&c, c.healthy.len()))
-                .unwrap_or(0);
+                .map(|c| {
+                    let ids = c.healthy.iter().map(|d| d.id.clone());
+                    ids.take(counted(&c, c.healthy.len())).collect()
+                })
+                .unwrap_or_default();
+            let healthy = healthy_ids.len();
             // A retry that found no deployment raised that error in Python's loop: a retry
             // policy keeps going, `should_retry_this_error` raises it (nothing is healthy).
             let failure = match &failed.error {
@@ -482,6 +486,13 @@ impl Core {
                 && !inputs.skipped_ids.contains(id)
             {
                 inputs.skipped_ids.push(id.clone());
+            }
+            // An endpoint a deployment does not serve is retried on the others, until every
+            // one refused (`_every_deployment_refused`).
+            if failure.is_some_and(|failure| failure.is_a("UnsupportedEndpointError"))
+                && healthy_ids.iter().all(|id| inputs.skipped_ids.contains(id))
+            {
+                return Err(failed.error);
             }
             let delay = self.time_to_sleep(
                 snapshot,

@@ -56,7 +56,11 @@ def check(info: dict[str, object], tier: str | None, prompt: int, inclusive: boo
     usage: Final = Usage(prompt_tokens=prompt, completion_tokens=1, total_tokens=prompt + 1)
     rates: Final = _get_token_base_cost(info, usage, service_tier=tier, threshold_is_inclusive=inclusive)
     one_hour: Final = rates.cache_creation_rates_by_ttl.get("1hr", rates.cache_creation_rate)
-    return [tier, prompt, [rates.input_rate, rates.output_rate, rates.cache_creation_rate, one_hour, rates.cache_read_rate]]
+    return [
+        tier,
+        prompt,
+        [rates.input_rate, rates.output_rate, rates.cache_creation_rate, one_hour, rates.cache_read_rate],
+    ]
 
 
 def shape(info: dict[str, object], inclusive: bool) -> str:
