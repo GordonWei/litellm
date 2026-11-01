@@ -76,8 +76,8 @@ from litellm.router_rust_fallbacks import (
     RustFallbacks,
     mock_error,
     mock_failure,
+    refuse_malformed_fallbacks,
     rejected_fallback_target,
-    validate_fallbacks,
 )
 from litellm.router_rust_health import (
     RustHealthCallbacks,
@@ -425,7 +425,7 @@ class Resolved:
         configured: Final[list[object] | None] = (  # mutable-ok: the router's live list, as Python keeps it
             list(_as_list(get("fallbacks"))) or (dynamic.fallbacks if dynamic.fallbacks else None)  # pyright: ignore[reportAssignmentType]  # the process list as given
         )
-        validate_fallbacks(configured)
+        refuse_malformed_fallbacks(configured)
         default_fallbacks: Final = get("default_fallbacks") or dynamic.default_fallbacks
         if isinstance(default_fallbacks, str):
             raise TypeError(
@@ -439,7 +439,7 @@ class Resolved:
         content_policy: Final = list(_as_list(get("content_policy_fallbacks"))) or (
             list(dynamic.content_policy_fallbacks) if dynamic.content_policy_fallbacks else None
         )
-        validate_fallbacks(content_policy)
+        refuse_malformed_fallbacks(content_policy)
         num_retries: Final = get("num_retries")
         max_fallbacks: Final = get("max_fallbacks")
         allowed_fails: Final = get("allowed_fails")

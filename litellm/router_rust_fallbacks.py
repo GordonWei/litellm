@@ -11,7 +11,7 @@ from typing import Final
 from litellm.router_utils.fallback_event_handlers import check_non_standard_fallback_format
 
 
-def validate_fallbacks(fallback_param: Sequence[object] | None) -> None:
+def refuse_malformed_fallbacks(fallback_param: Sequence[object] | None) -> None:
     """``Router.validate_fallbacks``: every entry is a one-key dict whose targets are a list (or a
     client-side dict target)."""
     if fallback_param is None:
@@ -119,7 +119,7 @@ class RustFallbacks:
     """Fallback members served on the host."""
 
     def validate_fallbacks(self, fallback_param: Sequence[object] | None) -> None:
-        validate_fallbacks(fallback_param)
+        refuse_malformed_fallbacks(fallback_param)
 
 
 __all__ = [
@@ -127,6 +127,6 @@ __all__ = [
     "RustFallbacks",
     "mock_error",
     "mock_failure",
+    "refuse_malformed_fallbacks",
     "rejected_fallback_target",
-    "validate_fallbacks",
 ]
