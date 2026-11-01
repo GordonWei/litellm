@@ -366,7 +366,7 @@ impl Health {
         failure: &AttemptError,
     ) -> Result<bool, Error> {
         let status = failure.cooldown_status();
-        let policy_fails = settings.allowed_fails_for(failure.kind);
+        let policy_fails = settings.allowed_fails_for(failure);
         let lone = shape.single_deployment && !shape.has_fallback_group;
         if shape.single_deployment && status == 402 && policy_fails.is_none() {
             return Ok(false);

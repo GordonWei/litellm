@@ -8,7 +8,7 @@ use crate::{
         AllowedFailsPolicy, DEFAULT_COOLDOWN_TIME, PluginSpec, RetryPolicy, RouterConfig,
         RouterDynamicConfig, RoutingStrategy,
     },
-    error::FailureKind,
+    error::AttemptError,
 };
 
 #[derive(Clone, Debug)]
@@ -57,11 +57,11 @@ impl Settings {
         }
     }
 
-    /// `allowed_fails_for`: the policy's count for this failure kind.
-    pub fn allowed_fails_for(&self, kind: FailureKind) -> Option<u32> {
+    /// `allowed_fails_for`: the policy's count for this failure.
+    pub fn allowed_fails_for(&self, failure: &AttemptError) -> Option<u32> {
         self.allowed_fails_policy
             .as_ref()
-            .and_then(|policy| policy.allowed_fails_for(kind))
+            .and_then(|policy| policy.allowed_fails_for(failure))
     }
 
     /// Python's `allowed_fails` default when set without a value (`litellm.allowed_fails`).

@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, time::Duration};
 use serde::Deserialize;
 
 use crate::{
-    error::FailureKind,
+    error::AttemptError,
     registry::{DeploymentSpec, RoutingGroupSpec},
 };
 
@@ -147,29 +147,32 @@ pub struct AllowedFailsPolicy {
     pub InternalServerErrorAllowedFails: Option<u32>,
     pub ServiceUnavailableErrorAllowedFails: Option<u32>,
     pub BadGatewayErrorAllowedFails: Option<u32>,
+    pub NotFoundErrorAllowedFails: Option<u32>,
 }
 
 impl AllowedFailsPolicy {
-    pub fn allowed_fails_for(&self, kind: FailureKind) -> Option<u32> {
-        match kind {
-            FailureKind::BadRequest | FailureKind::ContextWindowExceeded => {
-                self.BadRequestErrorAllowedFails
-            }
-            FailureKind::Authentication => self.AuthenticationErrorAllowedFails,
-            FailureKind::Timeout => self.TimeoutErrorAllowedFails,
-            FailureKind::RateLimit => self.RateLimitErrorAllowedFails,
-            FailureKind::ContentPolicyViolation => self.ContentPolicyViolationErrorAllowedFails,
-            FailureKind::InternalServer => self.InternalServerErrorAllowedFails,
-            FailureKind::ServiceUnavailable => self.ServiceUnavailableErrorAllowedFails,
-            FailureKind::BadGateway => self.BadGatewayErrorAllowedFails,
-            FailureKind::PermissionDenied
-            | FailureKind::NotFound
-            | FailureKind::ApiConnection
-            | FailureKind::GuardrailIntervention
-            | FailureKind::Declined
-            | FailureKind::CallerCredential
-            | FailureKind::Other => None,
-        }
+    /// `_core_get_allowed_fails_from_policy`: the first set field whose exception class the
+    /// failure is an instance of, in Python's order.
+    pub fn allowed_fails_for(&self, failure: &AttemptError) -> Option<u32> {
+        [
+            ("AuthenticationError", self.AuthenticationErrorAllowedFails),
+            ("Timeout", self.TimeoutErrorAllowedFails),
+            ("RateLimitError", self.RateLimitErrorAllowedFails),
+            (
+                "ContentPolicyViolationError",
+                self.ContentPolicyViolationErrorAllowedFails,
+            ),
+            ("BadRequestError", self.BadRequestErrorAllowedFails),
+            ("InternalServerError", self.InternalServerErrorAllowedFails),
+            (
+                "ServiceUnavailableError",
+                self.ServiceUnavailableErrorAllowedFails,
+            ),
+            ("BadGatewayError", self.BadGatewayErrorAllowedFails),
+            ("NotFoundError", self.NotFoundErrorAllowedFails),
+        ]
+        .into_iter()
+        .find_map(|(class, allowed)| allowed.filter(|_| failure.is_a(class)))
     }
 }
 

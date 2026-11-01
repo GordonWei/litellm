@@ -72,7 +72,7 @@ from litellm.router_rust_fallbacks import (
     rejected_fallback_target,
     validate_fallbacks,
 )
-from litellm.router_rust_health import RustHealthCallbacks, failure_status
+from litellm.router_rust_health import RustHealthCallbacks, cooled_in_running_loop, failure_status
 from litellm.router_rust_retries import RustRetries, refuse_unserved_retry_policies, resolved_retry_policy
 from litellm.router_rust_walk import FallbackOutcomes, WalkMetadata, await_all
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
@@ -767,7 +767,7 @@ class RustHealth(RouterHealth):
         handle: Final = self._core._handle  # pyright: ignore[reportPrivateUsage]  # see above
         call: Final = handle.report_failure(deployment_id, failure, count_only=exception_status == "")
         done: Final = self._core._drive_sync_steps(call)  # pyright: ignore[reportPrivateUsage]  # see above
-        return bool(done.get("cooled"))
+        return cooled_in_running_loop(bool(done.get("cooled")))
 
     async def usage(  # pyright: ignore[reportIncompatibleMethodOverride]  # the same two kinds
         self, model_group: str, *, kind: Literal["current", "remaining"] = "current"

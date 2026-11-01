@@ -35,6 +35,16 @@ def failure_status(exception_status: object) -> int | None:
     return status if status is not None and 0 <= status <= 65535 else None
 
 
+def cooled_in_running_loop(cooled: bool) -> bool:
+    """``set_cooldown_deployments`` schedules the cooldown event with ``asyncio.create_task``
+    after writing the cooldown, so outside a running loop it raises ``RuntimeError`` then."""
+    import asyncio
+
+    if cooled:
+        asyncio.get_running_loop()
+    return cooled
+
+
 def _configured_cooldown(model_info: object, litellm_params: Mapping[str, object]) -> float | None:
     """``_first_present(model_info, litellm_params, key="cooldown_time")``."""
     for source in (as_str_mapping(model_info), litellm_params):
@@ -124,7 +134,7 @@ class RustHealthCallbacks:
             requested_group=group if isinstance(group, str) else None,
             cooldown_time=_configured_cooldown(model_info, litellm_params),
         )
-        return bool(self._drive_sync_steps(call).get("cooled"))
+        return cooled_in_running_loop(bool(self._drive_sync_steps(call).get("cooled")))
 
     def sync_deployment_callback_on_success(
         self,
@@ -176,4 +186,4 @@ class RustHealthCallbacks:
         )
 
 
-__all__ = ["RustHealthCallbacks", "failure_status"]
+__all__ = ["RustHealthCallbacks", "cooled_in_running_loop", "failure_status"]
