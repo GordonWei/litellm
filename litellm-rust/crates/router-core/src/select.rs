@@ -387,6 +387,31 @@ impl Core {
             healthy = crate::routing_plugins::narrow(healthy, plugin_models.as_deref())?;
         }
 
+        // `_without_declared_text_only_deployments`: an image request skips the deployments that
+        // declare no vision, unless that leaves nothing.
+        if request.has_image && resolution.kind != ResolveKind::Id && !healthy.is_empty() {
+            let ctx = self.context(
+                snapshot,
+                op,
+                request,
+                &resolution.group,
+                name,
+                StrategyScope::Default,
+            );
+            let text_only = self
+                .host
+                .select(&SelectStage::TextOnly, &ctx, healthy.clone())
+                .await?;
+            let vision: Vec<Arc<Deployment>> = healthy
+                .iter()
+                .filter(|d| !text_only.iter().any(|t| t.id == d.id))
+                .cloned()
+                .collect();
+            if !vision.is_empty() {
+                healthy = vision;
+            }
+        }
+
         if let Some(pinned) = request.pinned_deployment_id.as_deref()
             && healthy.iter().any(|d| d.id == pinned)
         {

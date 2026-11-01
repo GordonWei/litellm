@@ -70,7 +70,7 @@ from litellm.router_rust_endpoints import (
 )
 from litellm.router_rust_members import RustRegistryMembers
 from litellm.router_rust_plugins import SYNC_PATH_MESSAGE, candidate_models, run_plugins
-from litellm.router_rust_precall import PreCallFacts
+from litellm.router_rust_precall import PreCallFacts, declares_no_vision, request_carries_image
 from litellm.router_rust_registry import HostRegistry, RustRegistry, hosted_registry_view
 from litellm.router_rust_selection import (
     SELECTOR_ATTRIBUTES,
@@ -1246,7 +1246,11 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             or request.get("enable_tag_filtering") is True
             or self._model_tag_filtering()
         )
-        return {**_start_fields(request), **({"filter_tags": True} if filter_tags else {})}
+        return {
+            **_start_fields(request),
+            **({"filter_tags": True} if filter_tags else {}),
+            **({"has_image": True} if request_carries_image(None, request) else {}),
+        }
 
     def _model_tag_filtering(self) -> bool:
         """Whether any deployment sets ``model_info.enable_tag_filtering``, cached per registry version."""
@@ -1478,6 +1482,15 @@ class RustCore(_SettingsSource, RustRegistryMembers):
 
         return PreCallFacts(self._host, hosted, step, record, request, messages, input)  # pyright: ignore[reportArgumentType]  # the host registry serves the reads
 
+    def _text_only(self, step: Mapping[str, object]) -> list[str]:  # mutable-ok: the step's answer
+        """The candidates that declare no vision support (bridged: needs the cost map)."""
+        group: Final = str(step.get("model_group"))
+        return [
+            str(id)
+            for id in _as_list(step.get("candidates"))
+            if declares_no_vision(as_str_mapping(self._handle.deployment(str(id))) or {}, group)
+        ]
+
     async def _answer_select(
         self, step: Mapping[str, object], request: Mapping[str, object], messages: object, input: object
     ) -> object:
@@ -1496,6 +1509,8 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             return candidate_models(request)
         if step.get("stage") == "tags":
             return await self._answer_tags(step, request)
+        if step.get("stage") == "text_only":
+            return self._text_only(step)
         inputs: Final = self._strategy_inputs(step, request)
         if inputs is None:
             return step["candidates"]
@@ -1523,6 +1538,8 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             return self._pre_call_facts(step, request, messages, input).answer()
         if step.get("stage") == "routing_plugins":
             return candidate_models(request)
+        if step.get("stage") == "text_only":
+            return self._text_only(step)
         inputs: Final = self._strategy_inputs(step, request)
         if inputs is None:
             return step["candidates"]
@@ -1767,7 +1784,11 @@ class _Selection:
         self._kind: Final = kind
         self._messages: Final = messages
         self._input: Final = input
-        fields: Final = {**core._routing_fields(request), **_narrowing_fields(request, kind)}  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
+        fields: Final = {
+            **core._routing_fields(request),  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
+            **_narrowing_fields(request, kind),
+            **({"has_image": True} if request_carries_image(messages, request) else {}),
+        }  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
         if specific_deployment:
             fields["specific_deployment"] = True
         if kind == "pick":

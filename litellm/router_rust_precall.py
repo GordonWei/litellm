@@ -283,4 +283,36 @@ class PreCallFacts:
         return self._answer(await self._count_async() if self._needs_count() else None)
 
 
-__all__ = ["PreCallFacts", "PreCallRegistry", "count_tokens"]
+def request_carries_image(messages: object, request: Mapping[str, object]) -> bool:
+    """``_request_carries_image``: the messages (or the request's own messages or input) hold an image."""
+    from litellm.litellm_core_utils.prompt_templates.common_utils import request_contains_image_content
+
+    return request_contains_image_content(messages or request.get("messages") or request.get("input"))
+
+
+def declares_no_vision(deployment: Mapping[str, object], group: str) -> bool:
+    """``_deployment_declares_no_vision``: ``model_info.supports_vision`` is ``False``, or, when it
+    is unset, the cost map says the model has vision explicitly disabled."""
+    from litellm import utils as litellm_utils
+
+    model_info: Final = as_str_mapping(deployment.get("model_info")) or {}
+    declared: Final = model_info.get("supports_vision")
+    if declared is not None:
+        return declared is False
+    params: Final = as_str_mapping(deployment.get("litellm_params")) or {}
+    if not params:
+        return False
+    base_model: Final = model_info.get("base_model") or params.get("base_model")
+    try:
+        model, custom_llm_provider = _capability_model_and_provider(params, group)
+        return litellm_utils.is_vision_explicitly_disabled(
+            base_model if isinstance(base_model, str) else model, custom_llm_provider
+        )
+    except Exception as e:  # noqa: BLE001  # best-effort filter: an unresolvable provider must not narrow the request
+        verbose_router_logger.debug(
+            "litellm.router.py::_deployment_declares_no_vision: keeping deployment for model=%s. Got - %s", group, e
+        )
+        return False
+
+
+__all__ = ["PreCallFacts", "PreCallRegistry", "count_tokens", "declares_no_vision", "request_carries_image"]

@@ -50,6 +50,9 @@ pub struct RouterRequest {
     pub excluded_ids: Vec<String>,
     /// `_retry_skipped_deployment_ids`: skipped unless that leaves nothing.
     pub retry_skipped_ids: Vec<String>,
+    /// The request carries an image (`_request_carries_image`), so deployments that declare no
+    /// vision are skipped while any other remains.
+    pub has_image: bool,
     /// The async pick, whose pre-routing hook (not ported yet) runs before strategy markers are
     /// dropped: markers of a group name stay candidates until pre-routing is served.
     pub pre_routes: bool,
@@ -113,6 +116,8 @@ pub enum SelectStage {
     Strategy(RoutingStrategy),
     /// Tag routing (`get_deployments_for_tag`), not yet ported: return the deployments that remain.
     Tags,
+    /// `_deployment_declares_no_vision`: return the candidates that declare no vision support.
+    TextOnly,
 }
 
 /// Routing events, delivered through [`Host::observe`].

@@ -611,6 +611,7 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
                 Stage::Strategy(strategy) => ("strategy", Some(strategy)),
                 Stage::Tags => ("tags", None),
                 Stage::PreCall => ("pre_call", None),
+                Stage::TextOnly => ("text_only", None),
                 Stage::RoutingPlugins { run } => {
                     dict.set_item("run", run)?;
                     ("routing_plugins", None)

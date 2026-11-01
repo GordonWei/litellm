@@ -55,6 +55,8 @@ pub(crate) enum Stage {
     Tags,
     /// `enable_pre_call_checks`: return the facts the filter decides by.
     PreCall,
+    /// `_deployment_declares_no_vision`: return the candidates that declare no vision support.
+    TextOnly,
     /// The routing plugins: run them when `run`, then return the candidate models they left.
     RoutingPlugins { run: bool },
 }
@@ -485,6 +487,7 @@ impl Host for StepHost {
                 SelectStage::Plugins => Stage::Plugins,
                 SelectStage::Strategy(strategy) => Stage::Strategy(strategy.to_string()),
                 SelectStage::Tags => Stage::Tags,
+                SelectStage::TextOnly => Stage::TextOnly,
             },
             pool: ctx.pool.iter().map(|d| d.id.clone()).collect(),
             model_group: ctx.model_group.to_owned(),
