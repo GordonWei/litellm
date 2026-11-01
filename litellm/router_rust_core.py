@@ -149,6 +149,14 @@ _SERVED_ARGUMENTS: Final = frozenset(
         "cache_kwargs",
         "set_verbose",
         "debug_level",
+        # Read host-side by the endpoint plans (litellm/router_rust_endpoints.py).
+        "stream_timeout",
+        "cache_responses",
+        "assistants_config",
+        "search_tools",
+        "guardrail_list",
+        "default_priority",
+        "polling_interval",
     }
 )
 # Arguments that may be passed at their default without asking for anything.
@@ -866,7 +874,9 @@ class RustCore(_SettingsSource):
             enable_tag_filtering=False,
             fallback_access_check=r.fallback_access_check,  # pyright: ignore[reportArgumentType]  # the check as passed
             fallback_budget_check=r.fallback_budget_check,  # pyright: ignore[reportArgumentType]  # the check as passed
-            cache_responses=False,
+            cache_responses=self._endpoints.cache_responses,
+            search_tools=self._endpoints.search_tools,  # pyright: ignore[reportArgumentType]  # the configured entries, as passed
+            guardrail_list=self._endpoints.guardrail_list,  # pyright: ignore[reportArgumentType]  # same
             _router=self,  # pyright: ignore[reportArgumentType]  # the snapshot reads as_dict from this core
             _unset=frozenset(
                 {
@@ -880,8 +890,6 @@ class RustCore(_SettingsSource):
                     "provider_budget_config",
                     "provider_default_deployment_ids",
                     "kubernetes_pod_discovery",
-                    "search_tools",
-                    "guardrail_list",
                 }
             ),
         )

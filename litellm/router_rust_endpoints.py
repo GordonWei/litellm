@@ -902,6 +902,18 @@ class RustEndpoints:
         self._polling_interval: Final = config.get("polling_interval")
         self._scheduler: object = None
 
+    @property
+    def cache_responses(self) -> bool:
+        return self._cache_responses
+
+    @property
+    def search_tools(self) -> list[object]:  # mutable-ok: the router's live list, as the Python router reports it
+        return self._search_tools
+
+    @property
+    def guardrail_list(self) -> list[object]:  # mutable-ok: same
+        return self._guardrails
+
     @staticmethod
     def prepare_host(config: "RouterConfig", host: "PythonHost") -> None:
         """`cache_responses` sets the process cache, unless one is set already (the proxy's)."""
