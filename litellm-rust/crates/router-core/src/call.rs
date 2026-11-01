@@ -18,7 +18,7 @@ use crate::{
     health::{GroupShape, should_retry_status},
     host::{Attempt, Output, RetryCause, RouterEvent, RouterRequest},
     mock::MockFailure,
-    registry::ResolveKind,
+    registry::{ResolveKind, ResolveScope},
     retry::{RetryContext, resolve_retry_policy, should_retry},
     select::{Candidates, SelectInputs},
 };
@@ -290,8 +290,8 @@ impl Core {
         }
         let failure = match error {
             Error::Attempt(failure) => Some(failure),
-            Error::NoHealthyDeployments { .. } => None,
-            Error::Config(_) | Error::UnknownModel { .. } | Error::Cache(_) | Error::Retired => {
+            Error::NoHealthyDeployments { .. } | Error::UnknownModel { .. } => None,
+            Error::Config(_) | Error::Cache(_) | Error::Retired => {
                 return None;
             }
         };
@@ -646,12 +646,29 @@ impl Core {
             }))
             .into());
         }
+        // A name no deployment serves is routed to the first default fallback
+        // (`_common_checks_available_deployment`), still stamped as the name.
+        let defaulted = candidates.model_group != target.group
+            && snapshot
+                .registry
+                .resolve_for(
+                    &target.group,
+                    ResolveScope {
+                        specific_deployment: request.specific_deployment,
+                    },
+                    request.team_id.as_deref(),
+                )
+                .is_none();
         let attempt = Attempt {
             op: op.clone(),
             request: request.clone(),
             deployment: deployment.clone(),
             name: target.group.clone(),
-            model_group: candidates.model_group.clone(),
+            model_group: if defaulted {
+                target.group.clone()
+            } else {
+                candidates.model_group.clone()
+            },
             target_order: target.order,
             candidate_ids: candidates.all.iter().map(|d| d.id.clone()).collect(),
             retry,

@@ -532,15 +532,18 @@ def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
     """The request fields the Rust core routes on."""
     fields: Final = {
         key: request[key]
-        for key in ("specific_deployment", "num_retries", "disable_fallbacks", "cooldown_time")
+        for key in ("specific_deployment", "num_retries", "cooldown_time")
         if request.get(key) is not None
     }
+    # `record_disable_fallbacks(kwargs, disable_fallbacks is True)`: only True turns them off.
+    disabled: Final = {"disable_fallbacks": True} if request.get("disable_fallbacks") is True else {}
     group_policies: Final = request.get("model_group_retry_policy")
     lists: Final = {key: _plain(request[key]) for key in _REQUEST_FALLBACK_KEYS if key in request}
     weights: Final = request.get("_router_weights")
     team_id: Final = _team_id(request)
     return {
         **fields,
+        **disabled,
         **({"router_weights": weights} if weights is not None else {}),
         **({"model_group_retry_policy": _plain(group_policies)} if group_policies is not None else {}),
         **lists,
