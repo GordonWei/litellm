@@ -170,6 +170,9 @@ pub struct AttemptError {
     /// (`exception_received`, masked past 50 characters).
     pub detail: Option<Arc<str>>,
     pub payload: Option<Payload>,
+    /// The host refused the attempt before the deployment saw it in a way Python records no
+    /// outcome for (a sync `pre_call_check`): no cooldown or failure count is written.
+    pub unrecorded: bool,
 }
 
 impl AttemptError {
@@ -181,6 +184,7 @@ impl AttemptError {
             num_retries: None,
             detail: None,
             payload: None,
+            unrecorded: false,
         }
     }
 

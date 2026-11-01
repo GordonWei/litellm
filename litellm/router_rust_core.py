@@ -2021,7 +2021,11 @@ class _Driver:
         call: AttemptCall | None = None  # rebind-ok: see attempt
         try:
             deployment, call = self._call(step)  # rebind-ok: rebound as the Python router rebinds it
-            self._core._endpoints.sync_pre_call_checks(self._plan, deployment, self._request)  # pyright: ignore[reportPrivateUsage]  # see above
+            try:
+                self._core._endpoints.sync_pre_call_checks(self._plan, deployment, self._request)  # pyright: ignore[reportPrivateUsage]  # see above
+            except Exception as refused:  # noqa: BLE001  # handed to the Rust call loop like any attempt failure
+                # The sync path records no outcome for a refused pre-call check: no cooldown.
+                return {**self._failed(step, deployment, call, refused), "unrecorded": True}
             answered: Final = self._core._host.invoke(call.host_op)(**call.kwargs)  # pyright: ignore[reportPrivateUsage]  # a sync endpoint
             if inspect.isawaitable(answered):
                 raise _NotSynchronous(f"the host's {call.host_op} endpoint is not synchronous")

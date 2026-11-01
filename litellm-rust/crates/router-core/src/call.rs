@@ -531,8 +531,10 @@ impl Core {
                 })
             }
             Err(failure) => {
-                self.record_failure(snapshot, &candidates, &deployment, &failure)
-                    .await;
+                if !failure.unrecorded {
+                    self.record_failure(snapshot, &candidates, &deployment, &failure)
+                        .await;
+                }
                 Err(Failed {
                     error: Error::Attempt(failure),
                     deployment_id: Some(deployment.id.clone()),

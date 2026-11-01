@@ -494,6 +494,7 @@ fn attempt_outcome(outcome: &Bound<'_, PyDict>) -> PyResult<Result<u64, AttemptE
     failure.retry_after = retry_after;
     failure.num_retries = item(outcome, "num_retries")?;
     failure.detail = item::<String>(outcome, "detail")?.map(Into::into);
+    failure.unrecorded = item(outcome, "unrecorded")?.unwrap_or(false);
     Ok(Err(failure))
 }
 
