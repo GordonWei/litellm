@@ -44,7 +44,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         path: Final = Path(str(item.path))
         if not path.is_relative_to(here):
             continue  # the hook sees every collected item, not only this folder's
-        name: Final = f"{path.relative_to(here).as_posix()}::{item.name}"
+        name: Final = "::".join((path.relative_to(here).as_posix(), *item.nodeid.split("::")[1:]))
         if name in _RUST_PARITY_PENDING:
             item.add_marker(pytest.mark.xfail(reason="Rust core parity pending", strict=True))
 
