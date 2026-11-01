@@ -466,10 +466,12 @@ CoreBuilder = Callable[..., RouterCore]
 def rust_core(host: ScriptedHost, **arguments: object) -> RouterCore:  # kwargs-ok: the router's constructor arguments
     """A ``RustCore`` on ``host``, built the way ``make_core`` builds one when the Rust router is on."""
     from litellm.router_rust_core import RustCore
+    from litellm.rust_bridge._native import RustBridgeDeclined
 
+    config: Final = build_router_config(arguments)  # an invalid config raises here, as for the Python core
     try:
-        return RustCore.build(build_router_config(arguments), host)
-    except Exception as declined:  # noqa: BLE001  # make_core keeps such a router on the Python core
+        return RustCore.build(config, host)
+    except RustBridgeDeclined as declined:  # make_core keeps such a router on the Python core
         raise CoreDeclined(str(declined)) from declined
 
 
