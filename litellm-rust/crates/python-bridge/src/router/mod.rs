@@ -15,7 +15,7 @@ use std::{
 use litellm_error::Report;
 use litellm_host_python::{from_py_argument, json_loads, to_py};
 use litellm_router_core::{
-    AttemptError, Error, FailureKind, FailureReport, Op, RetryCause, Router, RouterEvent,
+    AttemptError, Blocked, Error, FailureKind, FailureReport, Op, RetryCause, Router, RouterEvent,
     health::{UsageMetric, current_minute, usage_key},
     registry::{DeploymentFilter, ResolveScope},
 };
@@ -374,7 +374,22 @@ fn answer(ask: &Ask, outcome: Option<Bound<'_, PyAny>>) -> PyResult<Answer> {
         Ask::Select { .. } => Ok(Answer::Select(outcome.ok_or_else(missing)?.extract()?)),
         Ask::Attempt { .. } => {
             let outcome = outcome.ok_or_else(missing)?;
-            attempt_outcome(outcome.cast::<PyDict>()?).map(Answer::Attempt)
+            let outcome = outcome.cast::<PyDict>()?;
+            let blocked = match outcome.get_item("blocked")? {
+                Some(value) if !value.is_none() => {
+                    let name: String = value.extract()?;
+                    Some(name.parse::<Blocked>().map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "`{name}` is not a way a response is blocked"
+                        ))
+                    })?)
+                }
+                Some(_) | None => None,
+            };
+            attempt_outcome(outcome).map(|result| match (result, blocked) {
+                (Ok(total_tokens), Some(blocked)) => Answer::Blocked(total_tokens, blocked),
+                (result, _) => Answer::Attempt(result),
+            })
         }
         Ask::Cache { op, .. } => cache_outcome(*op, outcome).map(Answer::Cache),
     }
@@ -494,6 +509,16 @@ fn events_list(py: Python<'_>, events: Vec<RouterEvent>) -> PyResult<Bound<'_, P
                 dict.set_item("scope", scope)?;
                 dict.set_item("parent", parent)?;
                 dict.set_item("max_fallbacks", max_fallbacks)?;
+            }
+            RouterEvent::Blocked {
+                level,
+                model,
+                blocked,
+            } => {
+                dict.set_item("kind", "blocked")?;
+                dict.set_item("level", level)?;
+                dict.set_item("model", model)?;
+                dict.set_item("blocked", <&'static str>::from(blocked))?;
             }
             RouterEvent::FallbackDone {
                 from,

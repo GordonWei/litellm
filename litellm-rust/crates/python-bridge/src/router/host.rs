@@ -20,8 +20,8 @@ use std::{
 
 use async_trait::async_trait;
 use litellm_router_core::{
-    Attempt, AttemptError, Deployment, Error, Host, Output, Payload, RouterCache, RouterEvent,
-    RouterRequest, RouterResponse, RoutingContext, SelectStage,
+    Attempt, AttemptError, Blocked, Deployment, Error, Host, Output, Payload, RouterCache,
+    RouterEvent, RouterRequest, RouterResponse, RoutingContext, SelectStage,
 };
 use serde_json::{Map, Value};
 
@@ -169,6 +169,8 @@ impl Ask {
 pub(crate) enum Answer {
     /// The attempt's total tokens, or its failure.
     Attempt(Result<u64, AttemptError>),
+    /// A successful attempt whose response the provider blocked, with its tokens.
+    Blocked(u64, Blocked),
     Slept,
     AllowFallback(bool),
     /// The candidate ids that remain, pick first.
@@ -179,7 +181,7 @@ pub(crate) enum Answer {
 impl Answer {
     fn kind(&self) -> StepKind {
         match self {
-            Self::Attempt(_) => StepKind::Attempt,
+            Self::Attempt(_) | Self::Blocked(..) => StepKind::Attempt,
             Self::Slept => StepKind::Sleep,
             Self::AllowFallback(_) => StepKind::AllowFallback,
             Self::Select(_) => StepKind::Select,
@@ -495,12 +497,15 @@ impl Host for StepHost {
             max_retries: attempt.max_retries,
             model_group_size: attempt.model_group_size,
         };
-        let Answer::Attempt(result) = ask(question).await else {
-            unreachable!("{CHECKED}");
+        let (result, blocked) = match ask(question).await {
+            Answer::Attempt(result) => (result, None),
+            Answer::Blocked(total_tokens, blocked) => (Ok(total_tokens), Some(blocked)),
+            _ => unreachable!("{CHECKED}"),
         };
         result.map(|total_tokens| Output {
             value: Payload(Arc::new(())),
             total_tokens,
+            blocked,
         })
     }
 
@@ -559,6 +564,7 @@ impl Host for StepHost {
                 | RouterEvent::MockFailed { .. }
                 | RouterEvent::RetryLogged { .. }
                 | RouterEvent::FallbackDone { .. }
+                | RouterEvent::Blocked { .. }
         ) {
             return;
         }

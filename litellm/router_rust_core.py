@@ -1399,6 +1399,38 @@ class _Driver:
         self._walk: Final = WalkMetadata(request, metadata_field(op), self._params_base_model)
         self.outcomes: Final = FallbackOutcomes(request)
 
+    def _blocked(self, response: object, endpoint_name: str) -> str | None:
+        """How the provider blocked a served response, the first check of
+        ``_should_raise_content_policy_error`` (a chat response with no choices, or whose first
+        choice was content-filtered) and of ``_should_raise_anthropic_refusal_error`` (a
+        /v1/messages safeguard refusal carrying ``stop_details``)."""
+        from litellm.llms.anthropic.messages.native.utils import get_safeguard_refusal_stop_details
+        from litellm.types.utils import ModelResponse
+
+        if endpoint_name == "anthropic_messages" and get_safeguard_refusal_stop_details(response) is not None:
+            return "refusal"
+        if self._op not in ("acompletion", "completion") or not isinstance(response, ModelResponse):
+            return None
+        return (
+            "content_filter" if not response.choices or response.choices[0].finish_reason == "content_filter" else None
+        )
+
+    def _blocked_error(self, event: Mapping[str, object]) -> BaseException:
+        """The error the router raises for a blocked response a fallback would serve."""
+        import litellm.exceptions as litellm_exceptions
+        from litellm.llms.anthropic.messages.native.utils import (
+            get_safeguard_refusal_stop_details,
+            safeguard_refusal_error,
+        )
+
+        model: Final = str(event.get("model"))
+        stop_details: Final = get_safeguard_refusal_stop_details(self._last_response)
+        if event.get("blocked") == "refusal" and stop_details is not None:
+            return safeguard_refusal_error(model=model, stop_details=stop_details)
+        return litellm_exceptions.ContentPolicyViolationError(
+            message="Response output was blocked.", model=model, llm_provider=""
+        )
+
     def _params_base_model(self, deployment_id: str) -> str | None:
         """``_deployment_params_base_model``: the ``base_model`` under the deployment's ``litellm_params``."""
         record: Final = as_str_mapping(self._core._handle.deployment(deployment_id)) or {}  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
@@ -1448,6 +1480,12 @@ class _Driver:
                 continue
             if event.get("kind") == "fallback":
                 self._walk.hop(event)
+                continue
+            if event.get("kind") == "blocked":
+                level = event.get("level")
+                blocked = self._blocked_error(event)
+                self._last_error = blocked
+                self._level_errors[level if isinstance(level, int) else 0] = blocked
                 continue
             if event.get("kind") == "fallback_done":
                 level = event.get("level")
@@ -1509,7 +1547,8 @@ class _Driver:
         except Exception as error:  # noqa: BLE001  # every attempt failure is classified and handed to the Rust call loop
             return self._failed(step, deployment, error)
         self._last_response = response
-        return {"ok": True, "total_tokens": total_tokens(response)}
+        blocked: Final = self._blocked(response, str(getattr(endpoint, "__name__", "")))
+        return {"ok": True, "total_tokens": total_tokens(response), "blocked": blocked}
 
     def attempt_sync(self, step: Mapping[str, object]) -> Mapping[str, object]:
         deployment, kwargs = self._kwargs(step)
@@ -1520,7 +1559,7 @@ class _Driver:
         if inspect.isawaitable(response):
             raise TypeError(f"the host's {self._op} endpoint is not synchronous")
         self._last_response = response
-        return {"ok": True, "total_tokens": total_tokens(response)}
+        return {"ok": True, "total_tokens": total_tokens(response), "blocked": self._blocked(response, "")}
 
     async def allow_fallback(self, target: str) -> bool:
         """`_is_fallback_target_authorized`, then `_is_fallback_target_within_budget`."""

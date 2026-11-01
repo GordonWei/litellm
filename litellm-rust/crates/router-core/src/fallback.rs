@@ -180,6 +180,13 @@ impl Fallbacks {
         })
     }
 
+    /// `_has_default_fallbacks`: some entry keys `"*"`.
+    pub fn has_star(&self) -> bool {
+        self.0
+            .iter()
+            .any(|entry| matches!(entry, Entry::Dict(dict) if dict.contains_key("*")))
+    }
+
     /// `get_fallback_model_group`.
     fn lookup(&self, group: &str, keys: &FallbackKeys) -> Option<Found> {
         let prefixed = keys.provider_prefixed.get(group).map(String::as_str);

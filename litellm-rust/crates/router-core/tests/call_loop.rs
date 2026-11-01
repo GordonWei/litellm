@@ -44,6 +44,7 @@ impl Host for ScriptedHost {
             None => Ok(Output {
                 value: Payload(Arc::new(attempt.deployment.id.clone())),
                 total_tokens: 10,
+                blocked: None,
             }),
         }
     }

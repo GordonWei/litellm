@@ -16,7 +16,7 @@ use crate::{
     error::{AttemptError, ConfigError, Error, FailureKind, Unsupported},
     fallback::{FallbackKeys, FallbackTarget, Fallbacks},
     health::{GroupShape, should_retry_status},
-    host::{Attempt, Output, RetryCause, RouterEvent, RouterRequest},
+    host::{Attempt, Blocked, Output, RetryCause, RouterEvent, RouterRequest},
     mock::MockFailure,
     registry::{ResolveKind, ResolveScope},
     retry::{RetryContext, resolve_retry_policy, should_retry},
@@ -131,6 +131,31 @@ impl<'a> Lists<'a> {
     }
 }
 
+/// `has_unattempted_fallback_target` over the chain `list` resolves for the level's lookup
+/// groups: before the first hop nothing counts as tried, and a dict target with its own params
+/// is never skipped.
+fn unattempted_chain(
+    list: &Fallbacks,
+    lists: &Lists<'_>,
+    request: &RouterRequest,
+    target: &Target,
+    at: Hop,
+    attempted: &[Tried],
+) -> bool {
+    let mut lookup = vec![target.group.as_str()];
+    if request.model != target.group {
+        lookup.push(request.model.as_str());
+    }
+    list.lookup_groups(&lookup, lists.keys)
+        .is_some_and(|targets| {
+            at.level == 0
+                || targets.iter().any(|next| match next.identity() {
+                    FallbackTarget::Params(_) => true,
+                    identity => !attempted.contains(&Tried::Target(identity)),
+                })
+        })
+}
+
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 impl Core {
@@ -167,7 +192,10 @@ impl Core {
                 .filter(|mock| mock.before_retries() && at.level == 0);
             let error = match mock {
                 Some(mock) => self.mock_failed(mock, &target, at, None),
-                None => match self.with_retries(snapshot, op, request, &target, at).await {
+                None => match self
+                    .with_retries(snapshot, op, request, &target, at, &walk.attempted)
+                    .await
+                {
                     Ok(response) => return Ok(response),
                     Err(error) => error,
                 },
@@ -370,7 +398,9 @@ impl Core {
         request: &Arc<RouterRequest>,
         target: &Target,
         at: Hop,
+        attempted: &[Tried],
     ) -> Result<RouterResponse, Error> {
+        let walk = (at, attempted);
         let mut inputs = SelectInputs {
             target_order: target.order,
             ..SelectInputs::default()
@@ -403,7 +433,7 @@ impl Core {
                     target,
                     &inputs,
                     (0, first_budget),
-                    at,
+                    walk,
                 )
                 .await
             }
@@ -524,7 +554,7 @@ impl Core {
                     target,
                     &inputs,
                     (retry + 1, num_retries),
-                    at,
+                    walk,
                 )
                 .await
             {
@@ -634,7 +664,7 @@ impl Core {
         target: &Target,
         inputs: &SelectInputs,
         (retry, max_retries): (u32, u32),
-        at: Hop,
+        (at, attempted): (Hop, &[Tried]),
     ) -> Result<RouterResponse, Failed> {
         let candidates = self
             .candidates(snapshot, op, request, &target.group, inputs)
@@ -704,6 +734,30 @@ impl Core {
                 self.host.observe(&RouterEvent::Succeeded {
                     deployment_id: deployment.id.clone(),
                 });
+                // `_should_raise_content_policy_error`: a blocked response is raised only when
+                // a content-policy fallback would serve it, and counts as no failure.
+                let raised =
+                    match output.blocked {
+                        Some(Blocked::ContentFilter) => self
+                            .has_content_policy_fallback(snapshot, request, target, at, attempted),
+                        Some(Blocked::Refusal) => self
+                            .refusal_fallback_available(snapshot, request, target, at, attempted),
+                        None => false,
+                    };
+                if let Some(blocked) = output.blocked.filter(|_| raised) {
+                    self.host.observe(&RouterEvent::Blocked {
+                        level: at.level,
+                        model: target.group.clone(),
+                        blocked,
+                    });
+                    let mut failure =
+                        AttemptError::new(FailureKind::ContentPolicyViolation, Some(400));
+                    failure.classes = crate::retry::content_policy_classes();
+                    return Err(Failed {
+                        error: Error::Attempt(failure),
+                        deployment_id: Some(deployment.id.clone()),
+                    });
+                }
                 Ok(RouterResponse {
                     output,
                     deployment_id: deployment.id.clone(),
@@ -722,6 +776,49 @@ impl Core {
                 })
             }
         }
+    }
+
+    /// `_has_content_policy_fallback`: the content-policy chain resolves for the level's
+    /// lookup groups and holds a target the walk has not tried; with no content-policy list,
+    /// any router `"*"` entry.
+    fn has_content_policy_fallback(
+        &self,
+        snapshot: &Snapshot,
+        request: &RouterRequest,
+        target: &Target,
+        at: Hop,
+        attempted: &[Tried],
+    ) -> bool {
+        let lists = Lists::of(snapshot, request);
+        match lists.content_policy {
+            Some(list) => unattempted_chain(list, &lists, request, target, at, attempted),
+            None => snapshot.settings.dynamic.fallbacks.has_star(),
+        }
+    }
+
+    /// `_refusal_fallback_available`: the content-policy list decides when there is one;
+    /// else a router `"*"` entry, else a generic chain with a target the walk has not tried.
+    fn refusal_fallback_available(
+        &self,
+        snapshot: &Snapshot,
+        request: &RouterRequest,
+        target: &Target,
+        at: Hop,
+        attempted: &[Tried],
+    ) -> bool {
+        if request.disable_fallbacks {
+            return false;
+        }
+        let lists = Lists::of(snapshot, request);
+        if lists.content_policy.is_some() {
+            return self.has_content_policy_fallback(snapshot, request, target, at, attempted);
+        }
+        if snapshot.settings.dynamic.fallbacks.has_star() {
+            return true;
+        }
+        lists
+            .fallbacks
+            .is_some_and(|list| unattempted_chain(list, &lists, request, target, at, attempted))
     }
 
     async fn record_failure(

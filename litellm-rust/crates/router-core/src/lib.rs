@@ -100,7 +100,8 @@ pub use crate::{
     error::{AttemptError, ConfigError, Error, FailureKind, Payload, Unsupported},
     health::{Clock, Health, Outcome, SystemClock},
     host::{
-        Attempt, Host, Output, RetryCause, RouterEvent, RouterRequest, RoutingContext, SelectStage,
+        Attempt, Blocked, Host, Output, RetryCause, RouterEvent, RouterRequest, RoutingContext,
+        SelectStage,
     },
     registry::{ChangeSet, Deployment, DeploymentSpec, Registry, RegistryVersion},
     select::{Randomness, SeededRandomness, ThreadRandomness},

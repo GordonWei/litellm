@@ -88,6 +88,18 @@ pub struct Output {
     pub value: Payload,
     /// Prompt plus completion tokens, counted against the deployment's per-minute usage.
     pub total_tokens: u64,
+    /// A response the provider blocked, which the router may raise to fall back.
+    pub blocked: Option<Blocked>,
+}
+
+/// How a provider blocked a response the call otherwise served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::EnumString)]
+#[strum(serialize_all = "snake_case")]
+pub enum Blocked {
+    /// A chat response whose first choice was content-filtered (or that has no choices).
+    ContentFilter,
+    /// An Anthropic /v1/messages safeguard refusal carrying `stop_details`.
+    Refusal,
 }
 
 /// What a plugin or strategy sees: never the router itself.
@@ -156,6 +168,14 @@ pub enum RouterEvent {
         scope: u32,
         parent: u32,
         succeeded: bool,
+    },
+    /// The router raised a `ContentPolicyViolationError` for a blocked response, since a
+    /// fallback would serve it (`_should_raise_content_policy_error`,
+    /// `_should_raise_anthropic_refusal_error`).
+    Blocked {
+        level: u32,
+        model: String,
+        blocked: Blocked,
     },
     /// `log_retry`: the router recorded a failure in `scope`'s request metadata
     /// (`previous_models`, `request_retry_count`) before retrying or falling back.
