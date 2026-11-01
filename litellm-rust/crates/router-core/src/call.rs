@@ -207,7 +207,14 @@ impl Core {
         let kind = match error {
             Error::Attempt(failure) => failure.kind,
             Error::NoHealthyDeployments { .. } => FailureKind::RateLimit,
-            Error::Config(_) | Error::UnknownModel { .. } | Error::Cache(_) | Error::Retired => {
+            Error::Config(_)
+            | Error::UnknownModel { .. }
+            | Error::Cache(_)
+            | Error::Retired
+            | Error::Paused { .. }
+            | Error::NotPassThrough { .. }
+            | Error::NoPassThroughDeployments { .. }
+            | Error::OnlyMarkers { .. } => {
                 return None;
             }
         };

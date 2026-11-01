@@ -38,6 +38,17 @@ pub struct RouterRequest {
     /// Whether tag routing may apply to this request (router, request or model setting), so the
     /// host's tag stage runs.
     pub filter_tags: bool,
+    /// A pass-through pick: only `use_in_pass_through` deployments may serve it.
+    pub pass_through: Option<crate::select::PassThrough>,
+    /// `_target_order`: the order level to pick from instead of the lowest.
+    pub target_order: Option<i64>,
+    /// `_excluded_deployment_ids`: never picked, even when that leaves nothing.
+    pub excluded_ids: Vec<String>,
+    /// `_retry_skipped_deployment_ids`: skipped unless that leaves nothing.
+    pub retry_skipped_ids: Vec<String>,
+    /// The async pick, whose pre-routing hook (not ported yet) runs before strategy markers are
+    /// dropped: markers of a group name stay candidates until pre-routing is served.
+    pub pre_routes: bool,
     /// What the host needs to run the call itself, such as the Python kwargs.
     pub payload: Option<Payload>,
 }

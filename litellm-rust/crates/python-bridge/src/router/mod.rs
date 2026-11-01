@@ -45,6 +45,14 @@ enum ErrorKind {
     Cache,
     #[strum(serialize = "retired")]
     Retired,
+    #[strum(serialize = "paused")]
+    Paused,
+    #[strum(serialize = "not_pass_through")]
+    NotPassThrough,
+    #[strum(serialize = "no_pass_through_deployments")]
+    NoPassThroughDeployments,
+    #[strum(serialize = "only_markers")]
+    OnlyMarkers,
 }
 
 impl From<&Error> for ErrorKind {
@@ -56,6 +64,10 @@ impl From<&Error> for ErrorKind {
             Error::Attempt(_) => Self::Attempt,
             Error::Cache(_) => Self::Cache,
             Error::Retired => Self::Retired,
+            Error::Paused { .. } => Self::Paused,
+            Error::NotPassThrough { .. } => Self::NotPassThrough,
+            Error::NoPassThroughDeployments { .. } => Self::NoPassThroughDeployments,
+            Error::OnlyMarkers { .. } => Self::OnlyMarkers,
         }
     }
 }
@@ -447,6 +459,9 @@ fn step_dict(py: Python<'_>, step: Step) -> PyResult<Bound<'_, PyDict>> {
             let attempt = error.attempt();
             dict.set_item("error", Report::new(&error).to_string())?;
             dict.set_item("error_kind", <&'static str>::from(ErrorKind::from(&error)))?;
+            if let Error::OnlyMarkers { model } = &error {
+                dict.set_item("error_model", model)?;
+            }
             dict.set_item("attempt_failed", attempt.is_some())?;
             dict.set_item("status", attempt.and_then(|failure| failure.status))?;
             dict.set_item(

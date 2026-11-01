@@ -1212,36 +1212,58 @@ class RustCore(_SettingsSource):
         input: object = None,
         **_: object,  # kwargs-ok: the RouterCore select options this core ignores
     ) -> Mapping[str, object] | Sequence[Mapping[str, object]]:
-        """Pick a deployment for ``model`` without calling it (``pick``), or list the deployments
-        a pick would choose among (``healthy``)."""
-        if kind not in ("pick", "healthy"):
-            raise RustCoreUnsupported(f"select(kind={kind!r}) is not served by the Rust router core")
+        """Pick a deployment for ``model`` without calling it (``pick``), list the deployments a
+        pick would choose among (``healthy``), or pick one for a pass-through route
+        (``pass_through``, which picks with the sync strategies, as Python does)."""
+        if kind not in ("pick", "healthy", "pass_through"):
+            raise ValueError(f"unknown select kind {kind!r}")
         request: Final = request_kwargs if request_kwargs is not None else {}
-        fields: Final = dict(self._routing_fields(request))
-        if specific_deployment:
-            fields["specific_deployment"] = True
-        call: Final = (self._handle.select if kind == "pick" else self._handle.healthy)(model, _document(fields))
-        step: Mapping[str, object] = {}  # rebind-ok: one step per round
-        outcome: object = None  # rebind-ok: the answer to the last step
-        while True:
-            step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # Rust validates each outcome
-            match step["kind"]:
-                case "cache":
-                    outcome = await self._answer_cache(step)
-                case "select":
-                    outcome = await self._answer_select(step, request, messages, input)
-                case "done" if kind == "healthy":
-                    # The deployments as served: a priority group's members carry their priority as order.
-                    return [
-                        for_requested_model(as_str_mapping(record) or {}, model)
-                        for record in _as_list(step.get("deployments"))
-                    ]
-                case "done":
-                    return for_requested_model(as_str_mapping(step.get("deployment")) or {}, model)
-                case "failed":
-                    raise self._failure_error(step, model, None)
-                case other:
-                    raise RuntimeError(f"router-core returned an unknown step {other!r}")
+        selection: Final = _Selection(self, model, request, kind, specific_deployment, messages, input)
+        if kind == "pass_through":
+            return selection.run_sync()
+        return await selection.run()
+
+    async def async_get_available_deployment_for_pass_through(
+        self,
+        model: str,
+        request_kwargs: dict[str, object],  # mutable-ok: the legacy signature
+        messages: object = None,
+        input: object = None,
+        specific_deployment: bool | None = False,
+    ) -> Mapping[str, object]:
+        """The full healthy chain, then only ``use_in_pass_through`` deployments, picked with the
+        async strategies."""
+        selection: Final = _Selection(
+            self, model, request_kwargs, "async_pass_through", specific_deployment, messages, input
+        )
+        picked: Final = await selection.run()
+        return picked if isinstance(picked, Mapping) else {}
+
+    def get_available_deployment_for_pass_through(
+        self,
+        model: str,
+        messages: object = None,
+        input: object = None,
+        specific_deployment: bool | None = False,
+        request_kwargs: dict[str, object] | None = None,  # mutable-ok: the legacy signature
+    ) -> Mapping[str, object]:
+        """Deprecated: ``select(model, kind="pass_through")``."""
+        from litellm.router_deprecated import (
+            _note,  # pyright: ignore[reportPrivateUsage]  # the router's deprecation notice
+        )
+
+        _note("get_available_deployment_for_pass_through", 'select(model, kind="pass_through")')
+        selection: Final = _Selection(
+            self,
+            model,
+            request_kwargs if request_kwargs is not None else {},
+            "pass_through",
+            specific_deployment,
+            messages,
+            input,
+        )
+        picked: Final = selection.run_sync()
+        return picked if isinstance(picked, Mapping) else {}
 
     # -- endpoints -------------------------------------------------------------------------------
 
@@ -1300,7 +1322,9 @@ class RustCore(_SettingsSource):
 
     # -- driving a call --------------------------------------------------------------------------
 
-    def _start(self, op: str, request: Mapping[str, object]) -> "tuple[RouterCall, Mapping[str, object]]":
+    def _start(
+        self, op: str, request: Mapping[str, object], *, pre_routes: bool = True
+    ) -> "tuple[RouterCall, Mapping[str, object]]":
         if self._retired:
             raise RuntimeError("this router core was retired")
         unserved: Final = sorted(
@@ -1316,7 +1340,12 @@ class RustCore(_SettingsSource):
             raise TypeError(f"{field} must be a mapping")
         aliases: Final = self._resolved.model_group_alias
         prepared: Final = prepare_call(op, request, model if model in aliases else None)
-        return self._handle.start(op, _document({"model": model, **self._routing_fields(request)})), prepared
+        fields: Final = {
+            "model": model,
+            **self._routing_fields(request),
+            **({"pre_routes": True} if pre_routes else {}),
+        }
+        return self._handle.start(op, _document(fields)), prepared
 
     def _routing_fields(self, request: Mapping[str, object]) -> Mapping[str, object]:
         """The request fields the Rust core routes on, and whether its tag stage may apply: the
@@ -1370,7 +1399,8 @@ class RustCore(_SettingsSource):
 
     def _call_sync(self, op: str, request: Mapping[str, object]) -> object:
         async_op: Final = SYNC_OPS[op]
-        call, prepared = self._start(async_op, request)
+        # The sync path never runs pre-routing.
+        call, prepared = self._start(async_op, request, pre_routes=False)
         driver: Final = _Driver(self, op, prepared)
         outcome: object = None  # rebind-ok: the answer to the last step
         while True:
@@ -1572,11 +1602,46 @@ class RustCore(_SettingsSource):
 
     # -- errors the core raises when no attempt failed ------------------------------------------
 
-    def _failure_error(self, step: Mapping[str, object], model: str, last: BaseException | None) -> BaseException:
+    def _failure_error(
+        self, step: Mapping[str, object], model: str, last: BaseException | None, *, pass_through: str = ""
+    ) -> BaseException:
+        """The error a call or pick that failed before any attempt raises; ``pass_through`` names
+        the selection kind (``pass_through``/``async_pass_through``) whose errors it words."""
         import litellm.exceptions as litellm_exceptions
 
         kind: Final = step.get("error_kind")
         aliases: Final = self._resolved.model_group_alias
+        if kind == "paused":
+            # The message names the deployment's litellm model, not the id that was asked for.
+            record: Final = as_str_mapping(self._handle.deployment(model)) or {}
+            litellm_model: Final = str((as_str_mapping(record.get("litellm_params")) or {}).get("model"))
+            return litellm_exceptions.ServiceUnavailableError(
+                message=f"Model '{litellm_model}' is currently paused and cannot accept requests.",
+                model=litellm_model,
+                llm_provider="",
+            )
+        if kind == "only_markers":
+            named_model: Final = str(step.get("error_model") or model)
+            return litellm_exceptions.BadRequestError(
+                message=f"You passed in model={named_model}. {RouterErrors.only_strategy_marker_deployments.value}",
+                model=named_model,
+                llm_provider="",
+            )
+        if kind == "not_pass_through":
+            return litellm_exceptions.BadRequestError(
+                message=f"Deployment {model} does not support pass-through endpoint (use_in_pass_through=False)",
+                model=model,
+                llm_provider="",
+            )
+        if kind == "no_pass_through_deployments":
+            message: Final = (
+                f"Model {model} has no deployments configured with use_in_pass_through=True. "
+                "Please add use_in_pass_through: true to the deployment configuration"
+                if pass_through == "async_pass_through"
+                else f"Model {model} has no deployment configured with use_in_pass_through=True. "
+                "Please add use_in_pass_through: true in the deployment configuration"
+            )
+            return litellm_exceptions.BadRequestError(message=message, model=model, llm_provider="")
         if kind == "unknown_model":
             named: Final = _alias_target(aliases.get(model)) or model if model in aliases else model
             return litellm_exceptions.BadRequestError(
@@ -1586,7 +1651,13 @@ class RustCore(_SettingsSource):
             )
         if kind == "no_healthy_deployments":
             group: Final = self.registry().resolve(model)
-            ids: Final = self.registry().names(str(group), kind="ids")
+            group_ids: Final = self.registry().names(str(group), kind="ids")
+            # A listed pass-through pick names only the pass-through deployments.
+            ids: Final = (
+                [id for id in group_ids if _uses_pass_through(self._handle.deployment(id))]
+                if pass_through == "pass_through"
+                else list(group_ids)
+            )
             active: Final = self._cooldowns.get_active_cooldowns(list(ids), None)  # pyright: ignore[reportArgumentType]  # a list of ids
             cooling: Final = [id for id, _ in active]
             min_cooldown: Final = min(
@@ -1603,6 +1674,11 @@ class RustCore(_SettingsSource):
         if last is not None:
             return last
         return RuntimeError(f"router-core ({kind}): {step.get('error')}")
+
+
+def _uses_pass_through(record: object) -> bool:
+    params: Final = as_str_mapping((as_str_mapping(record) or {}).get("litellm_params")) or {}
+    return bool(params.get("use_in_pass_through"))
 
 
 def _seconds(value: object, default: float) -> float | int:
@@ -1624,6 +1700,123 @@ def _amount(value: object) -> float | int:
 def _record(deployment: object) -> object:
     dump: Final = getattr(deployment, "model_dump", None)
     return dump(exclude_none=True) if callable(dump) else deployment
+
+
+class _Selection:
+    """One ``select``: the Rust selection call, its select and cache steps answered on the host."""
+
+    def __init__(
+        self,
+        core: RustCore,
+        model: str,
+        request: dict[str, object],  # mutable-ok: the caller's request, whose narrowing keys are popped
+        kind: str,
+        specific_deployment: bool | None,
+        messages: object,
+        input: object,
+    ) -> None:
+        self._core: Final = core
+        self._model: Final = model
+        self._request: Final = request
+        self._kind: Final = kind
+        self._messages: Final = messages
+        self._input: Final = input
+        fields: Final = {**core._routing_fields(request), **_narrowing_fields(request, kind)}  # pyright: ignore[reportPrivateUsage]  # the selection serves its own core
+        if specific_deployment:
+            fields["specific_deployment"] = True
+        if kind == "pick":
+            fields["pre_routes"] = True
+        if kind == "pass_through":
+            fields["pass_through"] = "listed"
+        elif kind == "async_pass_through":
+            fields["pass_through"] = "healthy"
+        handle: Final = core._handle  # pyright: ignore[reportPrivateUsage]  # see above
+        self._call: Final = (handle.healthy if kind == "healthy" else handle.select)(model, _document(fields))
+
+    def _done(self, step: Mapping[str, object]) -> Mapping[str, object] | Sequence[Mapping[str, object]]:
+        if self._kind == "healthy":
+            # The deployments as served: a priority group's members carry their priority as order.
+            return [
+                for_requested_model(as_str_mapping(record) or {}, self._model)
+                for record in _as_list(step.get("deployments"))
+            ]
+        return for_requested_model(as_str_mapping(step.get("deployment")) or {}, self._model)
+
+    def _failed(self, step: Mapping[str, object]) -> BaseException:
+        error: Final = self._core._failure_error(step, self._model, None, pass_through=self._kind)  # pyright: ignore[reportPrivateUsage]  # see above
+        logging_obj: Final = self._request.get("litellm_logging_obj")
+        dispatch: Final[object] = getattr(logging_obj, "dispatch_failure_handlers", None)
+        if callable(dispatch) and self._kind != "pass_through":
+            import asyncio
+            import traceback
+
+            # A refused pick is logged to the request's logging object (`_async_get_available_deployment`).
+            trace: Final = "Traceback (most recent call last):\n" + "".join(
+                traceback.format_exception(type(error), error, error.__traceback__)
+            )
+            pending: Final[object] = dispatch(exception=error, traceback_exception=trace, prefer_async_handlers=True)
+            if inspect.isawaitable(pending):
+                _ = asyncio.ensure_future(pending)
+        return error
+
+    async def run(self) -> Mapping[str, object] | Sequence[Mapping[str, object]]:
+        core: Final = self._core
+        outcome: object = None  # rebind-ok: the answer to the last step
+        while True:
+            step = _STEP.validate_python(self._call.next(outcome))  # pyright: ignore[reportArgumentType]  # Rust validates each outcome
+            match step["kind"]:
+                case "cache":
+                    outcome = await core._answer_cache(step)  # pyright: ignore[reportPrivateUsage]  # see above
+                case "select":
+                    outcome = await core._answer_select(step, self._request, self._messages, self._input)  # pyright: ignore[reportPrivateUsage]  # see above
+                case "done":
+                    return self._done(step)
+                case "failed":
+                    raise self._failed(step)
+                case other:
+                    raise RuntimeError(f"router-core returned an unknown step {other!r}")
+
+    def run_sync(self) -> Mapping[str, object] | Sequence[Mapping[str, object]]:
+        core: Final = self._core
+        outcome: object = None  # rebind-ok: the answer to the last step
+        while True:
+            step = _STEP.validate_python(self._call.next(outcome))  # pyright: ignore[reportArgumentType]  # see run
+            match step["kind"]:
+                case "cache":
+                    outcome = core._answer_cache_sync(step)  # pyright: ignore[reportPrivateUsage]  # see above
+                case "select":
+                    outcome = core._answer_select_sync(step, self._request, self._messages, self._input)  # pyright: ignore[reportPrivateUsage]  # see above
+                case "done":
+                    return self._done(step)
+                case "failed":
+                    raise self._failed(step)
+                case other:
+                    raise RuntimeError(f"router-core returned an unknown step {other!r}")
+
+
+def _narrowing_fields(request: dict[str, object], kind: str) -> Mapping[str, object]:  # mutable-ok: popped
+    """``_target_order``, ``_excluded_deployment_ids`` and ``_retry_skipped_deployment_ids``, popped
+    from the request as the healthy chain pops them (a listed pass-through pick only reads the order)."""
+    from litellm.litellm_core_utils.routing_common_utils import (
+        as_excluded_deployment_ids,
+        as_retry_skipped_deployment_ids,
+    )
+
+    if kind == "pass_through":
+        order: Final = request.get("_target_order")
+        return {"target_order": order} if isinstance(order, int) and not isinstance(order, bool) else {}
+    target_order: Final = request.pop("_target_order", None)
+    excluded: Final = as_excluded_deployment_ids(request.pop("_excluded_deployment_ids", None))
+    skipped: Final = as_retry_skipped_deployment_ids(request.pop("_retry_skipped_deployment_ids", None))
+    return {
+        **(
+            {"target_order": target_order}
+            if isinstance(target_order, int) and not isinstance(target_order, bool)
+            else {}
+        ),
+        **({"excluded_ids": list(excluded)} if excluded else {}),
+        **({"retry_skipped_ids": list(skipped)} if skipped else {}),
+    }
 
 
 class _Driver:
