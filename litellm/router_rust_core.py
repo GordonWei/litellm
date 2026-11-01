@@ -288,6 +288,10 @@ _DYNAMIC_SETTINGS: Final = frozenset(
 )
 
 
+# Plain settings `update_settings` sets that the Rust core's retry loop reads.
+_RETRY_POLICY_SETTINGS: Final = ("retry_policy", "model_group_retry_policy")
+
+
 # Settings converted by `Resolved._selection_setting`.
 _SELECTION_SETTINGS: Final = frozenset(
     {
@@ -1095,6 +1099,8 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         return result
 
     def _apply_settings(self, assign: Mapping[str, object], update: SettingsUpdate) -> None:
+        policies: Final = {name: update.plain[name] for name in _RETRY_POLICY_SETTINGS if name in update.plain}
+        refuse_unserved_retry_policies(policies.get("model_group_retry_policy"))
         values: Final = {**assign, **update.values}
         given: Final = dict(update.values)  # the settings passed through `update_settings`
         if update.routing_groups is not MISSING:
@@ -1105,6 +1111,8 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
                 frozenset(self._resolved.model_group_alias),
             )
         self._plain.update(update.plain)
+        if policies:
+            self._set_retry_policies(policies)
         if self._deleted & set(values):
             self._deleted = self._deleted - set(values)
             self._settings = None
@@ -1130,6 +1138,19 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
             else:
                 names: Final = [str(d.get("model_name")) for d in self._handle.deployments()]
                 self._handle.apply({"settings": resolved.dynamic_document(self._version, names)})
+
+    def _set_retry_policies(self, policies: Mapping[str, object]) -> None:
+        """``update_settings``' ``retry_policy`` and ``model_group_retry_policy``, which the retry
+        loop reads from then on: router-core holds them with its static settings."""
+        previous: Final = self._resolved
+        resolved: Final = dataclasses.replace(
+            previous,
+            retry_policy=resolved_retry_policy(policies.get("retry_policy", previous.retry_policy)),
+            model_group_retry_policy=policies.get("model_group_retry_policy", previous.model_group_retry_policy),
+        )
+        if resolved != previous:
+            self._resolved = resolved
+            self._rebuild()
 
     def _apply_strategy(self, previous: Resolved, resolved: Resolved, values: Mapping[str, object]) -> None:
         """``_core_update_settings``: a changed strategy re-inits the selectors with the args passed
@@ -1194,6 +1215,7 @@ class RustCore(_SettingsSource, RustRegistryMembers, RustRetries, RustFallbacks,
         for name in ("success_callback", "_async_success_callback", "failure_callback", "_async_failure_callback"):
             self._host.set_callback_list(name, [])
         self._plain["retry_policy"] = None
+        self._set_retry_policies({"retry_policy": None})
         self.flush_cache()
 
     def __delattr__(self, name: str) -> None:
