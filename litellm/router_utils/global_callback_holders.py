@@ -15,7 +15,7 @@ serves ``optional_callbacks``.
 
 import threading
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Final, Protocol
 
 if TYPE_CHECKING:
@@ -37,7 +37,7 @@ class CheckOwner(Protocol):
     """A live router with optional pre-call checks."""
 
     @property
-    def optional_callbacks(self) -> "list[object] | None": ...  # mutable-ok: the router's live list
+    def optional_callbacks(self) -> "Sequence[object] | None": ...
 
 
 routers_holding_global_callbacks: Final["weakref.WeakSet[GlobalCallbackHolder]"] = weakref.WeakSet()
