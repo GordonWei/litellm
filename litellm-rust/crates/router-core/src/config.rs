@@ -75,13 +75,17 @@ pub enum RoutingStrategy {
     LatencyBased,
     #[strum(serialize = "cost-based-routing")]
     CostBased,
+    /// `routing_strategy=None` passed explicitly (sent as `"None"`): stored as None, so no
+    /// strategy arm matches and every pick finds no deployment.
+    #[strum(serialize = "None")]
+    Unset,
     #[strum(default, transparent)]
     Other(String),
 }
 
 impl RoutingStrategy {
     pub fn is_native(&self) -> bool {
-        matches!(self, Self::SimpleShuffle)
+        matches!(self, Self::SimpleShuffle | Self::Unset)
     }
 }
 
@@ -232,23 +236,24 @@ pub struct RouterDynamicConfig {
     pub fallback_keys: FallbackKeys,
 }
 
-/// One `model_group_alias` value: a group name, or `{"model": <group>, "hidden": <bool>}`.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum AliasTarget {
-    Group(String),
-    Entry { model: String },
-}
-
+/// `model_group_alias` as `resolve_model_group_alias` reads it: an alias maps to a non-empty
+/// group name, or to `{"model": <non-empty group name>, ...}`; any other value rewrites nothing.
 fn alias_targets<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let aliases = BTreeMap::<String, AliasTarget>::deserialize(deserializer)?;
+    let aliases = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
     Ok(aliases
         .into_iter()
-        .map(|(alias, target)| match target {
-            AliasTarget::Group(group) | AliasTarget::Entry { model: group } => (alias, group),
+        .filter_map(|(alias, target)| {
+            let group = match &target {
+                serde_json::Value::Object(entry) => entry.get("model")?,
+                other => other,
+            };
+            group
+                .as_str()
+                .filter(|group| !group.is_empty())
+                .map(|group| (alias, group.to_owned()))
         })
         .collect())
 }

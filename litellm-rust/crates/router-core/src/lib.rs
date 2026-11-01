@@ -91,6 +91,7 @@ pub mod routing_plugins;
 pub mod select;
 pub mod settings;
 pub mod strategy;
+pub mod weights;
 
 use std::sync::{
     Arc,
@@ -314,11 +315,10 @@ impl Router {
         &self,
         op: &Op,
         request: &RouterRequest,
-    ) -> Result<Vec<Arc<Deployment>>, Error> {
+    ) -> Result<select::Candidates, Error> {
         self.live()?;
         let snapshot = self.core.snapshot.load_full();
-        let candidates = self
-            .core
+        self.core
             .candidates(
                 &snapshot,
                 op,
@@ -326,8 +326,7 @@ impl Router {
                 &request.model,
                 &SelectInputs::default(),
             )
-            .await?;
-        Ok(candidates.healthy)
+            .await
     }
 
     pub fn registry(&self) -> Arc<Registry> {

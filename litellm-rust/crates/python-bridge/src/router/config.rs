@@ -156,7 +156,7 @@ struct RequestSpec {
     specific_deployment: Option<bool>,
     num_retries: Option<u32>,
     disable_fallbacks: Option<bool>,
-    router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
+    router_weights: Option<Value>,
     pinned_deployment_id: Option<String>,
     routing_strategy: Option<String>,
     filter_tags: Option<bool>,

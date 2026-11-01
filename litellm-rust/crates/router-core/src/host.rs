@@ -35,8 +35,9 @@ pub struct RouterRequest {
     /// A per-request `num_retries`, which wins over the router's.
     pub num_retries: Option<u32>,
     pub disable_fallbacks: bool,
-    /// `_router_weights`: model group to deployment id to weight.
-    pub router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
+    /// `_router_weights` as the request passed it: model group to deployment id to weight,
+    /// validated when simple-shuffle picks ([`crate::weights::validate`]).
+    pub router_weights: Option<Value>,
     /// The deployment a call on an existing resource (a video id) names: picked whenever the
     /// filters keep it (`_narrow_to_video_deployment`).
     pub pinned_deployment_id: Option<String>,

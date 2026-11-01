@@ -345,6 +345,8 @@ impl Core {
             // `is_bad_request_without_fallback`: never a fallback without `fallback_on_unsupported_params`.
             Error::UnsupportedParams { .. }
             | Error::RoutingPluginsNeedAsync
+            | Error::InvalidRouterWeights
+            | Error::NonNumericWeight { .. }
             | Error::Config(_)
             | Error::Cache(_)
             | Error::Retired

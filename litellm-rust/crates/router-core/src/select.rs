@@ -80,15 +80,16 @@ pub(crate) struct SelectInputs {
 }
 
 /// `simple_shuffle`: weighted by `_router_weights[group]`, else `weight`, else `rpm`, else
-/// `tpm`, each normalized by its maximum, else uniform.
+/// `tpm`, each normalized by its maximum, else uniform. A metric is read only when every set
+/// before it weighed nothing, and a non-numeric one fails the pick then (`_metric_weight`).
 pub fn simple_shuffle(
     deployments: &[Arc<Deployment>],
     model_group: &str,
     router_weights: Option<&BTreeMap<String, BTreeMap<String, f64>>>,
     rng: &dyn Randomness,
-) -> Option<Arc<Deployment>> {
+) -> Result<Option<Arc<Deployment>>, Error> {
     if deployments.is_empty() {
-        return None;
+        return Ok(None);
     }
     let scoped = router_weights
         .and_then(|weights| weights.get(model_group))
@@ -99,13 +100,15 @@ pub fn simple_shuffle(
                 .map(|d| weights.get(&d.id).copied().unwrap_or(0.0))
                 .collect::<Vec<_>>()
         });
-    let metric_sets = ["weight", "rpm", "tpm"].map(|metric| {
+    let metric_sets = ["weight", "rpm", "tpm"].into_iter().map(|metric| {
         deployments
             .iter()
-            .map(|d| d.metric(metric).unwrap_or(0.0))
-            .collect::<Vec<_>>()
+            .map(|d| d.metric_weight(metric))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Error::NonNumericWeight { metric })
     });
-    for weights in scoped.into_iter().chain(metric_sets) {
+    for weights in scoped.into_iter().map(Ok).chain(metric_sets) {
+        let weights = weights?;
         let largest = weights.iter().copied().fold(0.0, f64::max);
         if largest <= 0.0 {
             continue;
@@ -125,10 +128,10 @@ pub fn simple_shuffle(
                 target < cumulative
             })
             .unwrap_or(deployments.len() - 1);
-        return Some(deployments[index].clone());
+        return Ok(Some(deployments[index].clone()));
     }
     let index = ((rng.next_f64() * deployments.len() as f64) as usize).min(deployments.len() - 1);
-    Some(deployments[index].clone())
+    Ok(Some(deployments[index].clone()))
 }
 
 /// A pre-routing strategy marker (`classify_strategy_router_model`): its model is `auto_router/...`.
@@ -524,13 +527,18 @@ impl Core {
             &candidates.kind,
             &candidates.model_group,
         );
+        if strategy == RoutingStrategy::Unset {
+            return Err(no_deployment());
+        }
         if strategy == RoutingStrategy::SimpleShuffle {
+            let weights = crate::weights::validate(request.router_weights.as_ref())
+                .map_err(|_| Error::InvalidRouterWeights)?;
             return simple_shuffle(
                 &candidates.healthy,
                 &candidates.model_group,
-                request.router_weights.as_ref(),
+                weights.as_ref(),
                 self.rng.as_ref(),
-            )
+            )?
             .ok_or_else(no_deployment);
         }
         let ctx = self.context(
@@ -586,7 +594,9 @@ mod tests {
             deployment("a", json!({"model": "openai/a", "weight": 1, "rpm": 1000})),
             deployment("b", json!({"model": "openai/b", "weight": 3})),
         ];
-        let picked = simple_shuffle(&deployments, "g", None, &Fixed(draw)).unwrap();
+        let picked = simple_shuffle(&deployments, "g", None, &Fixed(draw))
+            .unwrap()
+            .unwrap();
         assert_eq!(picked.id, expected);
     }
 
@@ -597,7 +607,9 @@ mod tests {
             deployment("b", json!({"model": "openai/b"})),
         ];
         let weights = BTreeMap::from([("g".to_owned(), BTreeMap::from([("b".to_owned(), 1.0)]))]);
-        let picked = simple_shuffle(&deployments, "g", Some(&weights), &Fixed(0.99)).unwrap();
+        let picked = simple_shuffle(&deployments, "g", Some(&weights), &Fixed(0.99))
+            .unwrap()
+            .unwrap();
         assert_eq!(picked.id, "b");
     }
 }

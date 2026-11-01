@@ -69,6 +69,12 @@ pub enum Error {
     /// The routing plugins left none of the healthy deployments' models.
     #[error("no deployments left after routing-plugin filtering: {models:?}")]
     RoutingPluginsLeftNothing { models: Vec<String> },
+    /// The request's `_router_weights` failed `validate_router_weights` when simple-shuffle picked.
+    #[error("the request's router weights are invalid")]
+    InvalidRouterWeights,
+    /// A deployment's `litellm_params` `metric` (weight, rpm or tpm) is not a number.
+    #[error("deployment {metric} must be numeric")]
+    NonNumericWeight { metric: &'static str },
     /// A router with routing plugins was asked for a pick on the sync path, which never runs them.
     #[error("routing plugins only run on the async selection path")]
     RoutingPluginsNeedAsync,
@@ -92,6 +98,8 @@ impl Error {
             | Self::ContextWindowExceeded { .. }
             | Self::UnsupportedParams { .. }
             | Self::RoutingPluginsLeftNothing { .. }
+            | Self::InvalidRouterWeights
+            | Self::NonNumericWeight { .. }
             | Self::RoutingPluginsNeedAsync => None,
         }
     }

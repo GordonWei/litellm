@@ -265,6 +265,8 @@ pub(crate) enum Finish {
     },
     /// `healthy`: the deployments a pick would choose among, as served.
     Healthy {
+        /// A deployment named by its id, which the listing returns alone rather than as a list.
+        single: bool,
         deployment_ids: Vec<String>,
         deployments: Vec<Value>,
     },

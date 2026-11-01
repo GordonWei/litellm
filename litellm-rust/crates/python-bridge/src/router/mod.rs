@@ -67,6 +67,10 @@ enum ErrorKind {
     RoutingPluginsLeftNothing,
     #[strum(serialize = "routing_plugins_need_async")]
     RoutingPluginsNeedAsync,
+    #[strum(serialize = "invalid_router_weights")]
+    InvalidRouterWeights,
+    #[strum(serialize = "non_numeric_weight")]
+    NonNumericWeight,
 }
 
 impl From<&Error> for ErrorKind {
@@ -87,6 +91,8 @@ impl From<&Error> for ErrorKind {
             Error::UnsupportedParams { .. } => Self::UnsupportedParams,
             Error::RoutingPluginsLeftNothing { .. } => Self::RoutingPluginsLeftNothing,
             Error::RoutingPluginsNeedAsync => Self::RoutingPluginsNeedAsync,
+            Error::InvalidRouterWeights => Self::InvalidRouterWeights,
+            Error::NonNumericWeight { .. } => Self::NonNumericWeight,
         }
     }
 }
@@ -174,8 +180,12 @@ impl RouterCoreHandle {
             config::request(document(request)?, Some(model)).map_err(config_error_to_pyerr)?;
         let router = self.router.clone();
         Ok(RouterCall::new(async move {
-            let deployments = router.healthy(&Op::Completion, &request).await?;
+            let candidates = router.healthy(&Op::Completion, &request).await?;
+            // A deployment named by its id is listed alone, as a dict (`_core_async_get_healthy_deployments`).
+            let single = candidates.kind == ResolveKind::Id && candidates.healthy.len() == 1;
+            let deployments = candidates.healthy;
             Ok(Finish::Healthy {
+                single,
                 deployment_ids: deployments.iter().map(|d| d.id.clone()).collect(),
                 deployments: deployments
                     .iter()
@@ -770,6 +780,9 @@ fn step_dict(py: Python<'_>, step: Step) -> PyResult<Bound<'_, PyDict>> {
                 Error::RoutingPluginsLeftNothing { models } => {
                     dict.set_item("error_params", PyList::new(dict.py(), models)?)?;
                 }
+                Error::NonNumericWeight { metric } => {
+                    dict.set_item("error_detail", metric)?;
+                }
                 _ => {}
             }
             dict.set_item("attempt_failed", attempt.is_some())?;
@@ -896,9 +909,11 @@ fn done_items(dict: &Bound<'_, PyDict>, finish: Finish) -> PyResult<()> {
         Finish::Reported { cooled } => dict.set_item("cooled", cooled),
         Finish::Counted { key } => dict.set_item("key", key),
         Finish::Healthy {
+            single,
             deployment_ids,
             deployments,
         } => {
+            dict.set_item("single", single)?;
             dict.set_item("deployment_ids", deployment_ids)?;
             let records = deployments
                 .iter()

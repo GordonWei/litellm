@@ -151,6 +151,20 @@ impl Deployment {
         }
     }
 
+    /// `simple_shuffle._metric_weight`: 0 when unset, a number (a bool counts as 0 or 1), or
+    /// `None` when the value is not numeric. A `rpm`/`tpm` spelled as text reads as unset.
+    pub fn metric_weight(&self, key: &str) -> Option<f64> {
+        if key != "weight" {
+            return Some(self.metric(key).unwrap_or(0.0));
+        }
+        match self.raw_params.get(key) {
+            None | Some(Value::Null) => Some(0.0),
+            Some(Value::Bool(flag)) => Some(f64::from(u8::from(*flag))),
+            Some(Value::Number(number)) => number.as_f64(),
+            Some(_) => None,
+        }
+    }
+
     /// `litellm_params.order` (`get_deployment_order`).
     pub fn order(&self) -> Option<i64> {
         self.raw_params.get("order").and_then(Value::as_i64)
@@ -454,7 +468,13 @@ impl Registry {
                 .filter(|d| d.params.model == name)
                 .cloned()
                 .collect();
-            return resolution(ResolveKind::SpecificDeployment, name, matching);
+            // An empty match still resolves: the pick then finds no deployment rather than
+            // falling back to a default (`_common_checks_available_deployment` returns `[]`).
+            return Some(Resolution {
+                kind: ResolveKind::SpecificDeployment,
+                group: name.to_owned(),
+                deployments: matching,
+            });
         }
         if !self.by_group.contains_key(name)
             && let Some(deployment) = self.deployment(name)
