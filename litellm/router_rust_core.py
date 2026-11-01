@@ -23,7 +23,7 @@ import json
 import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias
 
 from pydantic import TypeAdapter
 
@@ -72,7 +72,6 @@ if TYPE_CHECKING:
     from litellm.rust_bridge._native import (  # pyright: ignore[reportPrivateUsage]  # the stub's step shapes
         RouterCall,
         RouterCoreHandle,
-        _AttemptFailed,  # pyright: ignore[reportPrivateUsage]  # the stub's step shape
     )
     from litellm.types.router import CustomRoutingStrategyBase
 
@@ -359,7 +358,7 @@ class Resolved:
             raise RustCoreUnsupported(f"the Rust router core does not serve the setting(s) {', '.join(unserved)} yet")
         updates: Final[dict[str, object]] = {}  # mutable-ok: built here, then applied once
         for name, value in values.items():
-            if name == "model_group_alias" or name == "default_litellm_params":
+            if name in {"model_group_alias", "default_litellm_params"}:
                 updates[name] = MappingProxyType(dict(as_str_mapping(value) or {}))
             elif name in ("num_retries", "max_fallbacks", "allowed_fails"):
                 updates[name] = int(str(value))
@@ -719,8 +718,7 @@ class RustHealth(RouterHealth):
         if failure["status"] is None and str(exception_status).isdigit():
             failure["status"] = int(str(exception_status))
         handle: Final = self._core._handle  # pyright: ignore[reportPrivateUsage]  # see above
-        failed: Final = cast("_AttemptFailed", failure)  # cast-ok: attempt_failure builds that shape
-        call: Final = handle.report_failure(deployment_id, failed)
+        call: Final = handle.report_failure(deployment_id, failure)
         done: Final = self._core._drive_sync_steps(call)  # pyright: ignore[reportPrivateUsage]  # see above
         return bool(done.get("cooled"))
 
@@ -1357,7 +1355,8 @@ class _Driver:
             host: Final = self._core._host  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
             endpoint: Final = host.invoke(_HOST_ENDPOINTS.get(self._op, self._op))
             # Every op the Rust core serves names an async endpoint, so the call returns an awaitable.
-            response: Final[object] = await cast("Awaitable[object]", endpoint(**kwargs))  # cast-ok: see above
+            pending: Final[object] = endpoint(**kwargs)
+            response: Final[object] = await pending if inspect.isawaitable(pending) else pending
         except Exception as error:  # noqa: BLE001  # every attempt failure is classified and handed to the Rust call loop
             return self._failed(step, deployment, error)
         self._last_response = response
@@ -1387,9 +1386,7 @@ class _Driver:
     def finish(self, step: Mapping[str, object]) -> object:
         """The response with the router's headers: the deployment id, the model group it was
         served as, and the retry and fallback counts (``set_response_headers``)."""
-        response: object = prepare_response_for_header_attachment(
-            self._last_response
-        )  # rebind-ok: gains its headers in turn
+        response: object = prepare_response_for_header_attachment(self._last_response)  # rebind-ok: gains headers
         if response is None:
             return self._last_response
         name, kwargs = self._served
