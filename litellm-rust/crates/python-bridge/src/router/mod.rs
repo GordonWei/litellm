@@ -15,7 +15,7 @@ use std::{
 use litellm_error::Report;
 use litellm_host_python::{from_py_argument, json_loads, to_py};
 use litellm_router_core::{
-    AttemptError, Error, FailureKind, Op, Outcome, Router, RouterEvent,
+    AttemptError, Error, FailureKind, FailureReport, Op, Router, RouterEvent,
     health::{UsageMetric, current_minute, usage_key},
     registry::{DeploymentFilter, ResolveScope},
 };
@@ -163,9 +163,20 @@ impl RouterCoreHandle {
         self.router.registry().version()
     }
 
-    /// Record a failure the router did not see itself (a health check, an interceptor), driven
-    /// like `start`: its steps are cache ops, and it ends with `done` (`cooled`).
-    fn report_failure(&self, id: &str, failure: &Bound<'_, PyDict>) -> PyResult<RouterCall> {
+    /// Record a failure the router did not see itself (a health check, an interceptor, a
+    /// logging callback), driven like `start`: its steps are cache ops, and it ends with `done`
+    /// (`cooled`).
+    #[pyo3(signature = (id, failure, deployment_cooldown=false, count_only=false, requested_group=None, cooldown_time=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn report_failure(
+        &self,
+        id: &str,
+        failure: &Bound<'_, PyDict>,
+        deployment_cooldown: bool,
+        count_only: bool,
+        requested_group: Option<String>,
+        cooldown_time: Option<f64>,
+    ) -> PyResult<RouterCall> {
         let failure = match attempt_outcome(failure)? {
             Err(failure) => failure,
             Ok(_) => {
@@ -176,17 +187,43 @@ impl RouterCoreHandle {
         };
         let router = self.router.clone();
         let id = id.to_owned();
+        let report = FailureReport {
+            deployment_cooldown,
+            cooldown_time,
+            count_only,
+            requested_group,
+        };
         Ok(RouterCall::new(async move {
             router
-                .report(&id, Outcome::Failure(failure))
+                .report_failure(&id, &failure, report)
                 .await
                 .map(|cooled| Finish::Reported { cooled })
         }))
     }
 
-    /// This worker's (successes, failures) against a deployment this minute.
-    fn outcomes_this_minute(&self, id: &str) -> (u64, u64) {
-        self.router.health().outcomes_this_minute(id)
+    /// Record a success a logging callback saw, driven like `report_failure`; it ends with
+    /// `done` (`key`: the success counter's key, or None for an unknown deployment).
+    fn report_success(&self, id: &str, total_tokens: f64, requests: f64) -> RouterCall {
+        let router = self.router.clone();
+        let id = id.to_owned();
+        RouterCall::new(async move {
+            router
+                .report_success(&id, total_tokens, requests)
+                .await
+                .map(|key| Finish::Counted { key })
+        })
+    }
+
+    /// Count a success against `id`, configured or not; ends with `done` (`key`).
+    fn count_success(&self, id: &str) -> RouterCall {
+        let router = self.router.clone();
+        let id = id.to_owned();
+        RouterCall::new(async move {
+            router
+                .count_success(&id)
+                .await
+                .map(|key| Finish::Counted { key: Some(key) })
+        })
     }
 
     /// The usage keys of this minute for every deployment of `model_group`:
@@ -550,12 +587,14 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             keys,
             value,
             ttl,
+            local,
         } => {
             dict.set_item("op", <&'static str>::from(op))?;
             dict.set_item("key", key)?;
             dict.set_item("keys", keys.map(|keys| PyList::new(py, keys)).transpose()?)?;
             dict.set_item("value", value.map(|value| to_py(py, &value)).transpose()?)?;
-            dict.set_item("ttl", ttl)
+            dict.set_item("ttl", ttl)?;
+            dict.set_item("local", local)
         }
     }
 }
@@ -578,6 +617,7 @@ fn done_items(dict: &Bound<'_, PyDict>, finish: Finish) -> PyResult<()> {
             dict.set_item("model_group", model_group)
         }
         Finish::Reported { cooled } => dict.set_item("cooled", cooled),
+        Finish::Counted { key } => dict.set_item("key", key),
         Finish::Healthy { deployment_ids } => dict.set_item("deployment_ids", deployment_ids),
     }
 }
@@ -639,7 +679,7 @@ handle = native.RouterCoreHandle(config, {"num_retries": 1})
 picked = drive(handle.select("primary", {}), None)
 assert (picked["kind"], picked["deployment_id"], picked["model_group"]) == ("done", "a1", "primary"), picked
 assert [step["op"] for step in asked] == ["batch_get"]
-assert list(asked[0]) == ["kind", "op", "key", "keys", "value", "ttl", "events"], list(asked[0])
+assert list(asked[0]) == ["kind", "op", "key", "keys", "value", "ttl", "local", "events"], list(asked[0])
 call = handle.start("acompletion", '{"model": "primary"}')
 version = handle.registry_version()
 assert handle.apply({"delete": ["gone"]}) == version + 1

@@ -72,6 +72,7 @@ from litellm.router_rust_fallbacks import (
     rejected_fallback_target,
     validate_fallbacks,
 )
+from litellm.router_rust_health import RustHealthCallbacks, failure_status
 from litellm.router_rust_retries import RustRetries, refuse_unserved_retry_policies, resolved_retry_policy
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
@@ -530,7 +531,7 @@ def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
     """The request fields the Rust core routes on."""
     fields: Final = {
         key: request[key]
-        for key in ("specific_deployment", "num_retries", "disable_fallbacks")
+        for key in ("specific_deployment", "num_retries", "disable_fallbacks", "cooldown_time")
         if request.get(key) is not None
     }
     group_policies: Final = request.get("model_group_retry_policy")
@@ -754,14 +755,13 @@ class RustHealth(RouterHealth):
         return self._core._cooldowns  # pyright: ignore[reportPrivateUsage]  # see above
 
     def failures_this_minute(self, deployment_id: str) -> int:
-        return int(self._core._handle.outcomes_this_minute(deployment_id)[1])  # pyright: ignore[reportPrivateUsage]  # see above
+        count: Final[object] = self.store.get_cache(f"{deployment_id}:fails", local_only=True)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # DualCache's reads are untyped
+        return int(count) if isinstance(count, int | float) else 0
 
     def record_failure(self, deployment_id: str, exception: Exception, exception_status: str | int) -> bool:
-        failure: Final = dict(attempt_failure(exception))
-        if failure["status"] is None and str(exception_status).isdigit():
-            failure["status"] = int(str(exception_status))
+        failure: Final = {**attempt_failure(exception), "status": failure_status(exception_status)}
         handle: Final = self._core._handle  # pyright: ignore[reportPrivateUsage]  # see above
-        call: Final = handle.report_failure(deployment_id, failure)
+        call: Final = handle.report_failure(deployment_id, failure, count_only=exception_status == "")
         done: Final = self._core._drive_sync_steps(call)  # pyright: ignore[reportPrivateUsage]  # see above
         return bool(done.get("cooled"))
 
@@ -820,7 +820,7 @@ def _limit(params: Sequence[Mapping[str, object]], key: str) -> int | None:
 _EndpointImpl: TypeAlias = Callable[..., Awaitable[object]]
 
 
-class RustCore(_SettingsSource, RustRetries, RustFallbacks):
+class RustCore(_SettingsSource, RustRetries, RustFallbacks, RustHealthCallbacks):
     """A ``RouterCore`` served by the Rust router core over a ``PythonHost``. It holds no Python core."""
 
     def __init__(self, config: RouterConfig, host: PythonHost, resolved: Resolved) -> None:
@@ -1222,6 +1222,21 @@ class RustCore(_SettingsSource, RustRetries, RustFallbacks):
                 case other:
                     raise RuntimeError(f"router-core asked for {other!r} while recording an outcome")
 
+    async def _drive_cache_steps(self, call: "RouterCall") -> Mapping[str, object]:
+        """``_drive_sync_steps`` answered through the async cache (``report_success``)."""
+        outcome: object = None  # rebind-ok: the answer to the last step
+        while True:
+            step = _STEP.validate_python(call.next(outcome))  # pyright: ignore[reportArgumentType]  # see _drive
+            match step["kind"]:
+                case "cache":
+                    outcome = await self._answer_cache(step)
+                case "done":
+                    return step
+                case "failed":
+                    raise RuntimeError(f"router-core ({step.get('error_kind')}): {step.get('error')}")
+                case other:
+                    raise RuntimeError(f"router-core asked for {other!r} while recording an outcome")
+
     # -- cache steps -----------------------------------------------------------------------------
 
     def _store_for(self, key: str) -> "DualCache":
@@ -1235,9 +1250,10 @@ class RustCore(_SettingsSource, RustRetries, RustFallbacks):
     async def _answer_cache_in_target(self, step: Mapping[str, object]) -> object:
         key: Final = str(step.get("key"))
         ttl: Final = _ttl(step)
+        local: Final = step.get("local") is True
         match step.get("op"):
             case "get":
-                return _plain(await self._store_for(key).async_get_cache(key))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
+                return _plain(await self._store_for(key).async_get_cache(key, local_only=local))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
             case "batch_get":
                 return _plain(
                     [await self._store_for(str(k)).async_get_cache(str(k)) for k in _as_list(step.get("keys"))]  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # see above
@@ -1253,9 +1269,9 @@ class RustCore(_SettingsSource, RustRetries, RustFallbacks):
                 by: Final = _amount(step.get("value"))
                 counter: Final = self._store_for(key)
                 total: Final = (
-                    await counter.async_increment_cache(key, by)  # pyright: ignore[reportUnknownMemberType]  # see above
+                    await counter.async_increment_cache(key, by, local_only=local)  # pyright: ignore[reportUnknownMemberType]  # see above
                     if ttl is None
-                    else await counter.async_increment_cache(key, by, ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # see above
+                    else await counter.async_increment_cache(key, by, local_only=local, ttl=ttl)  # pyright: ignore[reportUnknownMemberType]  # see above
                 )
                 return by if total is None else total
             case "delete":
@@ -1271,9 +1287,10 @@ class RustCore(_SettingsSource, RustRetries, RustFallbacks):
     def _answer_cache_sync_in_target(self, step: Mapping[str, object]) -> object:
         key: Final = str(step.get("key"))
         ttl: Final = _ttl(step)
+        local: Final = step.get("local") is True
         match step.get("op"):
             case "get":
-                return _plain(self._store_for(key).get_cache(key))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
+                return _plain(self._store_for(key).get_cache(key, local_only=local))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # DualCache's reads are untyped
             case "batch_get":
                 return _plain([self._store_for(str(k)).get_cache(str(k)) for k in _as_list(step.get("keys"))])  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # see above
             case "set":
@@ -1288,9 +1305,9 @@ class RustCore(_SettingsSource, RustRetries, RustFallbacks):
                 counter: Final = self._store_for(key)
                 # DualCache.increment_cache is annotated int but adds floats as given.
                 return (
-                    counter.increment_cache(key, by)  # pyright: ignore[reportUnknownMemberType, reportArgumentType]  # see above
+                    counter.increment_cache(key, by, local_only=local)  # pyright: ignore[reportUnknownMemberType, reportArgumentType]  # see above
                     if ttl is None
-                    else counter.increment_cache(key, by, ttl=ttl)  # pyright: ignore[reportUnknownMemberType, reportArgumentType]  # see above
+                    else counter.increment_cache(key, by, local_only=local, ttl=ttl)  # pyright: ignore[reportUnknownMemberType, reportArgumentType]  # see above
                 )
             case "delete":
                 self._store_for(key).delete_cache(key)  # pyright: ignore[reportUnknownMemberType]  # DualCache's delete is untyped

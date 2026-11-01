@@ -143,6 +143,8 @@ pub(crate) enum Ask {
         keys: Option<Vec<String>>,
         value: Option<Value>,
         ttl: Option<f64>,
+        /// The op reads or writes this worker's in-memory tier only (`local_only=True`).
+        local: bool,
     },
 }
 
@@ -224,6 +226,8 @@ pub(crate) enum Finish {
     Healthy { deployment_ids: Vec<String> },
     /// `report_failure`: whether the deployment was cooled down.
     Reported { cooled: bool },
+    /// `report_success` / `count_success`: the success counter's key, if one was counted.
+    Counted { key: Option<String> },
 }
 
 /// One step of a call: what it is blocked on, or how it ended.
@@ -348,12 +352,24 @@ async fn cache_step(
     value: Option<Value>,
     ttl: Option<Duration>,
 ) -> CacheOutcome {
+    ask_cache(op, key, keys, value, ttl, false).await
+}
+
+async fn ask_cache(
+    op: CacheOp,
+    key: Option<&str>,
+    keys: Option<&[String]>,
+    value: Option<Value>,
+    ttl: Option<Duration>,
+    local: bool,
+) -> CacheOutcome {
     let question = Ask::Cache {
         op,
         key: key.map(str::to_owned),
         keys: keys.map(<[String]>::to_vec),
         value,
         ttl: ttl_seconds(ttl),
+        local,
     };
     let Answer::Cache(outcome) = ask(question).await else {
         unreachable!("{CHECKED}");
@@ -412,6 +428,30 @@ impl RouterCache for StepCache {
     async fn async_delete_cache(&self, key: &str) -> Result<(), litellm_cache::Error> {
         cache_step(CacheOp::Delete, Some(key), None, None, None).await;
         Ok(())
+    }
+
+    async fn async_get_local(&self, key: &str) -> Result<Option<Value>, litellm_cache::Error> {
+        let CacheOutcome::Value(value) =
+            ask_cache(CacheOp::Get, Some(key), None, None, None, true).await
+        else {
+            unreachable!("{CHECKED}");
+        };
+        Ok(value)
+    }
+
+    async fn async_increment_local(
+        &self,
+        key: &str,
+        amount: f64,
+        ttl: Option<Duration>,
+    ) -> Result<f64, litellm_cache::Error> {
+        let value = Some(amount_value(amount));
+        let CacheOutcome::Number(next) =
+            ask_cache(CacheOp::Increment, Some(key), None, value, ttl, true).await
+        else {
+            unreachable!("{CHECKED}");
+        };
+        Ok(next)
     }
 }
 
@@ -747,6 +787,7 @@ mod tests {
             keys: Some(keys),
             value: None,
             ttl: None,
+            local: false,
         }) = step
         else {
             panic!("the call should read cooldowns first, got {step:?}");

@@ -175,6 +175,7 @@ struct RequestSpec {
     content_policy_fallbacks: Option<Option<Fallbacks>>,
     max_fallbacks: Option<u32>,
     mock_failure: Option<MockFailure>,
+    cooldown_time: Option<f64>,
     body: Option<Value>,
 }
 
@@ -208,6 +209,7 @@ pub(crate) fn request(value: Value, model: Option<&str>) -> Result<RouterRequest
         content_policy_fallbacks: spec.content_policy_fallbacks,
         max_fallbacks: spec.max_fallbacks,
         mock_failure: spec.mock_failure,
+        cooldown_time: spec.cooldown_time,
         payload: None,
     })
 }

@@ -617,7 +617,7 @@ impl Core {
                 })
             }
             Err(failure) => {
-                self.record_failure(snapshot, &candidates, &deployment, &failure)
+                self.record_failure(snapshot, request, &candidates, &deployment, &failure)
                     .await;
                 Err(Failed {
                     error: Error::Attempt(failure),
@@ -630,6 +630,7 @@ impl Core {
     async fn record_failure(
         &self,
         snapshot: &Snapshot,
+        request: &RouterRequest,
         candidates: &Candidates,
         deployment: &crate::registry::Deployment,
         failure: &AttemptError,
@@ -651,9 +652,18 @@ impl Core {
                 .fallback_targets(&[candidates.model_group.as_str()])
                 .is_some(),
         };
+        if let Err(error) = self.health.count_failed_request(deployment).await {
+            warn!(deployment_id = %deployment.id, error = %error, "usage was not recorded");
+        }
         match self
             .health
-            .record_failure(&snapshot.settings, deployment, shape, failure)
+            .record_failure(
+                &snapshot.settings,
+                deployment,
+                shape,
+                request.cooldown_time,
+                failure,
+            )
             .await
         {
             Ok(Some(cooldown)) => self.host.observe(&RouterEvent::CooldownSet {

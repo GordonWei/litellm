@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::{
-    cache::{InMemoryRouterCache, RouterCache},
+    cache::RouterCache,
     error::{AttemptError, Error, FailureKind},
     registry::Deployment,
     settings::Settings,
@@ -158,17 +158,12 @@ pub enum Outcome {
 #[derive(Clone)]
 pub struct Health {
     cache: Arc<dyn RouterCache>,
-    local: InMemoryRouterCache,
     clock: Arc<dyn Clock>,
 }
 
 impl Health {
     pub fn new(cache: Arc<dyn RouterCache>, clock: Arc<dyn Clock>) -> Self {
-        Self {
-            cache,
-            local: InMemoryRouterCache::default(),
-            clock,
-        }
+        Self { cache, clock }
     }
 
     pub fn cache(&self) -> &Arc<dyn RouterCache> {
@@ -217,19 +212,39 @@ impl Health {
         Ok(())
     }
 
-    fn local_count(&self, key: &str) -> u64 {
-        self.local
-            .get(key)
+    async fn local_count(&self, key: &str) -> Result<u64, Error> {
+        Ok(self
+            .cache
+            .async_get_local(key)
+            .await?
             .and_then(|value| value.as_f64())
-            .map_or(0, |count| count as u64)
+            .map_or(0, |count| count as u64))
     }
 
-    /// The per-minute (successes, fails) this worker saw.
-    pub fn outcomes_this_minute(&self, id: &str) -> (u64, u64) {
-        (
-            self.local_count(&format!("{id}:successes")),
-            self.local_count(&format!("{id}:fails")),
-        )
+    /// The per-minute (successes, fails) this worker saw (`{id}:successes`, `{id}:fails`, kept
+    /// `local_only`).
+    pub async fn outcomes_this_minute(&self, id: &str) -> Result<(u64, u64), Error> {
+        Ok((
+            self.local_count(&format!("{id}:successes")).await?,
+            self.local_count(&format!("{id}:fails")).await?,
+        ))
+    }
+
+    /// `increment_deployment_successes_for_current_minute`: returns the key it counted under.
+    pub async fn count_success(&self, id: &str) -> Result<String, Error> {
+        let key = format!("{id}:successes");
+        self.cache
+            .async_increment_local(&key, 1.0, Some(USAGE_TTL))
+            .await?;
+        Ok(key)
+    }
+
+    /// `increment_deployment_failures_for_current_minute`.
+    pub async fn count_failure(&self, id: &str) -> Result<(), Error> {
+        self.cache
+            .async_increment_local(&format!("{id}:fails"), 1.0, Some(USAGE_TTL))
+            .await?;
+        Ok(())
     }
 
     /// Cooldown duration precedence from `deployment_callback_on_failure`: the deployment's
@@ -239,7 +254,30 @@ impl Health {
         deployment: &Deployment,
         failure: &AttemptError,
     ) -> Duration {
-        Self::configured_cooldown(deployment)
+        Self::cooldown_for_call(settings, deployment, None, failure)
+    }
+
+    /// `cooldown_duration` for a call whose own params carry `cooldown_time` (a request's
+    /// value wins over the deployment's `litellm_params`, not over its `model_info`).
+    pub fn cooldown_for_call(
+        settings: &Settings,
+        deployment: &Deployment,
+        call_cooldown: Option<f64>,
+        failure: &AttemptError,
+    ) -> Duration {
+        let configured = deployment
+            .model_info
+            .cooldown_time
+            .or(call_cooldown)
+            .or_else(|| {
+                deployment
+                    .raw_params
+                    .get("cooldown_time")
+                    .and_then(|v| v.as_f64())
+            })
+            .filter(|seconds| *seconds >= 0.0)
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
+        configured
             .or(failure.retry_after)
             .unwrap_or(settings.cooldown_time)
     }
@@ -268,11 +306,25 @@ impl Health {
         settings: &Settings,
         deployment: &Deployment,
         shape: GroupShape,
+        call_cooldown: Option<f64>,
         failure: &AttemptError,
     ) -> Result<Option<Duration>, Error> {
-        let cooldown = Self::cooldown_duration(settings, deployment, failure);
-        self.local
-            .increment(&format!("{}:fails", deployment.id), 1.0, Some(USAGE_TTL));
+        self.count_failure(&deployment.id).await?;
+        let cooldown = Self::cooldown_for_call(settings, deployment, call_cooldown, failure);
+        self.cool_down_after(settings, deployment, shape, failure, cooldown)
+            .await
+    }
+
+    /// `set_cooldown_deployments` for a failure already counted: cool the deployment down for
+    /// `cooldown` when the rules say so. Returns the cooldown applied, if any.
+    pub async fn cool_down_after(
+        &self,
+        settings: &Settings,
+        deployment: &Deployment,
+        shape: GroupShape,
+        failure: &AttemptError,
+        cooldown: Duration,
+    ) -> Result<Option<Duration>, Error> {
         if !Self::should_run_cooldown_logic(settings, deployment, failure, cooldown) {
             return Ok(None);
         }
@@ -331,7 +383,7 @@ impl Health {
                 .await;
         }
         if settings.allowed_fails_policy.is_none() && settings.allowed_fails.is_none() {
-            let (successes, fails) = self.outcomes_this_minute(&deployment.id);
+            let (successes, fails) = self.outcomes_this_minute(&deployment.id).await?;
             let total = successes + fails;
             let percent_fails = if total > 0 {
                 fails as f64 / total as f64
@@ -375,12 +427,19 @@ impl Health {
         deployment: &Deployment,
         total_tokens: u64,
     ) -> Result<(), Error> {
-        self.local.increment(
-            &format!("{}:successes", deployment.id),
-            1.0,
-            Some(USAGE_TTL),
-        );
-        if !deployment.tracks_usage() {
+        self.count_success(&deployment.id).await?;
+        self.add_usage(deployment, total_tokens as f64, 1.0).await
+    }
+
+    /// `_increment_deployment_usage`: tokens and requests against a deployment that tracks
+    /// usage, unless there is nothing to add.
+    pub async fn add_usage(
+        &self,
+        deployment: &Deployment,
+        total_tokens: f64,
+        requests: f64,
+    ) -> Result<(), Error> {
+        if (total_tokens <= 0.0 && requests <= 0.0) || !deployment.tracks_usage() {
             return Ok(());
         }
         let minute = current_minute(self.clock.now());
@@ -388,13 +447,32 @@ impl Health {
         self.cache
             .async_increment(
                 &usage_key(&deployment.id, model, UsageMetric::Tpm, &minute),
-                total_tokens as f64,
+                total_tokens,
                 Some(USAGE_TTL),
             )
             .await?;
         self.cache
             .async_increment(
                 &usage_key(&deployment.id, model, UsageMetric::Rpm, &minute),
+                requests,
+                Some(USAGE_TTL),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `async_deployment_callback_on_failure`: a failed request counts against the
+    /// deployment's per-minute requests, whether or not it tracks usage.
+    pub async fn count_failed_request(&self, deployment: &Deployment) -> Result<(), Error> {
+        let minute = current_minute(self.clock.now());
+        self.cache
+            .async_increment(
+                &usage_key(
+                    &deployment.id,
+                    &deployment.params.model,
+                    UsageMetric::Rpm,
+                    &minute,
+                ),
                 1.0,
                 Some(USAGE_TTL),
             )
