@@ -74,6 +74,7 @@ from litellm.router_rust_fallbacks import (
 )
 from litellm.router_rust_health import RustHealthCallbacks, failure_status
 from litellm.router_rust_retries import RustRetries, refuse_unserved_retry_policies, resolved_retry_policy
+from litellm.router_rust_walk import WalkMetadata
 from litellm.router_utils.cooldown_cache import ROUTER_COOLDOWNS_TARGET
 from litellm.router_utils.routing_read_batch import ROUTER_USAGE_TARGET
 from litellm.types.router import Deployment, RouterErrors, RouterRateLimitError
@@ -1387,6 +1388,25 @@ class _Driver:
         self._last_error: BaseException | None = None
         self._level_errors: Final[dict[int, BaseException]] = {}  # mutable-ok: filled as the call runs
         self._served: tuple[str | None, Mapping[str, object]] = (None, MappingProxyType({}))
+        self._walk: Final = WalkMetadata(request, metadata_field(op), self._params_base_model)
+
+    def _params_base_model(self, deployment_id: str) -> str | None:
+        """``_deployment_params_base_model``: the ``base_model`` under the deployment's ``litellm_params``."""
+        record: Final = as_str_mapping(self._core._handle.deployment(deployment_id)) or {}  # pyright: ignore[reportPrivateUsage]  # the driver serves its own core
+        base_model: Final = (as_str_mapping(record.get("litellm_params")) or {}).get("base_model")
+        return base_model if isinstance(base_model, str) else None
+
+    def _logged_error(self, event: Mapping[str, object]) -> BaseException | None:
+        """The error a ``retry_logged`` event records."""
+        match event.get("cause"):
+            case "level":
+                level: Final = event.get("level")
+                return self._level_errors.get(level if isinstance(level, int) else 0, self._last_error)
+            case "no_deployment":
+                kind: Final = "unknown_model" if event.get("unknown") else "no_healthy_deployments"
+                return self._core._failure_error({"error_kind": kind}, str(event.get("failed_model")), None)  # pyright: ignore[reportPrivateUsage]  # see above
+            case _:
+                return self._last_error
 
     def take_events(self, events: object) -> None:
         for raw_event in _as_list(events):
@@ -1417,6 +1437,12 @@ class _Driver:
                     {"error_kind": kind}, str(event.get("model")), None
                 )
                 continue
+            if event.get("kind") == "fallback":
+                self._walk.hop(event)
+                continue
+            if event.get("kind") == "retry_logged":
+                self._walk.log_retry(event, self._logged_error(event))
+                continue
             if event.get("kind") != "retries_exhausted":
                 continue
             error: BaseException | None = self._last_error
@@ -1432,7 +1458,7 @@ class _Driver:
         resolved: Final = self._core._resolved  # pyright: ignore[reportPrivateUsage]  # see above
         group: Final = str(step["model_group"])
         params: Final = as_str_mapping(step.get("params"))
-        kwargs: Final = attempt_kwargs(
+        built: Final = attempt_kwargs(
             self._op,
             self._request if params is None else {**self._request, **params},
             deployment,
@@ -1440,6 +1466,7 @@ class _Driver:
             default_litellm_params=resolved.default_litellm_params,
             timeout=resolved.timeout,
         )
+        kwargs: Final = self._walk.stamp(step, built)
         self._served = (requested, kwargs)
         return deployment, kwargs
 

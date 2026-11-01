@@ -121,7 +121,11 @@ pub(crate) enum Ask {
         fallback_level: u32,
         timeout: Option<f64>,
         /// Request params the fallback walk's dict targets merged in.
-        params: Option<Value>,
+        params: Option<Box<Value>>,
+        /// The walk level whose request metadata the attempt carries.
+        scope: u32,
+        max_retries: u32,
+        model_group_size: usize,
     },
     Sleep {
         seconds: f64,
@@ -486,7 +490,10 @@ impl Host for StepHost {
             params: attempt
                 .params
                 .as_ref()
-                .map(|params| Value::Object(Map::clone(params))),
+                .map(|params| Box::new(Value::Object(Map::clone(params)))),
+            scope: attempt.scope,
+            max_retries: attempt.max_retries,
+            model_group_size: attempt.model_group_size,
         };
         let Answer::Attempt(result) = ask(question).await else {
             unreachable!("{CHECKED}");
@@ -550,6 +557,7 @@ impl Host for StepHost {
                 | RouterEvent::Fallback { .. }
                 | RouterEvent::LevelFailed { .. }
                 | RouterEvent::MockFailed { .. }
+                | RouterEvent::RetryLogged { .. }
         ) {
             return;
         }

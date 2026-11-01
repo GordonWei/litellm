@@ -99,7 +99,9 @@ pub use crate::{
     config::{Op, RouterConfig, RouterDynamicConfig, RoutingStrategy},
     error::{AttemptError, ConfigError, Error, FailureKind, Payload, Unsupported},
     health::{Clock, Health, Outcome, SystemClock},
-    host::{Attempt, Host, Output, RouterEvent, RouterRequest, RoutingContext, SelectStage},
+    host::{
+        Attempt, Host, Output, RetryCause, RouterEvent, RouterRequest, RoutingContext, SelectStage,
+    },
     registry::{ChangeSet, Deployment, DeploymentSpec, Registry, RegistryVersion},
     select::{Randomness, SeededRandomness, ThreadRandomness},
     settings::Settings,

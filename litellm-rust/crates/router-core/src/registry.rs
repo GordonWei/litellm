@@ -370,6 +370,29 @@ impl Registry {
         self.by_group.get(name).map(|indices| self.at(indices))
     }
 
+    /// How many rows `_core_get_model_list(model_name=name)` lists: the group's deployments,
+    /// an alias's target group, a routing group's members, and only when none of those, the
+    /// deployments of the wildcard the name matches.
+    pub fn model_list_len(&self, name: &str) -> usize {
+        let count = |group: &str| self.by_group.get(group).map_or(0, Vec::len);
+        let listed = count(name)
+            + self.aliases.get(name).map_or(0, |target| count(target))
+            + self
+                .routing_groups
+                .iter()
+                .find(|group| group.group_name == name)
+                .map_or(0, |group| {
+                    group.models.iter().map(|model| count(model)).sum()
+                });
+        if listed > 0 {
+            return listed;
+        }
+        self.wildcards
+            .iter()
+            .find(|(pattern, _)| wildcard_matches(pattern, name))
+            .map_or(0, |(_, indices)| indices.len())
+    }
+
     /// The routing group a model group belongs to, if any.
     pub fn routing_group_of(&self, model_name: &str) -> Option<&RoutingGroupSpec> {
         self.routing_groups

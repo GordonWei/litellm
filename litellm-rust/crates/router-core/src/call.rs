@@ -16,7 +16,7 @@ use crate::{
     error::{AttemptError, ConfigError, Error, FailureKind, Unsupported},
     fallback::{FallbackKeys, FallbackTarget, Fallbacks},
     health::{GroupShape, should_retry_status},
-    host::{Attempt, Output, RouterEvent, RouterRequest},
+    host::{Attempt, Output, RetryCause, RouterEvent, RouterRequest},
     mock::MockFailure,
     registry::ResolveKind,
     retry::{RetryContext, resolve_retry_policy, should_retry},
@@ -58,11 +58,20 @@ impl From<Error> for Failed {
 }
 
 /// Where a level of the fallback walk sits: `depth` is `run_async_fallback`'s counter, one more
-/// for every target tried, and `level` how many fallbacks deep the walk is.
+/// for every target tried, `level` how many fallbacks deep the walk is, and `scope` the level's
+/// own copy of the request metadata (every hop copies its parent's).
 #[derive(Clone, Copy, Debug, Default)]
 struct Hop {
     depth: u32,
     level: u32,
+    scope: u32,
+}
+
+/// What the whole walk shares: the attempts made (`attempted_targets`) and the scopes handed out.
+#[derive(Debug, Default)]
+struct Walk {
+    attempted: Vec<Tried>,
+    scopes: u32,
 }
 
 /// What one level of the walk serves: a group, or the same group at a later `order`, with the
@@ -131,21 +140,14 @@ impl Core {
         request: Arc<RouterRequest>,
     ) -> Result<RouterResponse, Error> {
         let snapshot = self.snapshot.load_full();
-        let mut attempted = Vec::new();
+        let mut walk = Walk::default();
         let target = Target {
             group: request.model.clone(),
             order: None,
             params: None,
         };
-        self.with_fallbacks(
-            &snapshot,
-            &op,
-            &request,
-            target,
-            Hop::default(),
-            &mut attempted,
-        )
-        .await
+        self.with_fallbacks(&snapshot, &op, &request, target, Hop::default(), &mut walk)
+            .await
     }
 
     /// One level of `async_function_with_fallbacks`: the target's retry loop, then its
@@ -157,7 +159,7 @@ impl Core {
         request: &'a Arc<RouterRequest>,
         target: Target,
         at: Hop,
-        attempted: &'a mut Vec<Tried>,
+        walk: &'a mut Walk,
     ) -> BoxFuture<'a, Result<RouterResponse, Error>> {
         Box::pin(async move {
             let mock = request
@@ -189,8 +191,8 @@ impl Core {
                 return Err(error);
             }
             let failed = Tried::Target(FallbackTarget::Name(target.group.clone()));
-            if !attempted.contains(&failed) {
-                attempted.push(failed);
+            if !walk.attempted.contains(&failed) {
+                walk.attempted.push(failed);
             }
             let mut params = target.params.clone();
             let mut hop = at.depth;
@@ -213,10 +215,10 @@ impl Core {
                         (Tried::Target(fallback.identity()), group, None)
                     }
                 };
-                if attempted.contains(&tried) {
+                if walk.attempted.contains(&tried) {
                     continue;
                 }
-                attempted.push(tried);
+                walk.attempted.push(tried);
                 if let Next::Fallback(fallback) = &next
                     && let Some(merged) = fallback.params()
                 {
@@ -225,12 +227,23 @@ impl Core {
                     params = Some(Arc::new(combined));
                 }
                 hop += 1;
+                self.host.observe(&RouterEvent::RetryLogged {
+                    scope: at.scope,
+                    level: at.level,
+                    model: target.group.clone(),
+                    attempted_retries: None,
+                    cause: RetryCause::Level,
+                });
+                walk.scopes += 1;
                 self.host.observe(&RouterEvent::Fallback {
                     from: target.group.clone(),
                     to: group.clone(),
                     order,
                     depth: hop,
                     level: at.level + 1,
+                    scope: walk.scopes,
+                    parent: at.scope,
+                    max_fallbacks,
                 });
                 let next = Target {
                     group,
@@ -240,9 +253,10 @@ impl Core {
                 let at = Hop {
                     depth: hop,
                     level: at.level + 1,
+                    scope: walk.scopes,
                 };
                 if let Ok(mut response) = self
-                    .with_fallbacks(snapshot, op, request, next, at, attempted)
+                    .with_fallbacks(snapshot, op, request, next, at, walk)
                     .await
                 {
                     response.attempted_fallbacks = hop;
@@ -356,6 +370,8 @@ impl Core {
             count_only: true,
             ..SelectInputs::default()
         };
+        let settings = &snapshot.settings;
+        let first_budget = request.num_retries.unwrap_or(settings.num_retries);
         let first = match request.mock_failure {
             Some(MockFailure::RateLimit) => {
                 // `_handle_mock_testing_rate_limit_error`: a lone deployment's `num_retries`
@@ -371,8 +387,16 @@ impl Core {
                     .into())
             }
             _ => {
-                self.attempt(snapshot, op, request, target, &inputs, 0, at)
-                    .await
+                self.attempt(
+                    snapshot,
+                    op,
+                    request,
+                    target,
+                    &inputs,
+                    (0, first_budget),
+                    at,
+                )
+                .await
             }
         };
         let mut failed = match first {
@@ -385,7 +409,6 @@ impl Core {
         if failure.kind == FailureKind::GuardrailIntervention {
             return Err(failed.error);
         }
-        let settings = &snapshot.settings;
         let mut num_retries = request
             .num_retries
             .or(failure.num_retries)
@@ -416,6 +439,9 @@ impl Core {
             .unwrap_or(0);
 
         for retry in 0..=num_retries {
+            if retry > 0 {
+                self.log_retry(target, at, retry, &failed.error);
+            }
             let healthy = self
                 .candidates(snapshot, op, request, &target.group, &counting)
                 .await
@@ -436,6 +462,9 @@ impl Core {
             }
             if num_retries == 0 {
                 return Err(failed.error);
+            }
+            if retry == 0 {
+                self.log_retry(target, at, 0, &failed.error);
             }
             if let (Some(status), Some(id)) = (
                 failure.and_then(|failure| failure.status),
@@ -468,7 +497,15 @@ impl Core {
                 delay,
             });
             match self
-                .attempt(snapshot, op, request, target, &inputs, retry + 1, at)
+                .attempt(
+                    snapshot,
+                    op,
+                    request,
+                    target,
+                    &inputs,
+                    (retry + 1, num_retries),
+                    at,
+                )
                 .await
             {
                 Ok(mut response) => {
@@ -479,6 +516,26 @@ impl Core {
             }
         }
         Err(failed.error)
+    }
+
+    /// `_core_log_retry` for a failure in the level's retry loop.
+    fn log_retry(&self, target: &Target, at: Hop, retry: u32, error: &Error) {
+        let cause = match error {
+            Error::NoHealthyDeployments { model } | Error::UnknownModel { model } => {
+                RetryCause::NoDeployment {
+                    model: model.clone(),
+                    unknown: matches!(error, Error::UnknownModel { .. }),
+                }
+            }
+            _ => RetryCause::Attempt,
+        };
+        self.host.observe(&RouterEvent::RetryLogged {
+            scope: at.scope,
+            level: at.level,
+            model: target.group.clone(),
+            attempted_retries: Some(retry),
+            cause,
+        });
     }
 
     /// A `mock_testing_*` failure for the level's group, reported to the host, which raises
@@ -556,7 +613,7 @@ impl Core {
         request: &Arc<RouterRequest>,
         target: &Target,
         inputs: &SelectInputs,
-        retry: u32,
+        (retry, max_retries): (u32, u32),
         at: Hop,
     ) -> Result<RouterResponse, Failed> {
         let candidates = self
@@ -593,6 +650,9 @@ impl Core {
             fallback_level: at.level,
             timeout: snapshot.settings.timeout,
             params: target.params.clone(),
+            scope: at.scope,
+            max_retries,
+            model_group_size: snapshot.registry.model_list_len(&target.group),
         };
         // Every attempt runs through the host; the core records every outcome itself.
         match self.host.invoke(&attempt).await {

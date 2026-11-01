@@ -15,7 +15,7 @@ use std::{
 use litellm_error::Report;
 use litellm_host_python::{from_py_argument, json_loads, to_py};
 use litellm_router_core::{
-    AttemptError, Error, FailureKind, FailureReport, Op, Router, RouterEvent,
+    AttemptError, Error, FailureKind, FailureReport, Op, RetryCause, Router, RouterEvent,
     health::{UsageMetric, current_minute, usage_key},
     registry::{DeploymentFilter, ResolveScope},
 };
@@ -476,12 +476,46 @@ fn events_list(py: Python<'_>, events: Vec<RouterEvent>) -> PyResult<Bound<'_, P
                 dict.set_item("max", max)?;
             }
             RouterEvent::Fallback {
-                to, order, level, ..
+                from,
+                to,
+                order,
+                depth,
+                level,
+                scope,
+                parent,
+                max_fallbacks,
             } => {
                 dict.set_item("kind", "fallback")?;
+                dict.set_item("from", from)?;
                 dict.set_item("to", to)?;
                 dict.set_item("order", order)?;
+                dict.set_item("depth", depth)?;
                 dict.set_item("level", level)?;
+                dict.set_item("scope", scope)?;
+                dict.set_item("parent", parent)?;
+                dict.set_item("max_fallbacks", max_fallbacks)?;
+            }
+            RouterEvent::RetryLogged {
+                scope,
+                level,
+                model,
+                attempted_retries,
+                cause,
+            } => {
+                dict.set_item("kind", "retry_logged")?;
+                dict.set_item("scope", scope)?;
+                dict.set_item("level", level)?;
+                dict.set_item("model", model)?;
+                dict.set_item("attempted_retries", attempted_retries)?;
+                match cause {
+                    RetryCause::Attempt => dict.set_item("cause", "attempt")?,
+                    RetryCause::Level => dict.set_item("cause", "level")?,
+                    RetryCause::NoDeployment { model, unknown } => {
+                        dict.set_item("cause", "no_deployment")?;
+                        dict.set_item("failed_model", model)?;
+                        dict.set_item("unknown", unknown)?;
+                    }
+                }
             }
             RouterEvent::LevelFailed {
                 level,
@@ -552,7 +586,13 @@ fn ask_items(py: Python<'_>, dict: &Bound<'_, PyDict>, ask: Ask) -> PyResult<()>
             fallback_level,
             timeout,
             params,
+            scope,
+            max_retries,
+            model_group_size,
         } => {
+            dict.set_item("scope", scope)?;
+            dict.set_item("max_retries", max_retries)?;
+            dict.set_item("model_group_size", model_group_size)?;
             dict.set_item("deployment_id", deployment_id)?;
             dict.set_item("deployment", to_py(py, &deployment)?)?;
             dict.set_item("model", model)?;

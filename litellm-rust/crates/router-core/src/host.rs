@@ -74,6 +74,12 @@ pub struct Attempt {
     pub timeout: Option<Duration>,
     /// Request params the fallback walk's dict targets merged in (`kwargs.update(target)`).
     pub params: Option<Arc<Map<String, Value>>>,
+    /// The walk level whose request metadata this attempt carries (see [`RouterEvent::Fallback`]).
+    pub scope: u32,
+    /// The retry budget the level's loop stamps on the request before this attempt.
+    pub max_retries: u32,
+    /// How many deployments `get_model_list` lists for the level's group (`model_group_size`).
+    pub model_group_size: usize,
 }
 
 /// What a successful attempt returns.
@@ -135,6 +141,22 @@ pub enum RouterEvent {
         depth: u32,
         /// The fallback level `to` is tried at: 1 for the request's own fallbacks.
         level: u32,
+        /// The new level's request metadata scope, copied from `parent`'s at the hop.
+        scope: u32,
+        parent: u32,
+        /// The `max_fallbacks` the walk reads, stamped on the hop's request.
+        max_fallbacks: u32,
+    },
+    /// `log_retry`: the router recorded a failure in `scope`'s request metadata
+    /// (`previous_models`, `request_retry_count`) before retrying or falling back.
+    RetryLogged {
+        scope: u32,
+        level: u32,
+        /// The group the failed level served (`kwargs["model"]`).
+        model: String,
+        /// The retry number stamped before the failed try; `None` keeps the scope's own.
+        attempted_retries: Option<u32>,
+        cause: RetryCause,
     },
     /// A level of the fallback walk ended on an error no attempt raised: the group had no
     /// deployment for the caller (`unknown`) or none available. Python raises that error for
@@ -158,6 +180,17 @@ pub enum RouterEvent {
         attempted: u32,
         max: u32,
     },
+}
+
+/// Which error a [`RouterEvent::RetryLogged`] records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetryCause {
+    /// The last attempt's failure.
+    Attempt,
+    /// The error the level ended on (`run_async_fallback`'s `original_exception`).
+    Level,
+    /// A retry found no deployment: the group was unknown or had none available.
+    NoDeployment { model: String, unknown: bool },
 }
 
 #[async_trait]
