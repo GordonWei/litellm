@@ -56,6 +56,9 @@ pub enum Error {
     /// Every deployment `model` resolved to is a pre-routing strategy marker (`auto_router/...`).
     #[error("every deployment of `{model}` is a strategy router marker")]
     OnlyMarkers { model: String },
+    /// Every deployment `model` resolved to is split into PTU shares the caller holds none of.
+    #[error("deployment `{model}` is reserved for the teams holding a PTU share of it")]
+    PtuReserved { model: String },
 }
 
 impl Error {
@@ -71,7 +74,8 @@ impl Error {
             | Self::Paused { .. }
             | Self::NotPassThrough { .. }
             | Self::NoPassThroughDeployments { .. }
-            | Self::OnlyMarkers { .. } => None,
+            | Self::OnlyMarkers { .. }
+            | Self::PtuReserved { .. } => None,
         }
     }
 }

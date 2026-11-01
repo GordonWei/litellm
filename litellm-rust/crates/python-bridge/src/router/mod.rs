@@ -54,6 +54,8 @@ enum ErrorKind {
     NoPassThroughDeployments,
     #[strum(serialize = "only_markers")]
     OnlyMarkers,
+    #[strum(serialize = "ptu_reserved")]
+    PtuReserved,
 }
 
 impl From<&Error> for ErrorKind {
@@ -69,6 +71,7 @@ impl From<&Error> for ErrorKind {
             Error::NotPassThrough { .. } => Self::NotPassThrough,
             Error::NoPassThroughDeployments { .. } => Self::NoPassThroughDeployments,
             Error::OnlyMarkers { .. } => Self::OnlyMarkers,
+            Error::PtuReserved { .. } => Self::PtuReserved,
         }
     }
 }
@@ -511,7 +514,7 @@ fn step_dict(py: Python<'_>, step: Step) -> PyResult<Bound<'_, PyDict>> {
             let attempt = error.attempt();
             dict.set_item("error", Report::new(&error).to_string())?;
             dict.set_item("error_kind", <&'static str>::from(ErrorKind::from(&error)))?;
-            if let Error::OnlyMarkers { model } = &error {
+            if let Error::OnlyMarkers { model } | Error::PtuReserved { model } = &error {
                 dict.set_item("error_model", model)?;
             }
             dict.set_item("attempt_failed", attempt.is_some())?;

@@ -113,6 +113,7 @@ from litellm.types.utils import LlmProviders
 if TYPE_CHECKING:
     from litellm.caching.dual_cache import DualCache
     from litellm.caching.redis_cache import RedisCache
+    from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
     from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
     from litellm.router_utils.cooldown_cache import CooldownCache
     from litellm.rust_bridge._native import (  # pyright: ignore[reportPrivateUsage]  # the stub's step shapes
@@ -704,53 +705,25 @@ class RustHealth(RouterHealth):
         done: Final = self._core._drive_sync_steps(call)  # pyright: ignore[reportPrivateUsage]  # see above
         return bool(done.get("cooled"))
 
+    def team_ptu_ceiling(self, team_id: str, model_group: str) -> "PTUTeamCeiling | None":
+        return self._core._hosted._core_team_ptu_ceiling(team_id, model_group)  # pyright: ignore[reportPrivateUsage]  # the host registry's ported ceiling
+
     async def usage(  # pyright: ignore[reportIncompatibleMethodOverride]  # the same two kinds
         self, model_group: str, *, kind: Literal["current", "remaining"] = "current"
     ) -> tuple[int | None, int | None] | Mapping[str, int]:
-        keys: Final = self._core._handle.usage_keys(model_group)  # pyright: ignore[reportPrivateUsage]  # see above
-        if keys is None:
-            if kind == "current":
-                return None, None
-            return {}
-        with service_target(ROUTER_USAGE_TARGET):
-            values: Final = await self.store.async_batch_get_cache(  # pyright: ignore[reportUnknownMemberType]  # DualCache's reads are untyped
-                keys=[tpm for _, tpm, _ in keys] + [rpm for _, _, rpm in keys]
-            )
+        """The group's usage this minute, read from the routing cache over the host registry's
+        live model list, as ``get_model_group_usage`` / ``get_remaining_model_group_usage`` read it."""
+        hosted: Final = self._core._hosted  # pyright: ignore[reportPrivateUsage]  # see above
         if kind == "current":
-            tpm_values: Final = (values or [])[: len(keys)]
-            rpm_values: Final = (values or [])[len(keys) :]
-            return _summed(tpm_values), _summed(rpm_values)
-        if kind != "remaining":
-            raise ValueError(f"unknown usage kind {kind!r}")
-        current: Final = await self.usage(model_group)
-        current_tpm, current_rpm = current if isinstance(current, tuple) else (None, None)
-        limits: Final = [
-            as_str_mapping((as_str_mapping(self._core._handle.deployment(id)) or {}).get("litellm_params")) or {}  # pyright: ignore[reportPrivateUsage]  # see above
-            for id, _, _ in keys
-        ]
-        tpm_limit: Final = _limit(limits, "tpm")
-        rpm_limit: Final = _limit(limits, "rpm")
-        remaining: Final[dict[str, int]] = {}  # mutable-ok: the header map, built here
-        if tpm_limit is not None:
-            remaining["x-ratelimit-remaining-tokens"] = tpm_limit - (current_tpm or 0)
-            remaining["x-ratelimit-limit-tokens"] = tpm_limit
-        if rpm_limit is not None:
-            remaining["x-ratelimit-remaining-requests"] = rpm_limit - (current_rpm or 0)
-            remaining["x-ratelimit-limit-requests"] = rpm_limit
-        return remaining
+            return await hosted._core_get_model_group_usage(model_group)  # pyright: ignore[reportPrivateUsage]  # the ported usage read
+        if kind == "remaining":
+            return await hosted._core_get_remaining_model_group_usage(model_group)  # pyright: ignore[reportPrivateUsage]  # see above
+        raise ValueError(f"unknown usage kind {kind!r}")
 
 
-_HEALTH_SERVED: Final = frozenset({"store", "cooldowns", "failures_this_minute", "record_failure", "usage"})
-
-
-def _summed(values: Sequence[object]) -> int | None:
-    numbers: Final = [int(value) for value in values if isinstance(value, int | float)]
-    return sum(numbers) if numbers else None
-
-
-def _limit(params: Sequence[Mapping[str, object]], key: str) -> int | None:
-    values: Final = [int(value) for p in params if isinstance((value := p.get(key)), int | float)]
-    return sum(values) if values else None
+_HEALTH_SERVED: Final = frozenset(
+    {"store", "cooldowns", "failures_this_minute", "record_failure", "usage", "team_ptu_ceiling"}
+)
 
 
 # --- the core -----------------------------------------------------------------------------------
@@ -866,6 +839,8 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             return self._legacy[name]
         if name == "healthy_deployments":
             return self._hosted._core_model_list  # pyright: ignore[reportPrivateUsage]  # the live list, as the core keeps it
+        if name == "get_model_group_io_token_usage":
+            return self._hosted.get_model_group_io_token_usage
         if name == "scheduler":
             return self._endpoints._get_scheduler()  # pyright: ignore[reportPrivateUsage]  # the endpoint plans' scheduler
         if name == "chat":
@@ -1734,6 +1709,13 @@ class RustCore(_SettingsSource, RustRegistryMembers):
             return litellm_exceptions.BadRequestError(
                 message=f"You passed in model={named_model}. {RouterErrors.only_strategy_marker_deployments.value}",
                 model=named_model,
+                llm_provider="",
+            )
+        if kind == "ptu_reserved":
+            reserved: Final = str(step.get("error_model") or model)
+            return litellm_exceptions.BadRequestError(
+                message=f"Deployment {reserved} is reserved for the teams holding a PTU share of it",
+                model=reserved,
                 llm_provider="",
             )
         if kind == "not_pass_through":

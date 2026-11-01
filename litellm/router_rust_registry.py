@@ -80,7 +80,12 @@ from litellm.types.router import (
     holds_secret_pointer,
     validate_litellm_params_strictly,
 )
-from litellm.types.utils import CustomPricingLiteLLMParams, is_server_derived_pricing_key, shared_backend_model_info
+from litellm.types.utils import (
+    CustomPricingLiteLLMParams,
+    LlmProviders,
+    is_server_derived_pricing_key,
+    shared_backend_model_info,
+)
 from litellm.utils import (
     ModelInfoLookupMiss,
     get_secret,
@@ -89,9 +94,15 @@ from litellm.utils import (
 )
 
 if TYPE_CHECKING:
+    from litellm.litellm_core_utils.ptu_shares import PTUTeamCeiling
     from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
     from litellm.router_python_host import PythonHost
 
+# The PTU share teams and the team ceilings read so far.
+_PTUMemo: TypeAlias = tuple[
+    frozenset[str],
+    dict[tuple[str, str], "PTUTeamCeiling | None"],
+]
 _MODEL_INFO_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 _LITELLM_PARAMS_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 _CACHE_PRICING_FIELDS: Final = (
@@ -240,6 +251,39 @@ def _inherited_tiered_output_rate(
 
 def _bedrock_profile(params: Mapping[str, object], model: str) -> bool:
     return params.get("custom_llm_provider") == "bedrock" or model.startswith("bedrock/")
+
+
+def _deployment_ids(deployments: Iterable[Mapping[str, object]]) -> frozenset[str]:
+    return frozenset(
+        str(model_info["id"])
+        for deployment in deployments
+        if (model_info := _model_info_of(deployment)).get("id") is not None
+    )
+
+
+def _search_tool_support(deployment: Mapping[str, object]) -> bool | None:
+    """A deployment's answer to Codex's client ``tool_search``."""
+    from litellm.responses.litellm_completion_transformation.tool_search import chat_config_builds_anthropic_request
+    from litellm.utils import ProviderConfigManager
+
+    configured: Final = _model_info_of(deployment).get("supports_search_tool")
+    if isinstance(configured, bool):
+        return configured
+    params: Final = _params_of(deployment)
+    model: Final = params.get("model")
+    provider: Final = params.get("custom_llm_provider")
+    if not isinstance(model, str):
+        return None
+    try:
+        resolved_model, resolved_provider = resolve_model_and_provider_for_metadata(
+            model=model, custom_llm_provider=provider if isinstance(provider, str) else None
+        )
+        chat_config: Final = ProviderConfigManager.get_provider_chat_config(
+            model=resolved_model, provider=LlmProviders(resolved_provider)
+        )
+    except (litellm_exceptions.BadRequestError, ValueError):
+        return None
+    return True if chat_config_builds_anthropic_request(chat_config) else None
 
 
 def cost_map_backend_model(deployment: Deployment) -> str:
@@ -421,6 +465,8 @@ class HostRegistry(HostModelInfo):
         self._discovered_model_info_cache: InMemoryCache = InMemoryCache(
             max_size_in_memory=1, default_ttl=2 * MODEL_INFO_REFRESH_SECONDS
         )
+        # The PTU share teams and team ceilings, until the model list next changes.
+        self._ptu_cache: _PTUMemo | None = None
         self._cached_get_model_group_info: Callable[[str], ModelGroupInfo | None] = lru_cache(  # pyright: ignore[reportIncompatibleMethodOverride]  # the per-router cache shadows the uncached method, as the core keeps it
             maxsize=DEFAULT_MAX_LRU_CACHE_SIZE
         )(self._core_get_model_group_info)
@@ -476,7 +522,6 @@ class HostRegistry(HostModelInfo):
             get_openai_compatible_model_info,
         )
         from litellm.types.router import DiscoveredDeploymentModelInfo
-        from litellm.types.utils import LlmProviders
         from litellm.utils import aresolve_api_key_secret_reference
 
         deployment: Final = Deployment.model_validate(raw_deployment)
@@ -531,6 +576,7 @@ class HostRegistry(HostModelInfo):
         self._invalidate_model_group_info_cache()
 
     def _invalidate_model_group_info_cache(self) -> None:
+        self._ptu_cache = None
         self._cached_get_model_group_info.cache_clear()  # pyright: ignore[reportFunctionMemberAccess]  # an lru_cache
         self._core_cached_deployment_model_info.cache_clear()  # pyright: ignore[reportFunctionMemberAccess]  # an lru_cache
         self._routing_group_rows = None
@@ -1347,6 +1393,151 @@ class HostRegistry(HostModelInfo):
         )
         usable: Final = tuple(d for d in named if self._core_deployment_usable_by_team(d, team_id))
         return tuple(d for d in (usable or named) if _model_info_of(d).get("blocked") is not True)
+
+    def _core_team_ptu_ceiling(self, team_id: str, model_group: str) -> "PTUTeamCeiling | None":
+        """The per-minute ceiling ``team_id``'s PTU shares set on the group serving ``model_group``,
+        else None (``team_ptu_ceiling``), kept until the model list next changes."""
+        from litellm.litellm_core_utils.ptu_shares import ptu_share_teams, team_ptu_ceiling
+
+        listed: Final = tuple(self._core_get_model_list() or ())
+        if self._ptu_cache is None:
+            self._ptu_cache = (ptu_share_teams(listed), {})
+        share_teams, ceilings = self._ptu_cache
+        if team_id not in share_teams:
+            return None
+        key: Final = (team_id, model_group)
+        if key not in ceilings:
+            ceilings[key] = team_ptu_ceiling(
+                listed,
+                self._core_model_list,
+                team_id,
+                model_group,
+                lambda name: self._core_wildcard_route_deployments(name, team_id),
+            )
+        return ceilings[key]
+
+    def _core_deployments_for_request(self, model: str, request_kwargs: Mapping[str, object]) -> Sequence[UntypedEntry]:
+        """The deployments ``model`` names for this caller: the alias target, then team-first, then
+        global, then across teams for a proxy admin without a team (``deployments_for_request``)."""
+        from litellm.litellm_core_utils.routing_common_utils import get_request_team_id, is_proxy_admin_request
+
+        registered_name: Final = self._core_get_model_from_alias(model=model) or model
+        team_id: Final = get_request_team_id(request_kwargs)
+        deployments: Final = self._core_get_all_deployments(model_name=registered_name, team_id=team_id)
+        if deployments or team_id is not None or not is_proxy_admin_request(request_kwargs):
+            return deployments
+        return self._team_deployments_across_teams(registered_name)
+
+    def _team_deployments_across_teams(
+        self, model: str
+    ) -> list[UntypedEntry]:  # mutable-ok: a fresh list, as the core returns it
+        """Every team's deployments under public name ``model``; refused when several teams share it."""
+        with self._deployment_index_lock:
+            team_deployments: Final = [
+                self._core_model_list[index]
+                for (_, public_model_name), indices in self._core_team_model_to_deployment_indices.items()
+                if public_model_name == model
+                for index in indices
+            ]  # comprehension-ok: every index of every team entry under the name, as the core reads them
+        team_ids: Final = {
+            team_id
+            for deployment in team_deployments
+            if (team_id := _model_info_of(deployment).get("team_id")) is not None
+        }
+        if len(team_ids) > 1:
+            raise litellm_exceptions.BadRequestError(
+                message=(
+                    f"Model name '{model}' matches deployments from multiple teams. "
+                    "Specify the deployment ID directly to disambiguate."
+                ),
+                model=model,
+                llm_provider="",
+            )
+        return team_deployments
+
+    def _get_client(
+        self, deployment: Mapping[str, object], kwargs: Mapping[str, object], client_type: str | None = None
+    ) -> object:
+        """The SDK client cached in the routing cache for a deployment (``_get_client``); a pod
+        discovery deployment has none."""
+        from litellm.litellm_core_utils.core_helpers import get_parent_otel_span_from_kwargs
+        from litellm.router_rust_core import RustCoreUnsupported
+
+        if client_type == "max_parallel_requests":
+            raise RustCoreUnsupported(
+                "registry().client(client_type='max_parallel_requests') is not served by the Rust router core"
+            )
+        if _params_of(deployment).get("kubernetes_pod_discovery") is True:
+            return None
+        model_id: Final = _model_info_of(deployment).get("id")
+        span: Final = get_parent_otel_span_from_kwargs(dict(kwargs))
+        stream: Final = "_stream" if kwargs.get("stream") is True else ""
+        if client_type == "async":
+            return self._core_cache.get_cache(
+                key=f"{model_id}{stream}_async_client", local_only=True, parent_otel_span=span
+            )  # pyright: ignore[reportUnknownMemberType]  # DualCache's reads are untyped
+        return self._core_cache.get_cache(key=f"{model_id}{stream}_client", parent_otel_span=span)  # pyright: ignore[reportUnknownMemberType]  # see above
+
+    def _core_get_search_tool_support(self, model_name: str, team_id: str | None = None) -> tuple[bool | None, ...]:
+        """Per routable deployment: its ``supports_search_tool`` when a bool, else True when its route
+        builds an Anthropic Messages request, else None (``get_search_tool_support``)."""
+        return tuple(_search_tool_support(deployment) for deployment in self._routable_deployments(model_name, team_id))
+
+    def _core_get_candidate_model_ids_for_route(self, model: str, team_id: str | None = None) -> frozenset[str]:
+        """The deployment ids that could serve ``model`` for ``team_id``: the alias target, then a
+        routing group, then a team public name or wildcard route for a name that is no model
+        group, then the model group (``get_candidate_model_ids_for_route``). Read-only."""
+        resolved: Final = self._core_get_model_from_alias(model=model) or model
+        group: Final = self.get_routing_group(resolved) if self._core_routing_groups else None
+        if group is not None:
+            # The member union (`_get_routing_group_deployments`); a priority changes no id.
+            return frozenset[str]().union(
+                *(
+                    _deployment_ids(self._core_get_all_deployments(model_name=member, team_id=team_id))
+                    for member in group.models
+                )
+            )
+        if resolved not in self._core_model_names:
+            team_deployments: Final = (
+                self._core_get_all_deployments(model_name=resolved, team_id=team_id) if team_id is not None else []
+            )
+            if team_deployments:
+                return _deployment_ids(team_deployments)
+            wildcard: Final = self._core_wildcard_route_deployments(resolved, team_id)
+            if wildcard:
+                return _deployment_ids(wildcard)
+        return _deployment_ids(self._core_get_all_deployments(model_name=resolved, team_id=team_id))
+
+    def _core_team_model_has_alternatives(self, deployment_id: str) -> bool:
+        """Whether a team deployment's public name has another unpaused deployment of that team."""
+        deployment: Final = self._core_get_deployment(model_id=deployment_id)
+        if deployment is None:
+            return False
+        team_id: Final = deployment.model_info.team_id
+        public_model_name: Final = deployment.model_info.team_public_model_name
+        if team_id is None or public_model_name is None:
+            return False
+        siblings: Final = self._team_deployments_named(team_id, public_model_name) or ()
+        return len([s for s in siblings if _model_info_of(s).get("blocked") is not True]) > 1
+
+    def _core_resolve_served_model_name(self, model_name: str, served_model: str) -> str:
+        """``served_model`` when ``model_name`` routes to it (the alias target, a routing group
+        member, or the name itself), else ``model_name``."""
+        target: Final = self._core_get_model_from_alias(model_name) or model_name
+        group: Final = self.get_routing_group(target)
+        members: Final = group.models if group is not None else ()
+        return served_model if served_model == target or served_model in members else model_name
+
+    def _core_resolved_litellm_models(
+        self, model_name: str, team_id: str | None = None, *, use_base_model: bool = False
+    ) -> tuple[str, ...]:
+        """The provider model strings a call to ``model_name`` can be served by (``resolved_litellm_models``)."""
+        listed: Final = self._core_get_model_list(model_name=model_name, team_id=team_id) or ()
+        if use_base_model:
+            return tuple(
+                backend for entry in listed if (backend := cost_map_backend_model(Deployment.model_validate(entry)))
+            )
+        return tuple(model for entry in listed if isinstance(model := _params_of(entry).get("model"), str) and model)
 
     def _core_get_routable_upstream_model(self, model_name: str, team_id: str | None = None) -> str | None:
         deployment: Final = next(iter(self._routable_deployments(model_name, team_id)), None)
