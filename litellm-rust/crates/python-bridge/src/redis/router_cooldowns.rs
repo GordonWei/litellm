@@ -10,6 +10,7 @@ use super::{
     PyNumber, call,
     client::{PythonRedisSettings, shared_client},
     memory_error,
+    policy::router_tier_policies,
 };
 use crate::execution::{run_async_value, run_sync_value};
 
@@ -80,7 +81,8 @@ impl NativeRouterCooldowns {
         let client = redis_kwargs
             .map(|kwargs| shared_client(py, kwargs, namespace))
             .transpose()?;
-        Ok(Self(Arc::new(RouterCooldowns::new(client))))
+        let policy = router_tier_policies(py)?.cooldowns;
+        Ok(Self(Arc::new(RouterCooldowns::new(client, policy))))
     }
 
     fn put(

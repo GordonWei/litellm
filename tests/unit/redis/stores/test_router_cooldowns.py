@@ -1,21 +1,18 @@
-import asyncio
 import ast
+import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
+import pytest
 from pydantic import TypeAdapter
 from typing_extensions import ReadOnly, TypedDict
 
-import pytest
-
 from litellm._internal_context import current_service_target
-from litellm.caching.dual_cache import DualCache
 from litellm.caching.redis_cache import RedisCache
 from litellm.redis.stores._connection import redis_kwargs
-from litellm.redis.stores._routing_prefetch import selector_read
 from litellm.redis.stores.router_cooldowns import CooldownCacheValue, RouterCooldownStore
 
 _WIRE: Final = Path(__file__).parents[4] / "litellm-rust/crates/redis-store/tests/fixtures/router_wire.json"
@@ -131,25 +128,6 @@ def test_minimum_falls_back_to_the_default_when_nothing_or_zero_is_stored(
     store: Final = RouterCooldownStore(None, handle=handles)
     handles.built[0].smallest = smallest
     assert store.minimum(["dep"], 60.0, None) == expected
-
-
-@pytest.mark.asyncio
-async def test_the_routing_read_pairs_native_cooldowns_with_the_selector_counters() -> None:
-    handles: Final = Handles()
-    store: Final = RouterCooldownStore(None, handle=handles)
-    store.put("dep", _entry(), 60.0)
-    selector: Final = DualCache()
-    await selector.async_set_cache(  # pyright: ignore[reportUnknownMemberType]  # legacy DualCache is untyped
-        "dep:model:tpm:12-34", 7
-    )
-
-    read: Final = await store.routing_read(["dep"], selector_read(selector, ["dep:model:tpm:12-34", "missing"]), None)
-    alone: Final = await store.routing_read(["dep"], None, None)
-
-    assert read.cooldowns == (("dep", _entry()),)
-    assert list(read.selector_values or ()) == [7, None]
-    assert alone.selector_values is None
-    assert handles.built[0].targets[-1] == "router_cooldowns"
 
 
 def test_the_wire_fixture_is_what_mains_codec_writes_and_reads() -> None:

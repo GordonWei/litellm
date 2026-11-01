@@ -7,6 +7,7 @@ use super::{
     PyNumber, call,
     client::{PythonRedisSettings, shared_client},
     memory_error,
+    policy::router_tier_policies,
 };
 use crate::execution::run_async_value;
 
@@ -53,7 +54,8 @@ impl NativeRouterUsage {
         let client = redis_kwargs
             .map(|kwargs| shared_client(py, kwargs, namespace))
             .transpose()?;
-        Ok(Self(Arc::new(RouterUsage::new(client))))
+        let policy = router_tier_policies(py)?.usage;
+        Ok(Self(Arc::new(RouterUsage::new(client, policy))))
     }
 
     fn increment<'py>(

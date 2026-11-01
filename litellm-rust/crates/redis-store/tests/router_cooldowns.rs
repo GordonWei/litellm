@@ -5,7 +5,7 @@ use std::time::Duration;
 use litellm_redis_client::{Expiry, Ttl};
 use litellm_redis_store::{
     Number,
-    router_cooldowns::{Cooldown, RouterCooldowns},
+    router_cooldowns::{Cooldown, POLICY, RouterCooldowns},
 };
 use litellm_redis_testing::{RedisDeployment, Topology};
 use rstest::rstest;
@@ -44,7 +44,7 @@ async fn put_writes_mains_str_dict_bytes_with_whole_second_ttl(
 ) {
     let deployment = RedisDeployment::start(topology).await.unwrap();
     let raw = connect(&deployment);
-    let store = RouterCooldowns::new(Some(connect(&deployment)));
+    let store = RouterCooldowns::new(Some(connect(&deployment)), POLICY);
 
     for case in cases("cooldowns") {
         let ttl = Duration::from_secs_f64(case["ttl_seconds"].as_f64().unwrap());
@@ -74,7 +74,7 @@ async fn reads_cooldowns_python_wrote_as_str_dict_or_json(
 ) {
     let deployment = RedisDeployment::start(topology).await.unwrap();
     let raw = connect(&deployment);
-    let store = RouterCooldowns::with_clock(Some(connect(&deployment)), fixture_clock());
+    let store = RouterCooldowns::with_clock(Some(connect(&deployment)), POLICY, fixture_clock());
 
     for case in cases("cooldowns") {
         raw.set(
@@ -100,7 +100,7 @@ async fn an_ended_cooldown_is_not_active_but_still_counts_toward_the_minimum(
     let deployment = RedisDeployment::start(topology).await.unwrap();
     let raw = connect(&deployment);
     let late = std::sync::Arc::new(|| Duration::from_secs(1_730_000_100));
-    let store = RouterCooldowns::with_clock(Some(connect(&deployment)), late);
+    let store = RouterCooldowns::with_clock(Some(connect(&deployment)), POLICY, late);
     let models = cases("cooldowns")
         .iter()
         .map(|case| text(case, "model_id"))
@@ -129,8 +129,8 @@ async fn allowed_fails_count_across_routers_and_keep_the_first_ttl(
 ) {
     let deployment = RedisDeployment::start(topology).await.unwrap();
     let raw = connect(&deployment);
-    let first = RouterCooldowns::new(Some(connect(&deployment)));
-    let second = RouterCooldowns::new(Some(connect(&deployment)));
+    let first = RouterCooldowns::new(Some(connect(&deployment)), POLICY);
+    let second = RouterCooldowns::new(Some(connect(&deployment)), POLICY);
 
     for case in cases("allowed_fails") {
         let key = text(&case, "key");
@@ -163,7 +163,7 @@ async fn python_written_fail_counts_continue_in_rust(
 ) {
     let deployment = RedisDeployment::start(topology).await.unwrap();
     let raw = connect(&deployment);
-    let store = RouterCooldowns::new(Some(connect(&deployment)));
+    let store = RouterCooldowns::new(Some(connect(&deployment)), POLICY);
     raw.incr_by(
         "deployment:dep-a:allowed_fails",
         4,
@@ -184,7 +184,7 @@ async fn python_written_fail_counts_continue_in_rust(
 #[rstest]
 #[tokio::test]
 async fn a_router_without_redis_keeps_its_cooldowns_and_counts_in_memory() {
-    let store = RouterCooldowns::with_clock(None, fixture_clock());
+    let store = RouterCooldowns::with_clock(None, POLICY, fixture_clock());
     let case = &cases("cooldowns")[0];
 
     store
@@ -225,7 +225,7 @@ async fn a_router_without_redis_keeps_its_cooldowns_and_counts_in_memory() {
 #[tokio::test]
 async fn a_redis_outage_serves_memory_and_counts_fails_locally() {
     let deployment = RedisDeployment::start(Topology::Standalone).await.unwrap();
-    let store = RouterCooldowns::with_clock(Some(connect(&deployment)), fixture_clock());
+    let store = RouterCooldowns::with_clock(Some(connect(&deployment)), POLICY, fixture_clock());
     let case = &cases("cooldowns")[0];
     store
         .put(
@@ -277,7 +277,7 @@ async fn a_miss_is_read_from_redis_again_only_after_the_one_second_refresh(
     let deployment = RedisDeployment::start(topology).await.unwrap();
     let raw = connect(&deployment);
     let time = StepClock::at(1_730_000_000.75);
-    let store = RouterCooldowns::with_clock(Some(connect(&deployment)), time.clock());
+    let store = RouterCooldowns::with_clock(Some(connect(&deployment)), POLICY, time.clock());
     let case = &cases("cooldowns")[0];
 
     let before = store.active(&ids(case)).await.unwrap();
@@ -312,7 +312,7 @@ async fn a_breaker_refusal_does_not_hold_back_the_next_read() {
     );
     let time = StepClock::at(1_730_000_000.75);
     let guarded = support::connect_guarded(&deployment, breaker);
-    let store = RouterCooldowns::with_clock(Some(guarded.clone()), time.clock());
+    let store = RouterCooldowns::with_clock(Some(guarded.clone()), POLICY, time.clock());
     let case = &cases("cooldowns")[0];
     deployment.stop().await.unwrap();
     store.active(&ids(case)).await.unwrap();

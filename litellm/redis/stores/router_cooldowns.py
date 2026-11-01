@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol, TypeAlias
 
 if TYPE_CHECKING:
@@ -13,9 +11,7 @@ from litellm._internal_context import service_target
 from litellm.caching.redis_cache import RedisCache
 from litellm.rust_bridge._native import NativeRouterCooldowns
 
-from . import _routing_prefetch
 from ._connection import redis_kwargs
-from ._routing_prefetch import TierRead
 
 
 class CooldownCacheValue(TypedDict):
@@ -29,21 +25,11 @@ ROUTER_COOLDOWNS_TARGET: Final = "router_cooldowns"
 ActiveCooldowns: TypeAlias = Sequence[tuple[str, CooldownCacheValue]]
 
 
-@dataclass(frozen=True, slots=True)
-class RoutingRead:
-    cooldowns: ActiveCooldowns
-    selector_values: Sequence[object | None] | None
-
-
 class RouterCooldowns(Protocol):
     def attach_redis(self, connection: RedisCache | None) -> None: ...
     def flush_local_counters(self) -> None: ...
     def put(self, model_id: str, value: CooldownCacheValue, ttl: float) -> None: ...
     def increment_allowed_fails(self, model_id: str, suffix: str | None, ttl: float) -> int: ...
-    def arm_routing_read(self, model_ids: Sequence[str], selector: TierRead | None) -> None: ...
-    async def routing_read(
-        self, model_ids: Sequence[str], selector: TierRead | None, parent_otel_span: Span | None
-    ) -> RoutingRead: ...
     async def active(self, model_ids: Sequence[str], parent_otel_span: Span | None) -> ActiveCooldowns: ...
     def active_sync(self, model_ids: Sequence[str], parent_otel_span: Span | None) -> ActiveCooldowns: ...
     def minimum(self, model_ids: Sequence[str], default: float, parent_otel_span: Span | None) -> float: ...
@@ -93,20 +79,6 @@ class RouterCooldownStore:
     def increment_allowed_fails(self, model_id: str, suffix: str | None, ttl: float) -> int:
         with service_target(ROUTER_COOLDOWNS_TARGET):
             return self._handle.increment_allowed_fails(model_id, suffix, ttl)
-
-    def arm_routing_read(self, model_ids: Sequence[str], selector: TierRead | None) -> None:
-        if selector is not None:
-            _routing_prefetch.arm(selector)
-
-    async def routing_read(
-        self, model_ids: Sequence[str], selector: TierRead | None, parent_otel_span: Span | None
-    ) -> RoutingRead:
-        with service_target(ROUTER_COOLDOWNS_TARGET):
-            cooldowns: Final = self._handle.aactive(model_ids)
-        if selector is None:
-            return RoutingRead(cooldowns=tuple(await cooldowns), selector_values=None)
-        active, selector_values = await asyncio.gather(cooldowns, _routing_prefetch.read(selector, parent_otel_span))
-        return RoutingRead(cooldowns=tuple(active), selector_values=selector_values)
 
     async def active(self, model_ids: Sequence[str], parent_otel_span: Span | None) -> ActiveCooldowns:
         with service_target(ROUTER_COOLDOWNS_TARGET):

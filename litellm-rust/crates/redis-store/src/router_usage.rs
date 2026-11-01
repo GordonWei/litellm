@@ -61,17 +61,17 @@ fn whole_seconds(ttl: Duration) -> Duration {
 pub struct RouterUsage(DualCache<InMemoryCache<Number>, RedisClient>);
 
 impl RouterUsage {
-    pub fn new(client: Option<RedisClient>) -> Self {
-        Self::with_clock(client, system_clock())
+    pub fn new(client: Option<RedisClient>, policy: TierPolicy) -> Self {
+        Self::with_clock(client, policy, system_clock())
     }
 
-    pub fn with_clock(client: Option<RedisClient>, now: Clock) -> Self {
+    pub fn with_clock(client: Option<RedisClient>, policy: TierPolicy, now: Clock) -> Self {
         let clock = now.clone();
         let memory =
-            InMemoryCache::with_clock(Some(MEMORY_ENTRIES), Some(POLICY.backfill_ttl), move || {
+            InMemoryCache::with_clock(Some(MEMORY_ENTRIES), Some(policy.backfill_ttl), move || {
                 clock()
             });
-        Self(DualCache::read_through(memory, client, POLICY, now))
+        Self(DualCache::read_through(memory, client, policy, now))
     }
 
     /// `DualCache.async_increment_cache`: memory, then `INCRBYFLOAT` keeping an existing TTL.

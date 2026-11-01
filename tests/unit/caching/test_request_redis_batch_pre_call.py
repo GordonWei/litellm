@@ -29,8 +29,8 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     RateLimitUnverifiableError,
 )
 from litellm.proxy.utils import InternalUsageCache
-from litellm.redis.stores._routing_prefetch import ArmedRead, TierRead
 from litellm.router_api import RoutingContext
+from litellm.router_utils.routing_prefetch import ArmedRead, TierRead
 from litellm.router_utils.routing_read_batch import (
     ROUTER_USAGE_TARGET,
     RoutingPrefetch,

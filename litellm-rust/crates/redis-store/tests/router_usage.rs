@@ -5,7 +5,7 @@ use std::time::Duration;
 use litellm_redis_client::{Expiry, Ttl};
 use litellm_redis_store::{
     Number,
-    router_usage::{COUNTER_TTL, Counter, Kind, RouterUsage},
+    router_usage::{COUNTER_TTL, Counter, Kind, POLICY, RouterUsage},
 };
 use litellm_redis_testing::{RedisDeployment, Topology};
 use rstest::rstest;
@@ -39,7 +39,7 @@ async fn reads_counters_python_incremented_under_mains_keys(
 ) {
     let deployment = RedisDeployment::start(topology).await.unwrap();
     let raw = connect(&deployment);
-    let store = RouterUsage::new(Some(connect(&deployment)));
+    let store = RouterUsage::new(Some(connect(&deployment)), POLICY);
     let counters = cases("usage");
     for (case, delta) in counters.iter().zip([7.75, 3.0]) {
         raw.incr_by_float(&text(case, "key"), delta, Expiry::Refresh(COUNTER_TTL))
@@ -63,8 +63,8 @@ async fn deployment_increments_write_incrbyfloat_totals_with_a_refreshed_minute_
 ) {
     let deployment = RedisDeployment::start(topology).await.unwrap();
     let raw = connect(&deployment);
-    let writer = RouterUsage::new(Some(connect(&deployment)));
-    let reader = RouterUsage::new(Some(connect(&deployment)));
+    let writer = RouterUsage::new(Some(connect(&deployment)), POLICY);
+    let reader = RouterUsage::new(Some(connect(&deployment)), POLICY);
     let case = &cases("usage")[0];
     let model = case["model"].as_str();
     let [tpm_key, rpm_key] =
@@ -106,7 +106,7 @@ async fn a_request_increment_keeps_the_window_python_started(
 ) {
     let deployment = RedisDeployment::start(topology).await.unwrap();
     let raw = connect(&deployment);
-    let store = RouterUsage::new(Some(connect(&deployment)));
+    let store = RouterUsage::new(Some(connect(&deployment)), POLICY);
     let case = &cases("usage")[1];
     let key = text(case, "key");
     raw.incr_by_float(&key, 1.0, Expiry::KeepExisting(Duration::from_secs(20)))
@@ -128,7 +128,7 @@ async fn a_request_increment_keeps_the_window_python_started(
 #[rstest]
 #[tokio::test]
 async fn without_redis_counters_accumulate_in_memory_until_flushed() {
-    let store = RouterUsage::new(None);
+    let store = RouterUsage::new(None, POLICY);
     let counters = tpm_and_rpm(Some("model"));
 
     store
@@ -153,7 +153,7 @@ async fn without_redis_counters_accumulate_in_memory_until_flushed() {
 #[tokio::test]
 async fn a_failed_pipeline_keeps_the_memory_counts_as_integers() {
     let deployment = RedisDeployment::start(Topology::Standalone).await.unwrap();
-    let store = RouterUsage::new(Some(connect(&deployment)));
+    let store = RouterUsage::new(Some(connect(&deployment)), POLICY);
     deployment.stop().await.unwrap();
 
     store
