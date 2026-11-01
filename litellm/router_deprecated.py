@@ -510,9 +510,9 @@ class DeprecatedRouterMembers:
     @staticmethod
     def deployment_usable_by_team(model: "Mapping[str, object] | Deployment", team_id: str | None) -> bool:
         _note("deployment_usable_by_team", "registry().includes(deployment, team_id=...)")
-        from litellm.router_python_core import PythonCore
+        from litellm.router_api import deployment_usable_by_team as usable_by_team
 
-        return PythonCore._core_deployment_usable_by_team(model, team_id)
+        return usable_by_team(model, team_id)
 
     _deployment_usable_by_team = deployment_usable_by_team
 

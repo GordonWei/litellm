@@ -178,9 +178,9 @@ def deployment_usable_by_team(deployment: "Mapping[str, object] | Deployment", t
     Whether ``team_id`` may use ``deployment``: a team-scoped deployment (``model_info.team_id``
     set) only by that team, any other deployment by everyone. Needs no router instance.
     """
-    from litellm.router_python_core import PythonCore
+    from litellm.router_rust_registry import HostRegistry
 
-    return PythonCore._core_deployment_usable_by_team(deployment, team_id)
+    return HostRegistry._core_deployment_usable_by_team(deployment, team_id)
 
 
 def deployment_id(model_group: str, litellm_params: Mapping[str, object]) -> str:
@@ -334,9 +334,9 @@ def deployment_metadata(request_kwargs: Mapping[str, object]) -> Mapping[str, ob
 
 
 def _json_default_stable_id(obj: object) -> str:
-    from litellm.router_python_core import PythonCore
+    from litellm.router_rust_prerouting import _json_default_stable_id as stable_id
 
-    return PythonCore._json_default_stable_id(obj)
+    return stable_id(obj)
 
 
 class RouterRegistry:
@@ -597,10 +597,8 @@ class RouterRegistry:
         ``should_include_deployment``), or, without ``model_name``, whether the team may use it at
         all (was ``deployment_usable_by_team``).
         """
-        from litellm.router_python_core import PythonCore
-
         if model_name is None:
-            return PythonCore._core_deployment_usable_by_team(deployment, team_id)
+            return deployment_usable_by_team(deployment, team_id)
         return self._router._core_should_include_deployment(model_name=model_name, model=deployment, team_id=team_id)
 
     @overload
@@ -1242,16 +1240,16 @@ class RouterHealth:
     @staticmethod
     def is_blocked(deployment: "Deployment") -> bool:
         """Whether an admin paused this deployment (was ``is_deployment_blocked``)."""
-        from litellm.router_python_core import PythonCore
+        from litellm.router_rust_health_routing import is_blocked as deployment_is_blocked
 
-        return PythonCore._core_is_deployment_blocked(deployment)
+        return deployment_is_blocked(deployment)
 
     @staticmethod
     def all_blocked(deployments: "Sequence[DeploymentTypedDict]") -> bool:
         """Whether every deployment in the list is paused (was ``are_all_deployments_blocked``)."""
-        from litellm.router_python_core import PythonCore
+        from litellm.router_rust_health_routing import all_blocked as deployments_all_blocked
 
-        return PythonCore._core_are_all_deployments_blocked(deployments)
+        return deployments_all_blocked(deployments)
 
     def fully_blocked_model_names(self) -> set[str]:  # mutable-ok: the core's type, a fresh set
         """Groups whose every deployment is paused (was ``get_fully_blocked_model_names``)."""
