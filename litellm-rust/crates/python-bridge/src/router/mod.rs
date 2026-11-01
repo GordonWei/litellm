@@ -5,6 +5,7 @@
 
 mod config;
 mod host;
+mod stream;
 
 use std::{
     sync::{Arc, Mutex, PoisonError},
@@ -257,6 +258,57 @@ impl RouterCoreHandle {
 
     fn retire(&self) {
         self.router.retire();
+    }
+
+    /// What may still take over a stream from `origin` that fails before content, and the
+    /// retry budget for a failure of `kind` (see `stream::policy`).
+    #[pyo3(signature = (request, origin, kind=None))]
+    fn stream_policy<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'py, PyAny>,
+        origin: &Bound<'py, PyAny>,
+        kind: Option<&str>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        stream::policy(py, &self.router, request, origin, kind)
+    }
+
+    /// Retry a stream from `origin` that failed before content within its group, driven like
+    /// `start`: `done` when a retry returned a response, `failed` with the newest failure.
+    fn retry_stream(
+        &self,
+        op: &str,
+        request: &Bound<'_, PyAny>,
+        origin: &Bound<'_, PyAny>,
+        failure: &Bound<'_, PyDict>,
+    ) -> PyResult<RouterCall> {
+        stream::recover(
+            &self.router,
+            stream::Recovery::Retry,
+            op,
+            request,
+            origin,
+            failure,
+        )
+    }
+
+    /// The fallback walk for a stream from `origin` that failed before content, driven like
+    /// `start`.
+    fn fallback_stream(
+        &self,
+        op: &str,
+        request: &Bound<'_, PyAny>,
+        origin: &Bound<'_, PyAny>,
+        failure: &Bound<'_, PyDict>,
+    ) -> PyResult<RouterCall> {
+        stream::recover(
+            &self.router,
+            stream::Recovery::Fallback,
+            op,
+            request,
+            origin,
+            failure,
+        )
     }
 }
 
