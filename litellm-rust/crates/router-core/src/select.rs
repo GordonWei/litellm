@@ -14,7 +14,8 @@ use crate::{
     error::Error,
     health_routing::WhenAllUnhealthy,
     host::{RouterRequest, RoutingContext, SelectStage},
-    registry::{Deployment, ResolveKind, ResolveScope},
+    registry::{Deployment, ResolveKind},
+    resolve::{Caller, resolve_request},
     strategy::{StrategyScope, routing_context},
 };
 
@@ -83,15 +84,16 @@ pub(crate) struct SelectInputs {
 }
 
 /// `simple_shuffle`: weighted by `_router_weights[group]`, else `weight`, else `rpm`, else
-/// `tpm`, each normalized by its maximum, else uniform.
+/// `tpm`, each normalized by its maximum, else uniform. A metric is read only when every set
+/// before it weighed nothing, and a non-numeric one fails the pick then (`_metric_weight`).
 pub fn simple_shuffle(
     deployments: &[Arc<Deployment>],
     model_group: &str,
     router_weights: Option<&BTreeMap<String, BTreeMap<String, f64>>>,
     rng: &dyn Randomness,
-) -> Option<Arc<Deployment>> {
+) -> Result<Option<Arc<Deployment>>, Error> {
     if deployments.is_empty() {
-        return None;
+        return Ok(None);
     }
     let scoped = router_weights
         .and_then(|weights| weights.get(model_group))
@@ -102,13 +104,15 @@ pub fn simple_shuffle(
                 .map(|d| weights.get(&d.id).copied().unwrap_or(0.0))
                 .collect::<Vec<_>>()
         });
-    let metric_sets = ["weight", "rpm", "tpm"].map(|metric| {
+    let metric_sets = ["weight", "rpm", "tpm"].into_iter().map(|metric| {
         deployments
             .iter()
-            .map(|d| d.metric(metric).unwrap_or(0.0))
-            .collect::<Vec<_>>()
+            .map(|d| d.metric_weight(metric))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Error::NonNumericWeight { metric })
     });
-    for weights in scoped.into_iter().chain(metric_sets) {
+    for weights in scoped.into_iter().map(Ok).chain(metric_sets) {
+        let weights = weights?;
         let largest = weights.iter().copied().fold(0.0, f64::max);
         if largest <= 0.0 {
             continue;
@@ -128,10 +132,10 @@ pub fn simple_shuffle(
                 target < cumulative
             })
             .unwrap_or(deployments.len() - 1);
-        return Some(deployments[index].clone());
+        return Ok(Some(deployments[index].clone()));
     }
     let index = ((rng.next_f64() * deployments.len() as f64) as usize).min(deployments.len() - 1);
-    Some(deployments[index].clone())
+    Ok(Some(deployments[index].clone()))
 }
 
 /// A pre-routing strategy marker (`classify_strategy_router_model`): its model is `auto_router/...`.
@@ -149,6 +153,41 @@ fn uses_pass_through(deployment: &Deployment) -> bool {
         Some(serde_json::Value::Array(value)) => !value.is_empty(),
         Some(serde_json::Value::Object(value)) => !value.is_empty(),
     }
+}
+
+/// `filter_team_based_models`: a team-owned deployment serves only its team, except that a proxy
+/// admin without a team keeps deployments that are all team-owned and listed under the model the
+/// request names, unless they belong to several teams.
+fn filter_team_based(
+    deployments: Vec<Arc<Deployment>>,
+    request: &RouterRequest,
+) -> Result<Vec<Arc<Deployment>>, Error> {
+    let team_id = request.team_id.as_deref();
+    if team_id.is_none()
+        && request.proxy_admin
+        && let Some(requested) = request.admin_model.as_deref()
+        && !deployments.is_empty()
+        && deployments.iter().all(|d| {
+            d.model_info.team_id.is_some()
+                && (d.model_name == requested
+                    || d.model_info.team_public_model_name.as_deref() == Some(requested))
+        })
+    {
+        let teams: std::collections::BTreeSet<&str> = deployments
+            .iter()
+            .filter_map(|d| d.model_info.team_id.as_deref())
+            .collect();
+        if teams.len() > 1 {
+            return Err(Error::MultipleTeams {
+                model: requested.to_owned(),
+            });
+        }
+        return Ok(deployments);
+    }
+    Ok(deployments
+        .into_iter()
+        .filter(|d| d.usable_by_team(team_id))
+        .collect())
 }
 
 impl Core {
@@ -197,49 +236,30 @@ impl Core {
         } else {
             None
         };
-        let scope = ResolveScope {
-            specific_deployment: request.specific_deployment,
+        // No deployment for the name: route to the first default fallback.
+        let default_target = crate::resolve::default_target(&snapshot.settings.dynamic);
+        let caller = Caller {
+            team_id: request.team_id.as_deref(),
+            proxy_admin: request.proxy_admin,
+            allowed_models: &request.allowed_models,
         };
-        let dynamic = &snapshot.settings.dynamic;
-        let resolution = registry
-            .resolve_for(name, scope, request.team_id.as_deref())
-            .or_else(|| {
-                // No deployment for the name: route to the first default fallback.
-                let default = dynamic
-                    .fallbacks
-                    .default_target()
-                    .or_else(|| dynamic.default_fallbacks.first().map(String::as_str))?;
-                registry.resolve(default, scope)
-            })
-            .ok_or_else(|| Error::UnknownModel {
-                model: name.to_owned(),
-            })?;
-        // `_drop_strategy_markers`: a marker is never a callable deployment.
-        let resolved_any = !resolution.deployments.is_empty();
+        let resolution = resolve_request(
+            registry,
+            name,
+            request.specific_deployment,
+            caller,
+            default_target,
+            jiff::Timestamp::now(),
+        )?
+        .ok_or_else(|| Error::UnknownModel {
+            model: name.to_owned(),
+        })?;
         let first_model = resolution
             .deployments
             .first()
             .map(|d| d.params.model.clone());
-        let deployments: Vec<Arc<Deployment>> = resolution
-            .deployments
-            .iter()
-            .filter(|d| !is_strategy_marker(d))
-            .cloned()
-            .collect();
-        if resolved_any && deployments.is_empty() {
-            return Err(Error::OnlyMarkers {
-                // A marker named by its id is reported by its litellm model.
-                model: match resolution.kind {
-                    ResolveKind::Id => first_model.unwrap_or_else(|| name.to_owned()),
-                    _ => name.to_owned(),
-                },
-            });
-        }
         let team_id = request.team_id.as_deref();
-        let usable: Vec<Arc<Deployment>> = deployments
-            .into_iter()
-            .filter(|d| d.usable_by_team(team_id))
-            .collect();
+        let usable = filter_team_based(resolution.deployments.clone(), request)?;
         // `_filter_reserved_deployments`: PTU shares keep holders to their share and everyone
         // else to the deployments split into none.
         let (mut all, withheld) = crate::ptu::filter_shared(usable, team_id);
@@ -564,13 +584,18 @@ impl Core {
             &candidates.kind,
             &candidates.model_group,
         );
+        if strategy == RoutingStrategy::Unset {
+            return Err(no_deployment());
+        }
         if strategy == RoutingStrategy::SimpleShuffle {
+            let weights = crate::weights::validate(request.router_weights.as_ref())
+                .map_err(|_| Error::InvalidRouterWeights)?;
             return simple_shuffle(
                 &candidates.healthy,
                 &candidates.model_group,
-                request.router_weights.as_ref(),
+                weights.as_ref(),
                 self.rng.as_ref(),
-            )
+            )?
             .ok_or_else(no_deployment);
         }
         let ctx = self.context(
@@ -626,7 +651,9 @@ mod tests {
             deployment("a", json!({"model": "openai/a", "weight": 1, "rpm": 1000})),
             deployment("b", json!({"model": "openai/b", "weight": 3})),
         ];
-        let picked = simple_shuffle(&deployments, "g", None, &Fixed(draw)).unwrap();
+        let picked = simple_shuffle(&deployments, "g", None, &Fixed(draw))
+            .unwrap()
+            .unwrap();
         assert_eq!(picked.id, expected);
     }
 
@@ -637,7 +664,9 @@ mod tests {
             deployment("b", json!({"model": "openai/b"})),
         ];
         let weights = BTreeMap::from([("g".to_owned(), BTreeMap::from([("b".to_owned(), 1.0)]))]);
-        let picked = simple_shuffle(&deployments, "g", Some(&weights), &Fixed(0.99)).unwrap();
+        let picked = simple_shuffle(&deployments, "g", Some(&weights), &Fixed(0.99))
+            .unwrap()
+            .unwrap();
         assert_eq!(picked.id, "b");
     }
 }

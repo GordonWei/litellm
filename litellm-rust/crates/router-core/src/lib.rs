@@ -73,6 +73,7 @@
 //! - [`precall`]: the `enable_pre_call_checks` filter.
 //! - [`host`]: the `Host` boundary.
 
+pub mod access;
 pub mod cache;
 pub mod call;
 pub mod config;
@@ -86,12 +87,14 @@ pub mod precall;
 pub mod prerouting;
 pub mod ptu;
 pub mod registry;
+pub mod resolve;
 pub mod retry;
 pub mod routing_groups;
 pub mod routing_plugins;
 pub mod select;
 pub mod settings;
 pub mod strategy;
+pub mod weights;
 
 use std::sync::{
     Arc,
@@ -315,7 +318,7 @@ impl Router {
         &self,
         op: &Op,
         request: &RouterRequest,
-    ) -> Result<Vec<Arc<Deployment>>, Error> {
+    ) -> Result<select::Candidates, Error> {
         self.live()?;
         let snapshot = self.core.snapshot.load_full();
         let candidates = self
@@ -334,7 +337,7 @@ impl Router {
                 model: candidates.model_group,
             });
         }
-        Ok(candidates.healthy)
+        Ok(candidates)
     }
 
     pub fn registry(&self) -> Arc<Registry> {

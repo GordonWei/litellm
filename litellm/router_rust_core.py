@@ -62,6 +62,7 @@ from litellm.router_api import (
 from litellm.router_attempt import for_requested_model, request_from_call
 from litellm.router_config import RouterConfig, RouterDynamicConfig
 from litellm.router_python_host import PythonHost
+from litellm.router_rust_access import caller_fields, selection_refusal
 from litellm.router_rust_callbacks import OptionalChecks, RustOptionalChecks
 from litellm.router_rust_endpoints import (
     AttemptCall,
@@ -101,6 +102,7 @@ from litellm.router_rust_plugins import SYNC_PATH_MESSAGE, candidate_models, run
 from litellm.router_rust_precall import PreCallFacts, declares_no_vision, request_carries_image
 from litellm.router_rust_prerouting import PreRouter, PreRoutingStrategies
 from litellm.router_rust_registry import HostRegistry, RustRegistry, hosted_registry_view
+from litellm.router_rust_replay import track_live_registry, untrack_live_registry
 from litellm.router_rust_retries import (
     RustRetries,
     group_policy_document,
@@ -425,7 +427,7 @@ class Resolved:
     """The router's settings, resolved from its arguments and the process settings the way the
     Python router's constructor resolves them. Replaced, never changed, by ``apply``."""
 
-    routing_strategy: str
+    routing_strategy: str | None
     routing_strategy_args: Mapping[str, object]
     num_retries: int
     max_fallbacks: int
@@ -485,7 +487,10 @@ class Resolved:
         strategy: Final = get("routing_strategy")
         validate_routing_strategy(strategy)  # pyright: ignore[reportArgumentType]  # validated as given
         return cls(
-            routing_strategy=normalize_strategy(strategy) or "simple-shuffle",
+            # An explicit `routing_strategy=None` is stored as None (no strategy picks).
+            routing_strategy=None
+            if strategy is None and "routing_strategy" in config.arguments
+            else normalize_strategy(strategy) or "simple-shuffle",
             routing_strategy_args=MappingProxyType(dict(as_str_mapping(get("routing_strategy_args")) or {})),
             num_retries=int(str(num_retries))
             if num_retries is not None
@@ -606,7 +611,9 @@ class Resolved:
             "model_group_retry_policy": _plain(self.model_group_retry_policy) or None,
             **self.health_routing.static_document(),
         }
-        return {name: value for name, value in values.items() if value is not None}
+        kept: Final = {name: value for name, value in values.items() if value is not None}
+        # An explicit `routing_strategy=None` reaches the Rust core as "None": no strategy picks.
+        return kept if self.routing_strategy is not None else {**kept, "routing_strategy": "None"}
 
     def dynamic_document(self, version: int, model_names: Sequence[str]) -> Mapping[str, object]:
         values: Final = {
@@ -692,14 +699,7 @@ def unsupported_arguments(config: RouterConfig) -> frozenset[str]:
         for name, value in config.arguments.items()
         if name not in _SERVED_ARGUMENTS and value not in (None, _UNSET_DEFAULTS.get(name))
     )
-    # `simple_shuffle` raises on a non-numeric weight when it picks; only the Python core keeps that.
-    odd_weight: Final = any(
-        (params := as_str_mapping((as_str_mapping(deployment) or {}).get("litellm_params"))) is not None
-        and params.get("weight") is not None
-        and (isinstance(params.get("weight"), bool) or not isinstance(params.get("weight"), int | float))
-        for deployment in _as_list(config.get("model_list"))
-    )
-    return unserved | ({"model_list"} if odd_weight else frozenset[str]())
+    return unserved
 
 
 def _team_id(request: Mapping[str, object]) -> str | None:
@@ -739,6 +739,7 @@ def _start_fields(request: Mapping[str, object]) -> Mapping[str, object]:
         ),
         **lists,
         **({"team_id": team_id} if team_id else {}),
+        **caller_fields(request),
     }
 
 
@@ -913,6 +914,8 @@ class RustCore(
         self._custom_strategy: CustomRoutingStrategyBase | None = None
         self._hosted.build(_as_list(config.get("model_list")) if config.get("model_list") is not None else None)
         self._hosted.set_routing_groups(resolved.routing_groups)
+        track_live_registry(self._hosted)
+        self._hosted.routable_lookup = self._routable
         self._handle: RouterCoreHandle = self._new_handle(list(self._hosted._core_model_list))  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
         self._join_callback_holders()
         self._checks: Final = OptionalChecks(self, host, self._cache, self._hosted, ctx, config.arguments)
@@ -1145,6 +1148,7 @@ class RustCore(
 
     def retire(self) -> None:
         self._retired = True
+        untrack_live_registry(self._hosted)
         self._retire_callbacks()
         if self._hosted.strategies is not None:
             self._hosted.strategies.retire()
@@ -1542,6 +1546,18 @@ class RustCore(
             **(overrides or {}),
         }
         return self._handle.start(plan.endpoint, _document({"model": model, **fields})), prepared
+
+    def _process_renamed(self, model: str, group: str) -> str:
+        """``model`` as the error names it: a group the name resolved to by name, alias or routing
+        group is renamed through the process ``model_alias_map`` (``_common_checks_available_deployment``)."""
+        renames: Final = self._host.dynamic().model_alias_map
+        resolution: Final = self._handle.resolve(model) if group in renames else None
+        if resolution is None or resolution["kind"] not in ("Group", "Alias", "RoutingGroup"):
+            return model
+        return renames[group]
+
+    def _routable(self, model: str, request: Mapping[str, object]) -> Sequence[Mapping[str, object]]:
+        return self._handle.routable(model, _document(_start_fields(request)))
 
     def _routing_fields(self, request: Mapping[str, object]) -> Mapping[str, object]:
         """The request fields the Rust core routes on, and whether its tag stage may apply: the
@@ -2055,7 +2071,13 @@ class RustCore(
     # -- errors the core raises when no attempt failed ------------------------------------------
 
     def _failure_error(
-        self, step: Mapping[str, object], model: str, last: BaseException | None, *, pass_through: str = ""
+        self,
+        step: Mapping[str, object],
+        model: str,
+        last: BaseException | None,
+        *,
+        pass_through: str = "",
+        request: Mapping[str, object] | None = None,
     ) -> BaseException:
         """The error a call or pick that failed before any attempt raises; ``pass_through`` names
         the selection kind (``pass_through``/``async_pass_through``) whose errors it words."""
@@ -2063,6 +2085,9 @@ class RustCore(
 
         kind: Final = step.get("error_kind")
         aliases: Final = self._resolved.model_group_alias
+        refused: Final = selection_refusal(step, model, request or {})
+        if refused is not None:
+            return refused
         if kind == "paused":
             # The message names the deployment's litellm model, not the id that was asked for.
             record: Final = as_str_mapping(self._handle.deployment(model)) or {}
@@ -2147,7 +2172,7 @@ class RustCore(
                 default=_seconds(None, self._resolved.cooldown_time),
             )
             return RouterRateLimitError(
-                model=model,
+                model=self._process_renamed(model, str(group)),
                 cooldown_time=min_cooldown,
                 enable_pre_call_checks=self._resolved.enable_pre_call_checks,
                 cooldown_list=cooling,
@@ -2227,6 +2252,10 @@ class _Selection:
 
     def _done(self, step: Mapping[str, object]) -> Mapping[str, object] | Sequence[Mapping[str, object]]:
         if self._kind == "healthy":
+            if step.get("single"):
+                # A deployment named by its id is listed alone, as a dict.
+                (record,) = _as_list(step.get("deployments"))
+                return for_requested_model(as_str_mapping(record) or {}, self._model)
             # The deployments as served: a priority group's members carry their priority as order.
             return [
                 for_requested_model(as_str_mapping(record) or {}, self._model)
@@ -2235,7 +2264,10 @@ class _Selection:
         return for_requested_model(as_str_mapping(step.get("deployment")) or {}, self._model)
 
     def _failed(self, step: Mapping[str, object]) -> BaseException:
-        error: Final = self._core._failure_error(step, self._model, self._filter_error, pass_through=self._kind)  # pyright: ignore[reportPrivateUsage]  # see above
+        core: Final = self._core
+        error: Final = core._failure_error(  # pyright: ignore[reportPrivateUsage]  # see above
+            step, self._model, self._filter_error, pass_through=self._kind, request=self._request
+        )
         logging_obj: Final = self._request.get("litellm_logging_obj")
         dispatch: Final[object] = getattr(logging_obj, "dispatch_failure_handlers", None)
         if callable(dispatch) and self._kind not in ("pass_through", "sync_pick"):
@@ -2699,7 +2731,7 @@ class _Driver:
         model: Final = str(self._request.get("model"))
         primary: Final = self._level_errors.get(0)
         if primary is None:
-            return self._core._failure_error(step, model, self._last_error)  # pyright: ignore[reportPrivateUsage]  # see above
+            return self._core._failure_error(step, model, self._last_error, request=self._request)  # pyright: ignore[reportPrivateUsage]  # see above
         if self._core._host.dynamic().expose_router_debug_in_errors and hasattr(primary, "message"):  # pyright: ignore[reportPrivateUsage]  # see above
             primary.message += self._explanation(primary, model)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # checked above
         return primary

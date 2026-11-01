@@ -31,12 +31,21 @@ pub struct RouterRequest {
     pub body: Value,
     /// `user_api_key_team_id`.
     pub team_id: Option<String>,
+    /// The caller's `user_role` is `proxy_admin`.
+    pub proxy_admin: bool,
+    /// The caller's `models` plus `team_models` (`user_api_key_auth`), which narrow a caller
+    /// allowed only through access groups to those groups' deployments.
+    pub allowed_models: Vec<String>,
+    /// For a proxy admin, the model the request names (`model`, else the metadata
+    /// `model_group`), which keeps one team's deployments listed under it (`filter_team_based_models`).
+    pub admin_model: Option<String>,
     pub specific_deployment: bool,
     /// A per-request `num_retries`, which wins over the router's.
     pub num_retries: Option<u32>,
     pub disable_fallbacks: bool,
-    /// `_router_weights`: model group to deployment id to weight.
-    pub router_weights: Option<BTreeMap<String, BTreeMap<String, f64>>>,
+    /// `_router_weights` as the request passed it: model group to deployment id to weight,
+    /// validated when simple-shuffle picks ([`crate::weights::validate`]).
+    pub router_weights: Option<Value>,
     /// The deployment a call on an existing resource (a video id) names: picked whenever the
     /// filters keep it (`_narrow_to_video_deployment`).
     pub pinned_deployment_id: Option<String>,

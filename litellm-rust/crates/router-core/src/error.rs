@@ -59,6 +59,17 @@ pub enum Error {
     /// Every deployment `model` resolved to is split into PTU shares the caller holds none of.
     #[error("deployment `{model}` is reserved for the teams holding a PTU share of it")]
     PtuReserved { model: String },
+    /// A proxy admin without a team named a public model name several teams use.
+    #[error("model name `{model}` matches deployments from multiple teams")]
+    MultipleTeams { model: String },
+    /// Every deployment `model` resolved to is reserved for other teams by an active access
+    /// window, the first of which ends at `until` (`HH:MM`) in `timezone`.
+    #[error("deployment `{model}` is reserved for another team until {until} {timezone}")]
+    Reserved {
+        model: String,
+        until: String,
+        timezone: String,
+    },
     /// The pre-call checks found no deployment whose context window fits the prompt; `detail`
     /// names each one dropped for it.
     #[error("no deployment of `{model}` has a context window large enough for this call")]
@@ -69,6 +80,12 @@ pub enum Error {
     /// The routing plugins left none of the healthy deployments' models.
     #[error("no deployments left after routing-plugin filtering: {models:?}")]
     RoutingPluginsLeftNothing { models: Vec<String> },
+    /// The request's `_router_weights` failed `validate_router_weights` when simple-shuffle picked.
+    #[error("the request's router weights are invalid")]
+    InvalidRouterWeights,
+    /// A deployment's `litellm_params` `metric` (weight, rpm or tpm) is not a number.
+    #[error("deployment {metric} must be numeric")]
+    NonNumericWeight { metric: &'static str },
     /// A router with routing plugins was asked for a pick on the sync path, which never runs them.
     #[error("routing plugins only run on the async selection path")]
     RoutingPluginsNeedAsync,
@@ -89,9 +106,13 @@ impl Error {
             | Self::NoPassThroughDeployments { .. }
             | Self::OnlyMarkers { .. }
             | Self::PtuReserved { .. }
+            | Self::MultipleTeams { .. }
+            | Self::Reserved { .. }
             | Self::ContextWindowExceeded { .. }
             | Self::UnsupportedParams { .. }
             | Self::RoutingPluginsLeftNothing { .. }
+            | Self::InvalidRouterWeights
+            | Self::NonNumericWeight { .. }
             | Self::RoutingPluginsNeedAsync => None,
         }
     }

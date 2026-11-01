@@ -158,6 +158,20 @@ impl Deployment {
         }
     }
 
+    /// `simple_shuffle._metric_weight`: 0 when unset, a number (a bool counts as 0 or 1), or
+    /// `None` when the value is not numeric. A `rpm`/`tpm` spelled as text reads as unset.
+    pub fn metric_weight(&self, key: &str) -> Option<f64> {
+        if key != "weight" {
+            return Some(self.metric(key).unwrap_or(0.0));
+        }
+        match self.raw_params.get(key) {
+            None | Some(Value::Null) => Some(0.0),
+            Some(Value::Bool(flag)) => Some(f64::from(u8::from(*flag))),
+            Some(Value::Number(number)) => number.as_f64(),
+            Some(_) => None,
+        }
+    }
+
     /// `litellm_params.order` (`get_deployment_order`).
     pub fn order(&self) -> Option<i64> {
         self.raw_params.get("order").and_then(Value::as_i64)
@@ -444,6 +458,36 @@ impl Registry {
         &self.routing_groups
     }
 
+    /// Every deployment, in configured order.
+    pub(crate) fn all(&self) -> &[Arc<Deployment>] {
+        &self.deployments
+    }
+
+    /// Whether `name` is a deployment `model_name` (`name in _core_model_names`).
+    pub(crate) fn has_name(&self, name: &str) -> bool {
+        self.by_group.contains_key(name)
+    }
+
+    /// The group `model_group_alias` rewrites `name` to.
+    pub(crate) fn alias_of(&self, name: &str) -> Option<&str> {
+        self.aliases.get(name).map(String::as_str)
+    }
+
+    /// The callable routing group named `name`: a model group of that name shadows it.
+    pub(crate) fn routing_group_named(&self, name: &str) -> Option<&RoutingGroupSpec> {
+        (!self.by_group.contains_key(name))
+            .then(|| self.routing_groups.iter().find(|g| g.group_name == name))
+            .flatten()
+    }
+
+    /// The most specific wildcard pattern matching `name`, with its deployments.
+    pub(crate) fn wildcard_for(&self, name: &str) -> Option<(String, Vec<Arc<Deployment>>)> {
+        self.wildcards
+            .iter()
+            .find(|(pattern, _)| wildcard_matches(pattern, name))
+            .map(|(pattern, indices)| (pattern.clone(), self.at(indices)))
+    }
+
     /// Resolve a requested name, in the order of `_common_checks_available_deployment`:
     /// a specific deployment, an id, an alias, a routing group, a model group, a wildcard.
     pub fn resolve(&self, name: &str, scope: ResolveScope) -> Option<Resolution> {
@@ -461,7 +505,13 @@ impl Registry {
                 .filter(|d| d.params.model == name)
                 .cloned()
                 .collect();
-            return resolution(ResolveKind::SpecificDeployment, name, matching);
+            // An empty match still resolves: the pick then finds no deployment rather than
+            // falling back to a default (`_common_checks_available_deployment` returns `[]`).
+            return Some(Resolution {
+                kind: ResolveKind::SpecificDeployment,
+                group: name.to_owned(),
+                deployments: matching,
+            });
         }
         if !self.by_group.contains_key(name)
             && let Some(deployment) = self.deployment(name)
@@ -507,51 +557,6 @@ impl Registry {
             .and_then(|(pattern, indices)| {
                 resolution(ResolveKind::Wildcard, pattern, self.at(indices))
             })
-    }
-
-    /// `resolve` for a caller: a team's own deployments under their public name win
-    /// (`_core_get_all_deployments` with `team_id`), then the name as [`Self::resolve`] reads it,
-    /// then deployments whose `litellm_params.model` is the name (`_get_deployment_by_litellm_model`).
-    pub fn resolve_for(
-        &self,
-        name: &str,
-        scope: ResolveScope,
-        team_id: Option<&str>,
-    ) -> Option<Resolution> {
-        if let Some(team) = team_id
-            && !scope.specific_deployment
-        {
-            let own: Vec<Arc<Deployment>> = self
-                .deployments
-                .iter()
-                .filter(|d| {
-                    d.model_info.team_id.as_deref() == Some(team)
-                        && d.model_info.team_public_model_name.as_deref() == Some(name)
-                })
-                .cloned()
-                .collect();
-            if !own.is_empty() {
-                return Some(Resolution {
-                    kind: ResolveKind::Group,
-                    group: name.to_owned(),
-                    deployments: own,
-                });
-            }
-        }
-        if let Some(resolution) = self.resolve(name, scope) {
-            return Some(resolution);
-        }
-        let by_model: Vec<Arc<Deployment>> = self
-            .deployments
-            .iter()
-            .filter(|d| d.params.model == name)
-            .cloned()
-            .collect();
-        (!by_model.is_empty()).then(|| Resolution {
-            kind: ResolveKind::Group,
-            group: name.to_owned(),
-            deployments: by_model,
-        })
     }
 
     /// Access group name to the model groups in it.
